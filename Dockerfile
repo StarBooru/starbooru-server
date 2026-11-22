@@ -20,29 +20,30 @@ RUN mkdir -p /out/ai \
     && cp target/release/starbooru-server /out/starbooru-server \
     && cp target/release/starbooru-ai-worker /out/ai/starbooru-ai-worker
 
-# ONNX Runtime, which runs the models, pinned by version and hash.
+# ONNX Runtime, which runs the models, pinned by version and hash. It comes from
+# Microsoft's NuGet packages: the GitHub releases are gone since 2026-11-17, and
+# the libraries in these packages are the same files, byte for byte.
 ARG AI_GPU=none
 ARG ORT_VERSION=1.31.1
-ARG ORT_SHA256_X86_64=c849e36a1ef3e22d4ff217b9d1ce4a3cf5b9467b975610913ae959ad5b16bdc9
-ARG ORT_SHA256_AARCH64=5317505e2da99be65f8e2775ba3c2afd6d2961fd78aba1bd8f56159f48820c78
-ARG ORT_SHA256_CUDA=b2146862e691f7e338f5aff9c7a9a5567c2ca57cf01442a1adb3a13bf62d9095
+ARG ORT_SHA256_CPU=6871ccbc97f3d5bdb4095a1dcec33aa78d56f6ed8de5980ef5fa1d9f2e7c679a
+ARG ORT_SHA256_CUDA=cfb5315b87f812d8d91194075eb4aab3cbfd97a932f2b56c9bfa41e36087c4a2
 RUN set -eux; \
     case "$AI_GPU:$(uname -m)" in \
-      none:x86_64|vulkan:x86_64) pkg="onnxruntime-linux-x64-$ORT_VERSION"; sha="$ORT_SHA256_X86_64" ;; \
-      none:aarch64) pkg="onnxruntime-linux-aarch64-$ORT_VERSION"; sha="$ORT_SHA256_AARCH64" ;; \
-      nvidia:x86_64) pkg="onnxruntime-linux-x64-gpu_cuda13-$ORT_VERSION"; sha="$ORT_SHA256_CUDA" ;; \
+      none:x86_64|vulkan:x86_64) pkg=microsoft.ml.onnxruntime; rid=linux-x64; sha="$ORT_SHA256_CPU" ;; \
+      none:aarch64) pkg=microsoft.ml.onnxruntime; rid=linux-arm64; sha="$ORT_SHA256_CPU" ;; \
+      nvidia:x86_64) pkg=microsoft.ml.onnxruntime.gpu.linux; rid=linux-x64; sha="$ORT_SHA256_CUDA" ;; \
       *) echo "AI_GPU=$AI_GPU isn't available on $(uname -m)" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL -A starbooru-build -o /tmp/ort.tgz \
-      "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${pkg}.tgz"; \
-    echo "$sha  /tmp/ort.tgz" | sha256sum -c -; \
+    curl -fsSL -A starbooru-build -o /tmp/ort.zip \
+      "https://api.nuget.org/v3-flatcontainer/$pkg/$ORT_VERSION/$pkg.$ORT_VERSION.nupkg"; \
+    echo "$sha  /tmp/ort.zip" | sha256sum -c -; \
     mkdir /tmp/ort; \
-    tar -xzf /tmp/ort.tgz -C /tmp/ort --strip-components=1; \
-    cp "/tmp/ort/lib/libonnxruntime.so.$ORT_VERSION" /out/ai/libonnxruntime.so; \
+    python3 -c 'import os,sys,zipfile; z=zipfile.ZipFile("/tmp/ort.zip"); d="runtimes/"+sys.argv[1]+"/native/"; [open("/tmp/ort/"+os.path.basename(n),"wb").write(z.read(n)) for n in z.namelist() if n.startswith(d) and n.endswith(".so")]' "$rid"; \
+    cp /tmp/ort/libonnxruntime.so /out/ai/libonnxruntime.so; \
     if [ "$AI_GPU" = nvidia ]; then \
-      cp /tmp/ort/lib/libonnxruntime_providers_cuda.so /tmp/ort/lib/libonnxruntime_providers_shared.so /out/ai/; \
+      cp /tmp/ort/libonnxruntime_providers_cuda.so /tmp/ort/libonnxruntime_providers_shared.so /out/ai/; \
     fi; \
-    rm -rf /tmp/ort /tmp/ort.tgz
+    rm -rf /tmp/ort /tmp/ort.zip
 
 # The worker for graphics cards, tried before the processor's.
 RUN set -eux; \

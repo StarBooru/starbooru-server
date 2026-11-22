@@ -31,7 +31,7 @@ Until starbooru-web is ready, the image serves no web app. Installs that need on
 
 ## Known gaps and risks
 
-- **ONNX Runtime is gone from GitHub.** Since 2026-11-17, `github.com/microsoft/onnxruntime` and its release downloads answer 404. The image build and the server's own runtime download (`local_ai/install.rs`) both fetch from there, so they fail until it comes back or the pins move to another source, such as the PyPI wheels.
+- **ONNX Runtime is gone from GitHub.** Since 2026-11-17, `github.com/microsoft/onnxruntime` and its release downloads answer 404. The image now takes it from Microsoft's NuGet packages, whose libraries are byte for byte those of the GitHub releases. The server's own runtime download (`local_ai/install.rs`) still fetches from GitHub, so it fails until the repository comes back or that pin moves to NuGet too.
 - **The server package has no local AI.** It holds no `starbooru-ai-worker` or ONNX Runtime, so the built-in models need the Docker image. API-based AI works.
 - **Orphan files.** Failed inserts remove their files unless another post owns them, and `tmp/` is cleared at startup. Files left by a crash between the write and the insert are not swept yet.
 - **AI key in the database.** An API key entered in Administration › AI is stored as plain text in `ai_tools`, so it is also in database backups. Setting it with `STARBOORU_AI_KEY` keeps it out of both.

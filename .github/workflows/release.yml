@@ -46,9 +46,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Named, so it lands in artifacts/server/; a lone artifact otherwise lands in artifacts/.
       - uses: actions/download-artifact@v8
         with:
-          path: artifacts
+          name: server
+          path: artifacts/server
       - name: Create the draft
         env:
           GH_TOKEN: ${{ github.token }}
