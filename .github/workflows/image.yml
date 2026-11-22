@@ -22,7 +22,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE: ghcr.io/filipnone/starbooru
+  IMAGE: ghcr.io/starbooru/starbooru-server
 
 jobs:
   build:
@@ -60,7 +60,7 @@ jobs:
             AI_GPU=${{ matrix.gpu }}
             STARBOORU_VERSION=${{ inputs.tag || github.ref_name }}
           labels: |
-            org.opencontainers.image.source=https://github.com/FilipNone/StarBooru
+            org.opencontainers.image.source=https://github.com/StarBooru/starbooru-server
             org.opencontainers.image.licenses=AGPL-3.0-or-later
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
       - name: Keep the digest
@@ -106,8 +106,8 @@ jobs:
           suffix="-$GPU"
           [ "$GPU" = none ] && suffix=
           docker buildx imagetools create \
-            --annotation "index:org.opencontainers.image.source=https://github.com/FilipNone/StarBooru" \
-            --annotation "index:org.opencontainers.image.description=StarBooru, a self-hosted personal booru: the server and the web app" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/StarBooru/starbooru-server" \
+            --annotation "index:org.opencontainers.image.description=StarBooru, a self-hosted personal booru: the server" \
             --annotation "index:org.opencontainers.image.licenses=AGPL-3.0-or-later" \
             -t "$IMAGE:${TAG#v}$suffix" \
             $(printf "$IMAGE@sha256:%s " *)

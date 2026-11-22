@@ -1,6 +1,6 @@
 # Deployment
 
-StarBooru ships as one ready-made image, `ghcr.io/filipnone/starbooru`, that contains the server and the web app, plus a PostgreSQL container. The repository's `docker-compose.yml` runs it and is ready for Dokploy.
+The server ships as one ready-made image, `ghcr.io/starbooru/starbooru-server`, next to a PostgreSQL container. The repository's `docker-compose.yml` runs it and is ready for Dokploy. The image holds no web app; to serve [starbooru-web](https://github.com/StarBooru/starbooru-web) from the same address, mount its bundle and set `STARBOORU_WEB_DIR`.
 
 ## Dokploy
 
@@ -12,10 +12,10 @@ StarBooru ships as one ready-made image, `ghcr.io/filipnone/starbooru`, that con
    ```
 3. **Domain.** In the *Domains* tab, add your domain for service **`starbooru`**, port **`8080`**, with HTTPS (Let's Encrypt). Dokploy adds the Traefik labels and network. Don't publish host ports.
 4. **Deploy.** This downloads the image, so nothing is compiled on your server.
-5. **Create the admin account.** Open `https://your-domain` and choose *Create account*. The first account becomes admin. Registration then closes unless `STARBOORU_ALLOW_REGISTRATION=true`.
+5. **Create the admin account.** Point any StarBooru app at `https://your-domain` and choose *Create account*, or call `POST /api/v1/auth/register`. The first account becomes admin. Registration then closes unless `STARBOORU_ALLOW_REGISTRATION=true`.
 6. **Backups.** StarBooru backs the database up itself (see [Backups](#backups)) into the `media` volume. In *Volume Backups*, back up the `media` volume off the server: it then holds the files and the database backups. Backing up `pgdata` as well does no harm, but a copy of a running database's files may not restore cleanly; the `pg_dump` archives always do.
 
-Desktop and Android users sign in with the same URL (`https://your-domain`).
+Every app signs in with the same URL (`https://your-domain`).
 
 ### Upload size
 
@@ -107,7 +107,7 @@ Admins can change the name, open registration, the recycle-bin days and the back
 | `STARBOORU_TRUST_PROXY` | `false` (`true` in `docker-compose.yml`) | Take the client address from the last `X-Forwarded-For` entry, for the sign-in limits. Turn it on only behind a reverse proxy that sets the header (Traefik does); otherwise clients could pick their own address. |
 | `STARBOORU_BIND` | `0.0.0.0:8080` | Listen address |
 | `STARBOORU_DATA_DIR` | `/data` in the image | Media storage |
-| `STARBOORU_WEB_DIR` | `/app/web` in the image | Compiled web app; unset means the server runs API-only. The image and the server package hold a `.br` and a `.gz` of each text file, which are sent as they are. For a web app you built yourself, `starbooru-server precompress <dir>` writes them; without them the server compresses each file as it goes out. |
+| `STARBOORU_WEB_DIR` | unset | A compiled web app to serve, such as starbooru-web's bundle; unset means the server runs API-only. `starbooru-server precompress <dir>` writes a `.br` and a `.gz` of each text file, which are then sent as they are; without them the server compresses each file as it goes out. |
 | `RUST_LOG` | `info,tower_http=info,sqlx=warn` | Log filter |
 
 ## Local AI

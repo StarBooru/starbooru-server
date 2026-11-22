@@ -4,8 +4,8 @@
 
 ## How it was checked
 
-<!-- Tests added, and for UI changes the themes and widths you looked at. -->
+<!-- Tests added, or the manual check written in the dev log. -->
 
 - [ ] The checks in `AGENTS.md` › *Before you finish a task* pass
 - [ ] Docs updated if behaviour changed (`docs/api.md` for any API change)
-- [ ] No personal pictures, tokens or passwords in the code, tests or screenshots
+- [ ] No personal pictures, tokens or passwords in the code or tests

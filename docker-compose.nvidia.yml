@@ -2,7 +2,7 @@
 #   docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d
 services:
   starbooru:
-    image: ghcr.io/filipnone/starbooru:${STARBOORU_VERSION:-latest}-nvidia
+    image: ghcr.io/starbooru/starbooru-server:${STARBOORU_VERSION:-latest}-nvidia
     environment:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     deploy:

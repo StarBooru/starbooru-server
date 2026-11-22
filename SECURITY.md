@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Please don't open a public issue. Report it privately through [GitHub's vulnerability reporting](https://github.com/FilipNone/StarBooru/security/advisories/new) with the steps to reproduce it, what an attacker could do, and the version or commit you tested.
+Please don't open a public issue. Report it privately through [GitHub's vulnerability reporting](https://github.com/StarBooru/starbooru-server/security/advisories/new) with the steps to reproduce it, what an attacker could do, and the version or commit you tested.
 
 StarBooru is a personal project, so there is no fixed response time. Reports are read and fixes go out as soon as they can.
 

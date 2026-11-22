@@ -18,5 +18,5 @@ body:
     attributes:
       label: Checks
       options:
-        - label: I looked at the [roadmap](https://github.com/FilipNone/StarBooru/blob/main/docs/roadmap.md) and existing issues.
+        - label: I looked at the [roadmap](https://github.com/StarBooru/starbooru-server/blob/main/docs/roadmap.md) and existing issues.
           required: true

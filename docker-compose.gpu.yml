@@ -4,7 +4,7 @@
 # its group: stat -c %g /dev/dri/renderD128
 services:
   starbooru:
-    image: ghcr.io/filipnone/starbooru:${STARBOORU_VERSION:-latest}-vulkan
+    image: ghcr.io/starbooru/starbooru-server:${STARBOORU_VERSION:-latest}-vulkan
     devices:
       - /dev/dri:/dev/dri
     group_add:

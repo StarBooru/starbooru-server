@@ -1,5 +1,5 @@
-# Local override: publish the web interface on http://localhost:8080
-# (or STARBOORU_PORT; the VS Code runner uses 8090 so it doesn't clash with the dev server).
+# Local override: publish the server on http://localhost:8080
+# (or STARBOORU_PORT).
 services:
   starbooru:
     ports:
