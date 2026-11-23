@@ -1,6 +1,6 @@
 # Roadmap
 
-_Status as of 2026-11-22. Scope comes from `docs/checklist.md`._
+_Status as of 2026-11-23. Scope comes from `docs/checklist.md`, and the two "Next" sections from the owner's list of 2026-11-23._
 
 The server left the [StarBooru](https://github.com/StarBooru/StarBooru) repository at `v0.1.0-beta.6`, with every feature it had then. That repository is archived, and its `docs/roadmap.md` has the status of each checklist item at the split, apps included.
 
@@ -16,13 +16,36 @@ Left:
 | Upscaling and background removal | M5 |
 | Sync between devices | M4 |
 
+## Next: private and public instances
+
+An instance runs in one of two modes: private, as today, or public, open to other people with their own accounts. Today every endpoint but `/info`, sign-up and sign-in needs a token, and only share links open without one. starbooru-web's `docs/roadmap.md` (section 5) has the app's side.
+
+- [ ] The mode, a server setting that `/info` reports
+- [ ] Switching is destructive, so the switch first offers a backup made for it, on by default
+- [ ] Private mode: 0 to 5 star scores as an option, with likes and dislikes as the default. A vote is -1, 0 or 1 today
+- [ ] Public mode: accounts with a profile and a profile picture. Sign-up exists (`allow_registration`), but a user has only a name and a role
+- [ ] Public mode: a forum
+- [ ] Public mode: votes on tags. Only posts take votes today
+- [ ] Public mode: the other-booru endpoints (`/remote/*`) are off and can't be turned on
+- [ ] Share links set up to suit each mode
+- [ ] A tag blacklist for each account
+- [ ] A home page setting: on or off, and how it's customised. Its background shows the most popular posts rated safe
+
+## Next: people
+
+A figure has a kind, a character, a cosplay flag and tag slots for clothing and looks. It has no franchise and no place in the picture, and no AI finds faces. starbooru-web's `docs/roadmap.md` (section 6) has the app's side.
+
+- [ ] An AI tool that finds faces on upload, anime ones included, keeps a crop of each, and fills in the figure: name, franchise, cosplay or not, clothing and looks
+- [ ] A franchise on each figure, from the `copyright` tag category, so people group by franchise
+- [ ] People in Explore, and popular characters in public mode
+
 ## Apps
 
 Each app starts from its docs and is rebuilt natively, with the archived Dioxus app as the visual reference.
 
 | App | Repository | Status |
 |---|---|---|
-| Web (Leptos) | [starbooru-web](https://github.com/StarBooru/starbooru-web) | docs only |
+| Web (Leptos) | [starbooru-web](https://github.com/StarBooru/starbooru-web) | v0.18.1: everything the Dioxus app did; polish next |
 | Android (Compose, Rust core) | [starbooru-android](https://github.com/StarBooru/starbooru-android) | docs only |
 | Windows (windows-reactor) | [starbooru-windows](https://github.com/StarBooru/starbooru-windows) | docs only |
 | Linux (GTK 4 and libadwaita) | [starbooru-linux](https://github.com/StarBooru/starbooru-linux) | docs only |
