@@ -16,6 +16,8 @@ Left:
 | Upscaling and background removal | M5 |
 | Sync between devices | M4 |
 
+- [ ] Reverse search an image with google images, iqdb, saucenao, trace.moe
+
 ## Next: private and public instances
 
 An instance runs in one of two modes: private, as today, or public, open to other people with their own accounts. Today every endpoint but `/info`, sign-up and sign-in needs a token, and only share links open without one. starbooru-web's `docs/roadmap.md` (section 5) has the app's side.
