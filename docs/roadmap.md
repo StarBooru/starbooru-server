@@ -1,6 +1,6 @@
 # Roadmap
 
-_Status as of 2026-11-23. Scope comes from `docs/checklist.md`, and the two "Next" sections from the owner's list of 2026-11-23._
+_Status as of 2026-11-24. Scope comes from `docs/checklist.md`, and the "Next" sections from the owner's lists of 2026-11-23. They come in this order: updates, private and public instances, people. Releases are no longer betas: the next is v0.2.0, and Cargo's version follows them._
 
 The server left the [StarBooru](https://github.com/StarBooru/StarBooru) repository at `v0.1.0-beta.6`, with every feature it had then. That repository is archived, and its `docs/roadmap.md` has the status of each checklist item at the split, apps included.
 
@@ -18,9 +18,20 @@ Left:
 
 - [ ] Reverse search an image with google images, iqdb, saucenao, trace.moe
 
+## Next: updates
+
+The server knows only its own version. Installs run the image's `latest` tag, so an administrator finds out about a new release only by looking. starbooru-web's `docs/roadmap.md` (section 10) has the app's side.
+
+- [ ] The server checks for a new release now and then (it can be turned off) and tells administrators, with the release notes
+- [ ] Updating from the app: the Docker image replaces itself when the administrator has given it the Docker socket; the server package downloads, checks and swaps itself
+- [ ] Automatic updates, an option, with a backup first
+- [ ] The image serves starbooru-web, a pinned release checked against its `SHA256SUMS`, and `web.rs` knows Trunk's file names (long cache, preloads)
+
 ## Next: private and public instances
 
-An instance runs in one of two modes: private, as today, or public, open to other people with their own accounts. Today every endpoint but `/info`, sign-up and sign-in needs a token, and only share links open without one. starbooru-web's `docs/roadmap.md` (section 5) has the app's side.
+An instance runs in one of two modes: private, as today, or public, open to other people with their own accounts. Today every endpoint but `/info`, sign-up and sign-in needs a token, and only share links open without one. starbooru-web's `docs/roadmap.md` (section 4) has the app's side.
+
+The owner's answers (2026-11-23): in public mode, people without an account can browse everything, read-only. A post is shared by its own address there; share links stay for private mode. Switching deletes what the new mode doesn't use, after a preview of it and a backup made for the switch.
 
 - [ ] The mode, a server setting that `/info` reports
 - [ ] Switching is destructive, so the switch first offers a backup made for it, on by default
@@ -29,13 +40,14 @@ An instance runs in one of two modes: private, as today, or public, open to othe
 - [ ] Public mode: a forum
 - [ ] Public mode: votes on tags. Only posts take votes today
 - [ ] Public mode: the other-booru endpoints (`/remote/*`) are off and can't be turned on
-- [ ] Share links set up to suit each mode
+- [ ] Public mode: browsing without an account, read-only, and Explore's Trending and Popular tags
+- [ ] Share links set up to suit each mode: share links in private mode, a post's own address in public mode
 - [ ] A tag blacklist for each account
 - [ ] A home page setting: on or off, and how it's customised. Its background shows the most popular posts rated safe
 
 ## Next: people
 
-A figure has a kind, a character, a cosplay flag and tag slots for clothing and looks. It has no franchise and no place in the picture, and no AI finds faces. starbooru-web's `docs/roadmap.md` (section 6) has the app's side.
+A figure has a kind, a character, a cosplay flag and tag slots for clothing and looks. It has no franchise and no place in the picture, and no AI finds faces. starbooru-web's `docs/roadmap.md` (section 5) has the app's side.
 
 - [ ] An AI tool that finds faces on upload, anime ones included, keeps a crop of each, and fills in the figure: name, franchise, cosplay or not, clothing and looks
 - [ ] A franchise on each figure, from the `copyright` tag category, so people group by franchise
@@ -47,7 +59,7 @@ Each app starts from its docs and is rebuilt natively, with the archived Dioxus 
 
 | App | Repository | Status |
 |---|---|---|
-| Web (Leptos) | [starbooru-web](https://github.com/StarBooru/starbooru-web) | v0.18.1: everything the Dioxus app did; polish next |
+| Web (Leptos) | [starbooru-web](https://github.com/StarBooru/starbooru-web) | v0.23.0: everything the Dioxus app did, plus browsing, sharing, design and install work; installable |
 | Android (Compose, Rust core) | [starbooru-android](https://github.com/StarBooru/starbooru-android) | docs only |
 | Windows (windows-reactor) | [starbooru-windows](https://github.com/StarBooru/starbooru-windows) | docs only |
 | Linux (GTK 4 and libadwaita) | [starbooru-linux](https://github.com/StarBooru/starbooru-linux) | docs only |
