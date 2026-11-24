@@ -2,6 +2,7 @@
 
 mod ai;
 mod auth;
+mod avatars;
 mod backup;
 #[cfg(test)]
 mod bench;
@@ -127,6 +128,11 @@ async fn run() -> Result<bool, StartupError> {
     tokio::spawn(update::run_auto(state.clone()));
     let backfill = state.clone();
     tokio::spawn(async move {
+        match avatars::sweep(&backfill).await {
+            Ok(0) => {}
+            Ok(n) => info!("removed {n} profile pictures no account uses"),
+            Err(e) => warn!("profile pictures not swept: {e}"),
+        }
         routes::backfill_media(backfill.clone()).await;
         routes::backfill_thumbs(backfill.clone()).await;
         routes::backfill_file_dates(backfill.clone()).await;

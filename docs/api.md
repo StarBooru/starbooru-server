@@ -12,14 +12,14 @@ All endpoints are under `/api/v1`. Bodies are JSON unless noted. The Rust types 
 |---|---|
 | 400 | bad input (`bad_request`, or `weak_password` for a new account whose password is too easy to guess) |
 | 401 | missing or expired token |
-| 403 | not allowed (`forbidden`, `quota_exceeded` for an upload past the account's storage limit, or `remote_off` for other boorus on a public server) |
+| 403 | not allowed (`forbidden`, `quota_exceeded` for an upload past the account's storage limit, `remote_off` for other boorus on a public server, or `profiles_off`, `forum_off` and `tag_votes_off` for what only a public server has) |
 | 404 | not found |
-| 409 | conflict (`duplicate`, `username_taken`, `deleted`, `not_deleted`, `implication_cycle`, `name_taken`, and those of [Modes](#modes) and [Share links](#share-links)) |
+| 409 | conflict (`duplicate`, `username_taken`, `deleted`, `not_deleted`, `implication_cycle`, `name_taken`, and those of [Modes](#modes), the [Forum](#forum) and [Share links](#share-links)) |
 | 413 | upload too large |
 | 507 | `storage_full`: the server's disk is full |
 | 415 | unsupported file type |
 | 424 | `fetch_failed`: another site the request depends on failed, such as an address to import or an AI provider. |
-| 429 | rate limited (`rate_limited`, sign-in limits and guests); `starbooru-client` waits out `Retry-After` (up to 30 s) and retries twice |
+| 429 | rate limited (`rate_limited`: sign-in limits, guests and forum posting); `starbooru-client` waits out `Retry-After` (up to 30 s) and retries twice |
 | 500 | internal error (details only in the server log) |
 
 ## Server
@@ -50,6 +50,10 @@ All endpoints are under `/api/v1`. Bodies are JSON unless noted. The Rust types 
 | GET | `/auth/sessions` | | `SessionInfo[] {id, client, created_at, last_used_at, expires_at, current}`: the account's live sessions, this one first. `client` is a short description such as "Firefox on Linux", derived from the User-Agent at sign-in (the header itself is not stored). `last_used_at` is updated at most every 5 minutes. |
 | DELETE | `/auth/sessions/{id}` | | 204; signs that session out. 404 if it isn't one of yours. |
 | DELETE | `/auth/sessions` | | `RevokeResult {revoked}`; signs out every session but this one |
+| GET | `/auth/profile` | | `Profile`, the caller's own (see [Profiles](#profiles)) |
+| PATCH | `/auth/profile` | `ProfileUpdate {display_name?, about?}` | `Profile` |
+| PUT | `/auth/avatar?x=&y=&size=` | the picture's bytes | `Profile` with the new picture |
+| DELETE | `/auth/avatar` | | `Profile` without a picture |
 
 Account rules:
 - Usernames are 2 to 32 characters of `A–Z a–z 0–9 _ . -` and are unique regardless of case.
@@ -104,12 +108,12 @@ Admins only; others get 403. API keys may read these but not change anything.
 | Method | Path | Body | Returns |
 |---|---|---|---|
 | GET | `/admin/stats` | | `ServerStats`: `version`, `started_at`, `users`, `disabled_users`, live `images`/`animations`/`videos`, `bin_posts`, `tags`, `media_bytes` (originals, bin included), `bin_bytes`, `database_bytes`, `uploads_by_day` (`[{day, posts}]`, the last 30 UTC days oldest first), `max_upload_bytes`, `video_thumbnails`, `url_import` |
-| GET | `/admin/settings` | | `ServerSettings {name, allow_registration, trash_days, auto_meta_tags, mode, score_kind}`, the values in force |
-| PUT | `/admin/settings` | `ServerSettings` | The saved settings. They apply at once. Each starts from its environment variable (`STARBOORU_NAME`, `STARBOORU_ALLOW_REGISTRATION`, `STARBOORU_TRASH_DAYS`, `STARBOORU_AUTO_TAGS`), and a value equal to the variable's keeps following it. The mode and the score kind are stored as they are and don't follow the environment. `name` is 1–64 characters with whitespace collapsed; `trash_days` is 0–3650. `auto_meta_tags` (automatic meta tags such as `highres` and `video` on new posts) may be left out by older clients and then means `true`. `mode` changes only through `POST /admin/mode`: the mode in force is accepted, another one is 409 `use_mode_switch`, and leaving it out is fine. `score_kind` left out stays as it is; a new one converts the votes (see [Scores](#scores)) and the answer lists what it did in `changes`, as `GET /admin/scores/preview` would have. `stars` on a public server is 409 `public_counts_likes`. |
-| GET | `/admin/users` | | `AdminUser[] {id, username, role, created_at, disabled, posts, bytes, quota_bytes, last_active}`, oldest first. `posts` and `bytes` count uploads, recycle bin included. `last_active` is the latest use of any session or key. |
-| PATCH | `/admin/users/{id}` | `UserUpdate {role?, disabled?, quota_bytes?}` | The updated `AdminUser`. Missing fields stay as they are; `"quota_bytes": null` removes the limit. Disabling signs the account out everywhere. 400 for your own account (so an admin always remains), 404 for an unknown id. |
+| GET | `/admin/settings` | | `ServerSettings {name, allow_registration, trash_days, auto_meta_tags, mode, score_kind, tag_vote_threshold?}`, the values in force. `tag_vote_threshold` is there on a public server only (see [Tag votes](#tag-votes)). |
+| PUT | `/admin/settings` | `ServerSettings` | The saved settings. They apply at once. Each starts from its environment variable (`STARBOORU_NAME`, `STARBOORU_ALLOW_REGISTRATION`, `STARBOORU_TRASH_DAYS`, `STARBOORU_AUTO_TAGS`), and a value equal to the variable's keeps following it. The mode and the score kind are stored as they are and don't follow the environment. `name` is 1–64 characters with whitespace collapsed; `trash_days` is 0–3650. `auto_meta_tags` (automatic meta tags such as `highres` and `video` on new posts) may be left out by older clients and then means `true`. `mode` changes only through `POST /admin/mode`: the mode in force is accepted, another one is 409 `use_mode_switch`, and leaving it out is fine. `score_kind` left out stays as it is; a new one converts the votes (see [Scores](#scores)) and the answer lists what it did in `changes`, as `GET /admin/scores/preview` would have. `stars` on a public server is 409 `public_counts_likes`. `tag_vote_threshold` is 0 to 100; left out, it stays as it is. |
+| GET | `/admin/users` | | `AdminUser[] {id, username, role, created_at, disabled, posts, bytes, quota_bytes, last_active, display_name?, about?, avatar_url?}`, oldest first. `posts` and `bytes` count uploads, recycle bin included. `last_active` is the latest use of any session or key. The profile fields are left out when not set; `avatar_url` is the signed 64 px picture. |
+| PATCH | `/admin/users/{id}` | `UserUpdate {role?, disabled?, quota_bytes?, clear_avatar?, clear_about?, clear_display_name?}` | The updated `AdminUser`. Missing fields stay as they are; `"quota_bytes": null` removes the limit. Disabling signs the account out everywhere. The `clear_*` flags (`true`) remove that part of the profile, for moderation. 400 for a role, disabled or limit on your own account (so an admin always remains); clearing your own profile is fine. 404 for an unknown id. |
 | POST | `/admin/users/{id}/password` | `PasswordReset {new}` | 204. Signs the account out everywhere; its API keys keep working. 400 for your own account (use `PUT /auth/password`). |
-| DELETE | `/admin/users/{id}` | | 204. Removes the account with its sessions, keys, votes (taken off the scores) and saved searches. Its posts stay, without an uploader. 400 for your own account. |
+| DELETE | `/admin/users/{id}` | | 204. Removes the account with its sessions, keys, votes (taken off the scores), votes on tags, saved searches and profile picture. Its posts, threads and forum posts stay, without an author. 400 for your own account. |
 | GET | `/admin/ai` | | `AiAdminStatus {hardware, runtime {ready, reason, gpu}, autotag, auto_translate, tools}`: per tool (`tagging`, `translation`, `comics`) its `settings {mode, preset, model, api_url, api_model, api_key_set}`, `presets [{preset, available, model, est_ms}]`, `models [{id, name, size, ram_mb, high_accuracy, est_ms, measured, gpu, installed, fits, progress {done, total}, error}]`, `active`, `state` (`off`, `ready`, `installing`, `failed`) and `error`. Keys are never returned. |
 | PUT | `/admin/ai` | `AiGeneralUpdate {autotag, auto_translate}` | `AiAdminStatus`. `auto_translate` is a language code, or `""` for off, that new images with OCR text are translated into; 400 when comics are off. |
 | PUT | `/admin/ai/tools/{tool}` | `AiToolUpdate {mode, preset, model, api_url, api_model, api_key?}` | `AiAdminStatus`. `mode` is `off`, `local` or `api`; `preset` is `fast`, `balanced` or `accurate`; an empty `model` follows the preset. API mode needs `api_url` and `api_model`. `api_key` missing keeps the stored key, `""` clears it. The models it needs start downloading. 400 for invalid values or another tool's model. |
@@ -203,8 +207,11 @@ A server is private (the default) or public. A private server is one person's or
 | Other boorus (`/remote/*`) | as set up | off: 403 `remote_off`, and it can't be turned on |
 | Explore's `trending` and `tags` | empty | worked out |
 | Library imports | anyone, under the URL import rules | administrators only |
+| Profiles | display names only, which nobody else sees | name, text, picture and stats, for everyone; posts say who uploaded them (see [Profiles](#profiles)) |
+| Forum | off: 403 `forum_off` | on (see [Forum](#forum)) |
+| Votes on tags | off: 403 `tag_votes_off` | on (see [Tag votes](#tag-votes)) |
 
-Switching deletes what the new mode has no use for. Going public deletes every share link and every saved account and search on other boorus, and turns star votes into likes. Going private deletes nothing yet.
+Switching deletes what the new mode has no use for. Going public deletes every share link and every saved account and search on other boorus, and turns star votes into likes; the forum starts with three categories (General, Requests, Site) if it has none. Going private deletes the profile pictures and texts, the forum's threads and posts, the votes on tags and the records of tags voted off posts. Display names and the forum's categories stay, for a server that goes public again; the tags voted off stay off posts, but edits may add them again.
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
@@ -222,6 +229,12 @@ A `Change` is `{kind, count, message}`: a machine name, how many, and the same i
 | `star_votes_converted` | Votes of 1, 2, 4 or 5 stars that become likes and dislikes |
 | `star_votes_dropped` | Votes of 3 stars, which are neither and are deleted |
 | `like_votes_converted` | Likes and dislikes that become stars |
+| `profile_pictures` | Profile pictures, deleted going private |
+| `profile_texts` | Texts accounts wrote about themselves, deleted going private |
+| `forum_threads` | Forum threads, deleted going private |
+| `forum_posts` | Forum posts, deleted going private |
+| `tag_votes` | Votes on posts' tags, deleted going private |
+| `tag_removals` | Records of tags voted off posts, deleted going private |
 
 ```json
 GET /api/v1/admin/mode/preview?to=public
@@ -241,6 +254,17 @@ POST /api/v1/admin/mode   {"to": "public"}
   "changes": [ { "kind": "share_links", "count": 12,
                  "message": "12 share links were deleted; on a public server a post is shared by its own address" } ],
   "backup": "starbooru-20261124-022248.dump" }
+
+GET /api/v1/admin/mode/preview?to=private
+{ "to": "private",
+  "changes": [
+    { "kind": "profile_pictures", "count": 2, "message": "2 profile pictures will be deleted" },
+    { "kind": "profile_texts", "count": 1, "message": "1 profile text will be deleted; display names stay" },
+    { "kind": "forum_posts", "count": 14, "message": "14 forum posts will be deleted" },
+    { "kind": "forum_threads", "count": 3, "message": "3 forum threads will be deleted; the categories stay" },
+    { "kind": "tag_votes", "count": 9, "message": "9 votes on tags will be deleted" },
+    { "kind": "tag_removals", "count": 1,
+      "message": "1 record of a tag voted off a post will be deleted; the tags stay off, and edits may add them again" } ] }
 ```
 
 `STARBOORU_MODE` and `STARBOORU_SCORES` set the mode and score kind of a new server. The first start stores them; after that only this API changes them (see `deployment.md` › *Private or public*).
@@ -254,6 +278,8 @@ On a public server a request without a token may read what a browser needs, and 
 | GET | `/posts`, `/posts/{id}`, `/posts/{id}/neighbors`, `/posts/{id}/related` |
 | GET | `/tags`, `/tags/{name}`, `/tag-corrections` |
 | GET | `/explore` |
+| GET | `/users/{name}` |
+| GET | `/forum`, `/forum/threads`, `/forum/threads/{id}` |
 
 `/info`, sign-up and sign-in, and the signed `/media` URLs are open in both modes. Everything else answers 401 to a guest, as it does on a private server, where none of these opens without a token. A guest has no vote of their own (`my_vote` is 0) and doesn't see the recycle bin: `status:deleted` is 401 and a binned post 404. A token that is sent but wrong is still 401.
 
@@ -287,6 +313,94 @@ PUT /api/v1/posts/7/vote   {"stars": 4}
 { "id": 7, "score": 2, "my_vote": 1, "stars": 4.33, "votes": 3, "my_stars": 4, "…": "…" }
 ```
 
+### Profiles
+
+An account has a display name, a text about itself and a picture, besides its username, which stays the handle. On a public server anyone, guests included, sees them; a private one keeps display names only and shows them to nobody else.
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/users/{name}` | | `Profile {name, display_name, about, avatar_url, avatar_small_url, role, joined, posts, forum_posts}`. The username in any case. `posts` counts uploads outside the recycle bin, `forum_posts` forum posts not deleted. 404 for an unknown name; 403 `profiles_off` on a private server. |
+| GET | `/auth/profile` | | The caller's own `Profile`, in either mode |
+| PATCH | `/auth/profile` | `ProfileUpdate {display_name?, about?}` | `Profile`. A field left out stays; `null` or `""` clears it. `display_name` is trimmed with its spaces collapsed, 1 to 40 characters, no control or invisible characters (such as right-to-left marks). `about` is plain text, its lines kept, at most 500 characters. Setting `about` on a private server is 403 `profiles_off`; clearing it works. 400 for too long or a bad character. |
+| PUT | `/auth/avatar?x=&y=&size=` | The picture itself (any `Content-Type`), at most 5 MiB | `Profile`. A JPEG, PNG, WebP or GIF (its first frame), told by its content. Cut to the square at `x`, `y` with sides of `size`, in pixels of the picture as stored (give all three or none), or to the largest square in the middle; at least 16 px. Kept as two JPEGs, 256 and 64 px, and the upload itself isn't. Public servers only: 403 `profiles_off` otherwise. 400 for a square outside the picture, a picture smaller than 16 px or an empty body, 413 over 5 MiB, 415 for another format. |
+| DELETE | `/auth/avatar` | | `Profile`, in either mode |
+
+`avatar_url` (256 px) and `avatar_small_url` (64 px) are signed `/media` paths, like a post's; both are `null` without a picture, and the apps draw an initial instead. The same picture uploaded twice gets the same address.
+
+On a public server a `Post` names its uploader in `uploader`, a `UserCard {name, display_name, avatar_url, avatar_small_url}`, left out on a private server and once the account is deleted. Forum threads and posts carry the same card as `author`.
+
+```json
+GET /api/v1/users/ann
+{ "name": "ann", "display_name": "Ann", "about": "I tag skies.\nAnd cats.",
+  "avatar_url": "/media/avatar/9f…c2.jpg?exp=1764000000&sig=…",
+  "avatar_small_url": "/media/avatar64/9f…c2.jpg?exp=1764000000&sig=…",
+  "role": "user", "joined": "2026-11-24T05:00:00Z", "posts": 12, "forum_posts": 3 }
+```
+
+### Forum
+
+A public server has a forum: categories set by admins, threads in them, posts in threads. Guests read it; writing needs an account. On a private server every forum endpoint answers 403 `forum_off`, guests included, so an app can tell a server without a forum from a missing page.
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/forum` | | `ForumCategory[] {id, name, description, position, threads, last_activity_at}`, by `position` then name. `last_activity_at` is the newest post in any of its threads, `null` when it has none. |
+| POST | `/forum/categories` | `NewCategory {name, description?, position?}` | `ForumCategory`. Admins with a session. `name` is one line of 1 to 64 characters, unique regardless of case (409 `name_taken`); `description` up to 500. Without `position` it goes last. 409 `too_many_categories` past 100. |
+| PATCH | `/forum/categories/{id}` | `CategoryUpdate {name?, description?, position?}` | `ForumCategory`. Admins. Fields left out stay. |
+| DELETE | `/forum/categories/{id}` | | 204. Admins. 409 `category_not_empty` while it has threads: move or delete them first. |
+| GET | `/forum/threads?category=&q=&page=&limit=` | | `ThreadPage {threads, page, limit, has_more}`. `ForumThread {id, category_id, title, author, created_at, last_activity_at, posts, pinned, locked}`. With `category`, that category's threads, pinned first; without it, every category's. Then the latest activity first. `q` finds threads whose title or a post not deleted has all its words (whole words, any case). `limit` is 1 to 100, default 30. 404 for an unknown category. |
+| POST | `/forum/threads` | `NewThread {category_id, title, body}` | `ForumThread`, with its first post. `title` is one line of 1 to 120 characters. 400 for an unknown category. |
+| GET | `/forum/threads/{id}?page=&limit=` | | `ThreadView {thread, posts, page, limit, has_more}`: the thread and a page of its posts, oldest first. `limit` is 1 to 100, default 50. |
+| PATCH | `/forum/threads/{id}` | `ThreadUpdate {title?, pinned?, locked?, category_id?}` | `ForumThread`. The title by its author (not while locked) or an admin; `pinned`, `locked` and `category_id` (a move) by admins with a session, others get 403. |
+| DELETE | `/forum/threads/{id}` | | 204. Admins: the thread with all its posts. |
+| POST | `/forum/threads/{id}/posts` | `ForumPostBody {body}` | `ForumPost`, a reply. 409 `locked` in a locked thread, except for admins. |
+| PATCH | `/forum/posts/{id}` | `ForumPostBody {body}` | `ForumPost` with `edited_at`. Its author only (403 otherwise); 409 `deleted` for a deleted post, `locked` in a locked thread. |
+| DELETE | `/forum/posts/{id}` | | 204. Its author or an admin. The post keeps its place in the thread, empty. |
+
+A `ForumPost` is `{id, thread_id, author, body, created_at, edited_at, deleted}`. A deleted one has an empty `body`, no `author` and `deleted: true`, so the thread still reads in order and its `posts` count doesn't change. `author` is also `null` once the account is deleted.
+
+A body is plain text of 1 to 10,000 characters, its lines kept and trimmed at both ends. The server stores Markdown as typed and the apps render it. A post can name posts of the booru as `>>123` or `post #123`; that stays text, and `starbooru_core::post_mentions` finds them for the apps to link.
+
+Each account may post (a thread or a reply) once every 15 seconds and 100 times in 24 hours; admins aren't held to either. Past that the answer is 429 `rate_limited` with `Retry-After` and a message saying how long.
+
+```json
+GET /api/v1/forum/threads/4?limit=2
+{ "thread": { "id": 4, "category_id": 1, "title": "Best sky tags",
+              "author": { "name": "ann", "display_name": "Ann",
+                          "avatar_url": "/media/avatar/…", "avatar_small_url": "/media/avatar64/…" },
+              "created_at": "2026-11-24T05:10:00Z", "last_activity_at": "2026-11-24T05:20:00Z",
+              "posts": 3, "pinned": false, "locked": false },
+  "posts": [
+    { "id": 10, "thread_id": 4, "author": { "name": "ann", "display_name": "Ann",
+        "avatar_url": "/media/avatar/…", "avatar_small_url": "/media/avatar64/…" },
+      "body": "# Skies\n\nSee >>12.", "created_at": "2026-11-24T05:10:00Z",
+      "edited_at": null, "deleted": false },
+    { "id": 11, "thread_id": 4, "author": null, "body": "",
+      "created_at": "2026-11-24T05:15:00Z", "edited_at": null, "deleted": true } ],
+  "page": 1, "limit": 2, "has_more": true }
+```
+
+### Tag votes
+
+On a public server, signed-in people vote on each tag of a post: it belongs there (1) or it doesn't (-1).
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| PUT | `/posts/{id}/tags/{name}/vote` | `TagVoteRequest {value: -1 \| 0 \| 1}` | `Post`. 0 takes the vote back. `name` follows aliases. 400 for a tag that isn't on the post or another value, 404 for an unknown tag or post, 403 `tag_votes_off` on a private server. |
+| GET | `/admin/tag-removals?page=&limit=` | | `TagRemovalPage {removals, page, limit, has_more}`, newest first: `TagRemoval {id, post_id, tag, score, removed_at, thumb_url}`, `score` being the tag's when it came off. Admins. |
+| DELETE | `/admin/tag-removals/{id}` | | `Post` with the tag back on, and no votes on it. Admins with a session. |
+
+On a public server a `Post` carries `tag_votes`, `{tag: TagVote {score, mine}}` for the tags with votes (votes for minus votes against, and the caller's own, -1, 0 or 1). A tag missing from it has a score of 0. Both it and `voted_off` are left out when empty, and always on a private server.
+
+When a tag's score reaches minus the threshold (3 by default; `tag_vote_threshold` in `PUT /admin/settings`, 0 to turn it off), it comes off that post at once. Its votes there are cleared, the removal is recorded, and the post lists the tag in `voted_off`. While the record is there, nothing puts the tag back on that post: not an edit, a bulk edit, an implication, an alias or the automatic tags. Only an admin's undo does, with no votes, so a tag the voters took off never comes back unnoticed.
+
+```json
+PUT /api/v1/posts/7/tags/cat/vote   {"value": -1}
+{ "id": 7, "tags": ["sky"], "voted_off": ["cat"],
+  "tag_votes": { "sky": { "score": 2, "mine": 0 } },
+  "uploader": { "name": "ann", "display_name": "Ann", "avatar_url": null, "avatar_small_url": null },
+  "…": "…" }
+```
+
 ## Posts
 
 | Method | Path | Body | Returns |
@@ -312,7 +426,7 @@ PUT /api/v1/posts/7/vote   {"stars": 4}
 | PUT | `/posts/{id}/figures` | `FiguresUpdate {figures: [Figure]}` | `Post`: replaces the post's people and updates its tags to match. See [People](#people-in-a-post). 400 for more than 20 people, more than 64 tags on one, more tags than a post can hold (512) or an invalid tag; 404 for a missing post; 409 `deleted` for a post in the recycle bin. |
 | PUT | `/posts/{id}/vote` | `{value: -1 \| 0 \| 1}`, or `{stars: 0–5}` under stars | `Post` with the new `score` and `my_vote` (and `stars`, `votes`, `my_stars` under stars; see [Scores](#scores)) |
 
-A `Post` carries `file_url`, `thumb_url` and `sample_url`. These are signed paths relative to the server, valid for at least 6 hours. Fetch them without the bearer token. `thumb_url` is null when no thumbnail exists. `sample_url` is a smaller JPEG copy of a big image, meant for viewing; it is null for most posts, and `file_url` stays the original to download. `duration_ms` is the length of a video, or null. `file_date` is the date in the file, or null: EXIF for images (its wall clock, marked UTC, because EXIF has no time zone) and the creation time for videos. `palette` lists the picture's main colours as `#rrggbb`, most common first; it is left out when there are none. `GET /posts/{id}` (and `POST /posts/{id}/ocr`) also carry `ocr_text`, the text found in a still image by OCR, lines separated by `\n`; it is left out when there is none, when the image is not read yet, and in lists.
+A `Post` carries `file_url`, `thumb_url` and `sample_url`. These are signed paths relative to the server, valid for at least 6 hours. Fetch them without the bearer token. `thumb_url` is null when no thumbnail exists. `sample_url` is a smaller JPEG copy of a big image, meant for viewing; it is null for most posts, and `file_url` stays the original to download. `duration_ms` is the length of a video, or null. `file_date` is the date in the file, or null: EXIF for images (its wall clock, marked UTC, because EXIF has no time zone) and the creation time for videos. `palette` lists the picture's main colours as `#rrggbb`, most common first; it is left out when there are none. `GET /posts/{id}` (and `POST /posts/{id}/ocr`) also carry `ocr_text`, the text found in a still image by OCR, lines separated by `\n`; it is left out when there is none, when the image is not read yet, and in lists. On a public server a post also carries `uploader`, `tag_votes` and `voted_off`, in lists too (see [Profiles](#profiles) and [Tag votes](#tag-votes)); a private server leaves them out, so its posts read as before.
 
 ### Chunked uploads
 
@@ -518,6 +632,7 @@ The page to give out is `/s/{token}` on the server, which the web app serves (`s
 
 ```text
 GET /media/{original|thumb|sample}/{sha256}.{ext}?exp=<unix>&sig=<hex>
+GET /media/{avatar|avatar64}/{sha256}.jpg?exp=<unix>&sig=<hex>
 ```
 
 Media URLs come from the API, so never build one by hand. Invalid or expired signatures get a 403. Range requests are supported. Responses are cacheable (`private, max-age=21600, immutable`).

@@ -168,24 +168,28 @@ struct UserRow {
     bytes: i64,
     quota_bytes: Option<i64>,
     last_active: Option<DateTime<Utc>>,
+    display_name: Option<String>,
+    about: Option<String>,
+    avatar_sha: Option<Vec<u8>>,
 }
 
-impl TryFrom<UserRow> for AdminUser {
-    type Error = AppError;
-
-    fn try_from(r: UserRow) -> AppResult<Self> {
-        Ok(AdminUser {
-            id: r.id,
-            username: r.username,
-            role: Role::from_db(&r.role).ok_or_else(|| AppError::internal("bad role in db"))?,
-            created_at: r.created_at,
-            disabled: r.disabled,
-            posts: count(r.posts),
-            bytes: count(r.bytes),
-            quota_bytes: r.quota_bytes.and_then(|q| u64::try_from(q).ok()),
-            last_active: r.last_active,
-        })
-    }
+fn to_admin_user(state: &AppState, r: UserRow) -> AppResult<AdminUser> {
+    Ok(AdminUser {
+        id: r.id,
+        username: r.username,
+        role: Role::from_db(&r.role).ok_or_else(|| AppError::internal("bad role in db"))?,
+        created_at: r.created_at,
+        disabled: r.disabled,
+        posts: count(r.posts),
+        bytes: count(r.bytes),
+        quota_bytes: r.quota_bytes.and_then(|q| u64::try_from(q).ok()),
+        last_active: r.last_active,
+        display_name: r.display_name,
+        about: r.about,
+        avatar_url: r
+            .avatar_sha
+            .map(|sha| crate::avatars::urls(state, &hex::encode(sha)).1),
+    })
 }
 
 /// Every account with `$1` NULL, else just that one.
@@ -194,7 +198,8 @@ const USERS_SQL: &str = "SELECT u.id, u.username, u.role, u.created_at, \
         coalesce(p.posts, 0) AS posts, coalesce(p.bytes, 0)::bigint AS bytes, u.quota_bytes, \
         greatest((SELECT max(last_used_at) FROM sessions s WHERE s.user_id = u.id), \
                  (SELECT max(last_used_at) FROM api_keys k WHERE k.user_id = u.id)) \
-            AS last_active \
+            AS last_active, \
+        u.display_name, u.about, u.avatar_sha \
     FROM users u \
     LEFT JOIN (SELECT uploader_id, count(*) AS posts, sum(file_size) AS bytes \
                FROM posts GROUP BY uploader_id) p ON p.uploader_id = u.id \
@@ -212,21 +217,24 @@ pub async fn users(
         .fetch_all(&state.db)
         .await?;
     rows.into_iter()
-        .map(AdminUser::try_from)
+        .map(|r| to_admin_user(&state, r))
         .collect::<AppResult<_>>()
         .map(Json)
 }
 
 /// Starts an account change: takes the lock and checks the caller is still
-/// an active admin, and that `target` isn't the caller.
+/// an active admin, and that `target` isn't the caller unless `own` is
+/// `None`.
 async fn begin_change<'a>(
     state: &'a AppState,
     user: &AuthUser,
     target: i64,
-    own: &'static str,
+    own: Option<&'static str>,
 ) -> AppResult<sqlx::Transaction<'a, sqlx::Postgres>> {
     require_admin_session(user)?;
-    if target == user.id {
+    if let Some(own) = own
+        && target == user.id
+    {
         return Err(AppError::BadRequest(own.into()));
     }
     let mut tx = state.db.begin().await?;
@@ -247,21 +255,19 @@ async fn begin_change<'a>(
     Ok(tx)
 }
 
-/// `PATCH /admin/users/{id}`: role, disabled and storage limit. Disabling
-/// signs the account out everywhere; its keys are refused until enabled.
+/// `PATCH /admin/users/{id}`: role, disabled and storage limit, and for
+/// moderation the profile's picture, text and display name. Disabling signs
+/// the account out everywhere; its keys are refused until enabled. Only the
+/// profile may be cleared on the admin's own account.
 pub async fn update_user(
     State(state): State<AppState>,
     user: AuthUser,
     Path(id): Path<i64>,
     Json(req): Json<UserUpdate>,
 ) -> AppResult<Json<AdminUser>> {
-    let mut tx = begin_change(
-        &state,
-        &user,
-        id,
-        "you can't change your own role or disable your own account",
-    )
-    .await?;
+    let own = (!req.only_profile())
+        .then_some("you can't change your own role or disable your own account");
+    let mut tx = begin_change(&state, &user, id, own).await?;
     let quota = match req.quota_bytes {
         Some(Some(q)) => Some(
             i64::try_from(q).map_err(|_| AppError::BadRequest("that limit is too big".into()))?,
@@ -274,7 +280,9 @@ pub async fn update_user(
              disabled_at = CASE WHEN $3::boolean IS NULL THEN disabled_at \
                                 WHEN $3 THEN coalesce(disabled_at, now()) \
                                 ELSE NULL END, \
-             quota_bytes = CASE WHEN $4 THEN $5 ELSE quota_bytes END \
+             quota_bytes = CASE WHEN $4 THEN $5 ELSE quota_bytes END, \
+             about = CASE WHEN $6 THEN NULL ELSE about END, \
+             display_name = CASE WHEN $7 THEN NULL ELSE display_name END \
          WHERE id = $1",
     )
     .bind(id)
@@ -282,6 +290,8 @@ pub async fn update_user(
     .bind(req.disabled)
     .bind(req.quota_bytes.is_some())
     .bind(quota)
+    .bind(req.clear_about)
+    .bind(req.clear_display_name)
     .execute(&mut *tx)
     .await?;
     if done.rows_affected() == 0 {
@@ -294,11 +304,14 @@ pub async fn update_user(
             .await?;
     }
     tx.commit().await?;
+    if req.clear_avatar {
+        crate::avatars::clear(&state, id).await?;
+    }
     let row: UserRow = sqlx::query_as(USERS_SQL)
         .bind(Some(id))
         .fetch_one(&state.db)
         .await?;
-    AdminUser::try_from(row).map(Json)
+    to_admin_user(&state, row).map(Json)
 }
 
 /// `POST /admin/users/{id}/password`: for someone who forgot theirs. Signs
@@ -316,7 +329,7 @@ pub async fn reset_password(
         &state,
         &user,
         id,
-        "change your own password under Account instead",
+        Some("change your own password under Account instead"),
     )
     .await?;
     let done = sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
@@ -343,7 +356,7 @@ pub async fn delete_user(
     user: AuthUser,
     Path(id): Path<i64>,
 ) -> AppResult<StatusCode> {
-    let mut tx = begin_change(&state, &user, id, "you can't delete your own account").await?;
+    let mut tx = begin_change(&state, &user, id, Some("you can't delete your own account")).await?;
     modes::lock_shared(&mut tx).await?;
     // Votes go with the account, so take them off the scores first.
     sqlx::query(
@@ -363,6 +376,10 @@ pub async fn delete_user(
         return Err(AppError::NotFound);
     }
     tx.commit().await?;
+    // Its picture's files, unless someone else has the same picture.
+    if let Err(e) = crate::avatars::sweep(&state).await {
+        tracing::warn!("a deleted account's picture was left on disk: {e}");
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

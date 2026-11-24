@@ -4,6 +4,7 @@
 //! only changed in the app.
 
 use sqlx::PgExecutor;
+use starbooru_core::tag_vote::DEFAULT_TAG_VOTE_THRESHOLD;
 use starbooru_core::{
     AiGeneralUpdate, AiMode, AiPreset, AiTool, AiToolUpdate, BackupSchedule, Mode, ScoreKind,
     ServerSettings, UpdateSettings,
@@ -14,8 +15,8 @@ use crate::config::Config;
 use crate::error::AppResult;
 use crate::state::AppState;
 
-/// name, allow_registration, trash_days, auto_meta_tags, mode, score_kind;
-/// NULL follows the environment.
+/// name, allow_registration, trash_days, auto_meta_tags, mode, score_kind,
+/// tag_vote_threshold; NULL follows the environment, or the default.
 type SettingsRow = (
     Option<String>,
     Option<bool>,
@@ -23,17 +24,18 @@ type SettingsRow = (
     Option<bool>,
     Option<String>,
     Option<String>,
+    Option<i32>,
 );
 
 /// The settings in force.
 pub async fn current(state: &AppState) -> AppResult<ServerSettings> {
     let row: Option<SettingsRow> = sqlx::query_as(
-        "SELECT name, allow_registration, trash_days, auto_meta_tags, mode, score_kind \
-         FROM server_settings",
+        "SELECT name, allow_registration, trash_days, auto_meta_tags, mode, score_kind, \
+         tag_vote_threshold FROM server_settings",
     )
     .fetch_optional(&state.db)
     .await?;
-    let (name, allow_registration, trash_days, auto_meta_tags, mode, kind) =
+    let (name, allow_registration, trash_days, auto_meta_tags, mode, kind, threshold) =
         row.unwrap_or_default();
     let config = &state.config;
     let (mode, score_kind) = in_force(mode, kind);
@@ -46,8 +48,25 @@ pub async fn current(state: &AppState) -> AppResult<ServerSettings> {
         auto_meta_tags: auto_meta_tags.unwrap_or(config.auto_meta_tags),
         mode,
         score_kind,
+        // Only public instances vote on tags; old apps never see it.
+        tag_vote_threshold: (mode == Mode::Public).then(|| threshold_or_default(threshold)),
         changes: Vec::new(),
     })
+}
+
+fn threshold_or_default(stored: Option<i32>) -> u32 {
+    stored
+        .and_then(|t| u32::try_from(t).ok())
+        .unwrap_or(DEFAULT_TAG_VOTE_THRESHOLD)
+}
+
+/// The score at which a tag comes off a post, as a positive number; 0 never.
+pub async fn tag_vote_threshold(db: impl PgExecutor<'_>) -> AppResult<u32> {
+    let stored: Option<Option<i32>> =
+        sqlx::query_scalar("SELECT tag_vote_threshold FROM server_settings")
+            .fetch_optional(db)
+            .await?;
+    Ok(threshold_or_default(stored.flatten()))
 }
 
 /// The mode and the score kind in force, from what is stored. Unlike the
@@ -141,11 +160,18 @@ pub async fn save(
     settings: &ServerSettings,
 ) -> AppResult<()> {
     let trash_days = i32::try_from(settings.trash_days).unwrap_or(i32::MAX);
+    // Left out, the threshold stays.
+    let threshold = settings
+        .tag_vote_threshold
+        .map(|t| i32::try_from(t).unwrap_or(i32::MAX));
     sqlx::query(
-        "INSERT INTO server_settings (id, name, allow_registration, trash_days, auto_meta_tags) \
-         VALUES (true, $1, $2, $3, $4) \
+        "INSERT INTO server_settings \
+             (id, name, allow_registration, trash_days, auto_meta_tags, tag_vote_threshold) \
+         VALUES (true, $1, $2, $3, $4, $5) \
          ON CONFLICT (id) DO UPDATE SET name = $1, allow_registration = $2, \
-         trash_days = $3, auto_meta_tags = $4, updated_at = now()",
+         trash_days = $3, auto_meta_tags = $4, \
+         tag_vote_threshold = COALESCE($5, server_settings.tag_vote_threshold), \
+         updated_at = now()",
     )
     .bind((settings.name != config.instance_name).then_some(&settings.name))
     .bind(
@@ -154,6 +180,7 @@ pub async fn save(
     )
     .bind((settings.trash_days != config.trash_days).then_some(trash_days))
     .bind((settings.auto_meta_tags != config.auto_meta_tags).then_some(settings.auto_meta_tags))
+    .bind(threshold)
     .execute(db)
     .await?;
     Ok(())

@@ -15,7 +15,7 @@ use starbooru_core::{
     MAX_DUPLICATE_DISTANCE, MAX_DUPLICATE_GROUP, Post, ResolveDuplicates,
 };
 
-use super::posts::{PostRow, adjust_counts, load, select_posts, set_tags, to_post};
+use super::posts::{PostRow, adjust_counts, is_public, load, select_posts, set_tags, to_post};
 use crate::auth::AuthUser;
 use crate::error::{AppError, AppResult};
 use crate::similar::{self, Fingerprint};
@@ -74,7 +74,7 @@ pub async fn list(
         .iter()
         .flat_map(|g| g.ids.iter().take(MAX_DUPLICATE_GROUP).copied())
         .collect();
-    let mut qb = select_posts(user.id);
+    let mut qb = select_posts(user.id, is_public(&state).await?);
     qb.push(" WHERE p.id = ANY(").push_bind(wanted).push(")");
     let rows = qb.build_query_as::<PostRow>().fetch_all(&state.db).await?;
     let mut posts: HashMap<i64, Post> = rows

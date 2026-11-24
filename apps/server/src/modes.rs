@@ -34,35 +34,118 @@ pub async fn lock_shared(tx: &mut Transaction<'_, Postgres>) -> AppResult<()> {
     Ok(())
 }
 
+/// For what only a public instance keeps: refuses with `code` unless the
+/// instance is public, and holds it so until `tx` ends, so a switch to
+/// private can't miss what `tx` writes.
+pub async fn hold_public(
+    tx: &mut Transaction<'_, Postgres>,
+    code: &'static str,
+    message: &'static str,
+) -> AppResult<()> {
+    lock_shared(tx).await?;
+    if settings::scoring(&mut **tx).await?.0 == Mode::Public {
+        Ok(())
+    } else {
+        Err(AppError::Refused { code, message })
+    }
+}
+
 /// Something a mode has no use for, which switching to it deletes.
 struct Unused {
     /// The mode without a use for it.
     mode: Mode,
     /// Its name in a [`Change`].
     kind: &'static str,
-    /// The table it is kept in, deleted from whole.
-    table: &'static str,
+    /// Where it is kept.
+    kept: Kept,
+}
+
+/// Where something is kept.
+enum Kept {
+    /// A table, deleted from whole.
+    Table(&'static str),
+    /// A column of `users`, emptied where it is set.
+    UserColumn(&'static str),
+}
+
+impl Kept {
+    #[cfg(test)]
+    fn name(&self) -> &'static str {
+        match self {
+            Kept::Table(name) | Kept::UserColumn(name) => name,
+        }
+    }
+
+    fn count_sql(&self) -> String {
+        match self {
+            Kept::Table(table) => format!("SELECT count(*) FROM {table}"),
+            Kept::UserColumn(column) => {
+                format!("SELECT count(*) FROM users WHERE {column} IS NOT NULL")
+            }
+        }
+    }
+
+    fn delete_sql(&self) -> String {
+        match self {
+            Kept::Table(table) => format!("DELETE FROM {table}"),
+            Kept::UserColumn(column) => {
+                format!("UPDATE users SET {column} = NULL WHERE {column} IS NOT NULL")
+            }
+        }
+    }
 }
 
 /// What each mode has no use for. Public instances share posts by their own
 /// address and don't reach other boorus, so their links and saved accounts
-/// and searches go. Private instances have no use yet for anything public
-/// ones keep.
+/// and searches go. Private instances show nobody else a profile, have no
+/// forum and don't vote on tags; display names and the forum's categories
+/// stay, for a server that goes public again. Rows go in the order they are
+/// deleted: forum posts before their threads.
 const UNUSED: &[Unused] = &[
     Unused {
         mode: Mode::Public,
         kind: changes::SHARE_LINKS,
-        table: "shares",
+        kept: Kept::Table("shares"),
     },
     Unused {
         mode: Mode::Public,
         kind: changes::BOORU_ACCOUNTS,
-        table: "booru_accounts",
+        kept: Kept::Table("booru_accounts"),
     },
     Unused {
         mode: Mode::Public,
         kind: changes::REMOTE_SEARCHES,
-        table: "remote_searches",
+        kept: Kept::Table("remote_searches"),
+    },
+    Unused {
+        mode: Mode::Private,
+        kind: changes::PROFILE_PICTURES,
+        kept: Kept::UserColumn("avatar_sha"),
+    },
+    Unused {
+        mode: Mode::Private,
+        kind: changes::PROFILE_TEXTS,
+        kept: Kept::UserColumn("about"),
+    },
+    Unused {
+        mode: Mode::Private,
+        kind: changes::FORUM_POSTS,
+        kept: Kept::Table("forum_posts"),
+    },
+    Unused {
+        mode: Mode::Private,
+        kind: changes::FORUM_THREADS,
+        kept: Kept::Table("forum_threads"),
+    },
+    Unused {
+        mode: Mode::Private,
+        kind: changes::TAG_VOTES,
+        kept: Kept::Table("tag_votes"),
+    },
+    Unused {
+        mode: Mode::Private,
+        kind: changes::TAG_REMOVALS,
+        kept: Kept::Table("tag_removals"),
     },
 ];
 
@@ -74,12 +157,9 @@ fn unused_in(mode: Mode) -> impl Iterator<Item = &'static Unused> {
 async fn unused_counts(conn: &mut PgConnection, mode: Mode) -> AppResult<Vec<Change>> {
     let mut counts = Vec::new();
     for unused in unused_in(mode) {
-        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT count(*) FROM {}",
-            unused.table
-        )))
-        .fetch_one(&mut *conn)
-        .await?;
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(unused.kept.count_sql()))
+            .fetch_one(&mut *conn)
+            .await?;
         counts.push((unused.kind, count));
     }
     Ok(changes_of(counts, false))
@@ -188,6 +268,9 @@ pub async fn settle(
     if first {
         settings::save_mode(&mut *tx, mode).await?;
         settings::save_score_kind(&mut *tx, kind).await?;
+        if stored_mode.is_none() && mode == Mode::Public {
+            crate::routes::seed_forum(&mut tx).await?;
+        }
     }
     tx.commit().await?;
     let env_mode = env_mode.filter(|_| !warned.0);
@@ -286,7 +369,7 @@ pub async fn switch(state: &AppState, to: Mode, backup: bool) -> AppResult<ModeS
     }
     let mut counts = Vec::new();
     for unused in unused_in(to) {
-        let gone = sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {}", unused.table)))
+        let gone = sqlx::query(sqlx::AssertSqlSafe(unused.kept.delete_sql()))
             .execute(&mut *tx)
             .await?
             .rows_affected();
@@ -297,6 +380,7 @@ pub async fn switch(state: &AppState, to: Mode, backup: bool) -> AppResult<ModeS
         // Public instances count likes; stored so, the private one that may
         // come later starts from likes too.
         settings::save_score_kind(&mut *tx, ScoreKind::Likes).await?;
+        crate::routes::seed_forum(&mut tx).await?;
     }
     settings::save_mode(&mut *tx, to).await?;
     let (_, kind) = settings::scoring(&mut *tx).await?;
@@ -306,6 +390,12 @@ pub async fn switch(state: &AppState, to: Mode, backup: bool) -> AppResult<ModeS
     info!("the server is {} now", to.as_str());
     for change in &done {
         info!("switching to {}: {}", to.as_str(), change.message);
+    }
+    if to == Mode::Private {
+        // The pictures' rows are gone; now their files.
+        if let Err(e) = crate::avatars::sweep(state).await {
+            warn!("profile pictures left on disk after the switch: {e}");
+        }
     }
     Ok(ModeSwitched {
         settings: settings::current(state).await?,
@@ -395,6 +485,42 @@ fn sentence(kind: &str, count: u64, done: bool) -> String {
             },
             format!("{become_} stars: a like 5, a dislike 1"),
         ),
+        changes::PROFILE_PICTURES => (
+            if one {
+                "profile picture"
+            } else {
+                "profile pictures"
+            },
+            deleted.to_owned(),
+        ),
+        changes::PROFILE_TEXTS => (
+            if one { "profile text" } else { "profile texts" },
+            format!("{deleted}; display names stay"),
+        ),
+        changes::FORUM_POSTS => (
+            if one { "forum post" } else { "forum posts" },
+            deleted.to_owned(),
+        ),
+        changes::FORUM_THREADS => (
+            if one { "forum thread" } else { "forum threads" },
+            format!("{deleted}; the categories stay"),
+        ),
+        changes::TAG_VOTES => (
+            if one {
+                "vote on a tag"
+            } else {
+                "votes on tags"
+            },
+            deleted.to_owned(),
+        ),
+        changes::TAG_REMOVALS => (
+            if one {
+                "record of a tag voted off a post"
+            } else {
+                "records of tags voted off posts"
+            },
+            format!("{deleted}; the tags stay off, and edits may add them again"),
+        ),
         other => (
             other,
             if done { "changed" } else { "will change" }.to_owned(),
@@ -480,10 +606,25 @@ mod tests {
             assert!(!sentence(unused.kind, 2, false).ends_with("will change"));
             assert!(
                 unused
-                    .table
+                    .kept
+                    .name()
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b == b'_')
             );
         }
+        assert_eq!(
+            sentence(changes::FORUM_THREADS, 1, true),
+            "1 forum thread was deleted; the categories stay"
+        );
+        assert_eq!(
+            Kept::UserColumn("about").delete_sql(),
+            "UPDATE users SET about = NULL WHERE about IS NOT NULL"
+        );
+    }
+
+    #[test]
+    fn forum_posts_go_before_their_threads() {
+        let at = |kind| UNUSED.iter().position(|u| u.kind == kind).unwrap();
+        assert!(at(changes::FORUM_POSTS) < at(changes::FORUM_THREADS));
     }
 }

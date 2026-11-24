@@ -304,11 +304,13 @@ async fn closure(tx: &mut Transaction<'_, Postgres>, tag_id: i64) -> AppResult<V
 }
 
 /// Adds everything `tag_id` implies to the posts that carry it, then
-/// recounts the affected tags.
+/// recounts the affected tags. Tags voted off a post stay off it.
 async fn apply_implications(tx: &mut Transaction<'_, Postgres>, tag_id: i64) -> AppResult<()> {
     let ids = closure(tx, tag_id).await?;
     sqlx::query(
-        "UPDATE posts SET tag_ids = ARRAY(SELECT DISTINCT unnest(tag_ids || $2::bigint[])), \
+        "UPDATE posts SET tag_ids = ARRAY(SELECT DISTINCT unnest(tag_ids || ARRAY( \
+             SELECT i FROM unnest($2::bigint[]) AS i WHERE NOT EXISTS ( \
+                 SELECT 1 FROM tag_removals r WHERE r.post_id = posts.id AND r.tag_id = i)))), \
          updated_at = now() \
          WHERE tag_ids @> ARRAY[$1::bigint] AND NOT tag_ids @> $2::bigint[]",
     )
@@ -332,7 +334,7 @@ async fn recount(tx: &mut Transaction<'_, Postgres>, ids: &[i64]) -> AppResult<(
 }
 
 /// Resolves a tag name from a URL (following an alias) to its row.
-async fn find(db: impl PgExecutor<'_>, raw: &str) -> AppResult<TagRow> {
+pub(super) async fn find(db: impl PgExecutor<'_>, raw: &str) -> AppResult<TagRow> {
     let name = normalize_tag(raw)?;
     let name = split_category(&name).1;
     sqlx::query_as(
@@ -675,9 +677,32 @@ async fn alias_into(
         .fetch_optional(&mut **tx)
         .await?;
     if let Some(old_id) = old {
+        // Votes and removals follow the tag: a vote unless the account voted
+        // on the target too, a removal unless the post carries the target.
+        // The rest go with the old tag.
         sqlx::query(
-            "UPDATE posts SET tag_ids = ARRAY(SELECT DISTINCT unnest( \
-                 array_replace(tag_ids, $1::bigint, $2::bigint))), updated_at = now() \
+            "UPDATE tag_removals r SET tag_id = $2 WHERE r.tag_id = $1 \
+             AND NOT EXISTS (SELECT 1 FROM tag_removals o WHERE o.post_id = r.post_id AND o.tag_id = $2) \
+             AND NOT EXISTS (SELECT 1 FROM posts p WHERE p.id = r.post_id AND p.tag_ids @> ARRAY[$2::bigint])",
+        )
+        .bind(old_id)
+        .bind(target_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "UPDATE tag_votes v SET tag_id = $2 WHERE v.tag_id = $1 \
+             AND NOT EXISTS (SELECT 1 FROM tag_votes o \
+                 WHERE o.post_id = v.post_id AND o.user_id = v.user_id AND o.tag_id = $2)",
+        )
+        .bind(old_id)
+        .bind(target_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "UPDATE posts SET tag_ids = ARRAY(SELECT DISTINCT t FROM \
+                 unnest(array_replace(tag_ids, $1::bigint, $2::bigint)) AS t \
+                 WHERE t <> $2 OR NOT EXISTS (SELECT 1 FROM tag_removals r \
+                     WHERE r.post_id = posts.id AND r.tag_id = $2)), updated_at = now() \
              WHERE tag_ids @> ARRAY[$1::bigint]",
         )
         .bind(old_id)

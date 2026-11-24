@@ -9,15 +9,18 @@ mod duplicates;
 mod edit;
 mod explore;
 mod figures;
+mod forum;
 mod imports;
 mod keys;
 mod library;
 mod modes;
 mod oidc;
 mod posts;
+mod profiles;
 mod remote;
 mod searches;
 mod shares;
+mod tag_votes;
 mod tags;
 mod trash;
 mod updates;
@@ -42,6 +45,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use starbooru_core::profile::MAX_AVATAR_BYTES;
 use starbooru_core::{ApiError, Mode, ServerInfo};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
@@ -50,6 +54,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, warn};
 
 pub(crate) use figures::replace as replace_figures;
+pub(crate) use forum::seed as seed_forum;
 pub(crate) use posts::set_tags as set_post_tags;
 
 use crate::error::{AppError, AppResult};
@@ -66,6 +71,14 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
         .route("/auth/usage", get(auth::usage))
+        .route("/auth/profile", get(profiles::mine).patch(profiles::update))
+        .route(
+            "/auth/avatar",
+            put(profiles::put_avatar)
+                .delete(profiles::delete_avatar)
+                .layer(DefaultBodyLimit::max(MAX_AVATAR_BYTES)),
+        )
+        .route("/users/{name}", get(profiles::get))
         .route("/auth/password", put(auth::change_password))
         .route("/auth/oidc/begin", post(oidc::begin))
         .route("/auth/oidc/begin-link", post(oidc::begin_link))
@@ -121,6 +134,11 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/mode", post(modes::switch))
         .route("/admin/mode/preview", get(modes::preview))
         .route("/admin/scores/preview", get(modes::scores_preview))
+        .route("/admin/tag-removals", get(tag_votes::removals))
+        .route(
+            "/admin/tag-removals/{id}",
+            axum::routing::delete(tag_votes::undo),
+        )
         .route("/keys", get(keys::list).post(keys::create))
         .route("/keys/{id}", axum::routing::delete(keys::delete))
         .route(
@@ -160,6 +178,7 @@ pub fn router(state: AppState) -> Router {
         .route("/library-imports/{id}/retry", post(library::retry))
         .route("/library-imports/{id}/failures", get(library::failures))
         .merge(remote_routes(&state))
+        .merge(forum_routes(&state))
         .route("/posts/bulk", post(posts::bulk))
         .route("/posts/{id}/neighbors", get(posts::neighbors))
         .route("/posts/{id}/related", get(posts::related))
@@ -168,6 +187,7 @@ pub fn router(state: AppState) -> Router {
         .route("/posts/{id}/purge", post(posts::purge))
         .route("/trash/empty", post(trash::empty))
         .route("/posts/{id}/vote", put(posts::vote))
+        .route("/posts/{id}/tags/{name}/vote", put(tag_votes::vote))
         .route("/posts/{id}/figures", put(figures::put))
         .route("/posts/{id}/edit", post(edit::edit))
         .route("/shares", get(shares::list).post(shares::create))
@@ -264,6 +284,36 @@ fn remote_routes(state: &AppState) -> Router<AppState> {
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             remote_gate,
+        ))
+}
+
+/// The forum. A private instance answers 403 `forum_off` to all of it.
+fn forum_routes(state: &AppState) -> Router<AppState> {
+    Router::new()
+        .route("/forum", get(forum::categories))
+        .route("/forum/categories", post(forum::create_category))
+        .route(
+            "/forum/categories/{id}",
+            axum::routing::patch(forum::update_category).delete(forum::delete_category),
+        )
+        .route(
+            "/forum/threads",
+            get(forum::threads).post(forum::create_thread),
+        )
+        .route(
+            "/forum/threads/{id}",
+            get(forum::read_thread)
+                .patch(forum::update_thread)
+                .delete(forum::delete_thread),
+        )
+        .route("/forum/threads/{id}/posts", post(forum::reply))
+        .route(
+            "/forum/posts/{id}",
+            axum::routing::patch(forum::edit_post).delete(forum::delete_post),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            forum::gate,
         ))
 }
 

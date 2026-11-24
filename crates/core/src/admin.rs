@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use crate::Role;
 use crate::mode::{Change, Mode, ScoreKind};
+use crate::tag_vote::MAX_TAG_VOTE_THRESHOLD;
 
 pub const MAX_INSTANCE_NAME_CHARS: usize = 64;
 pub const MAX_TRASH_DAYS: u32 = 3650;
@@ -38,6 +39,11 @@ pub struct ServerSettings {
     /// public instance. Left out of a `PUT`, it stays as it is.
     #[serde(default)]
     pub score_kind: ScoreKind,
+    /// On a public instance: a tag voted down to minus this comes off its
+    /// post; 0 never. `None` on a private one. Left out of a `PUT`, it
+    /// stays as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_vote_threshold: Option<u32>,
     /// Only in the answer to a `PUT` that changed `score_kind`: the votes
     /// it converted and dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -62,6 +68,8 @@ pub enum SettingsError {
     BadBackupDays,
     #[error("keep 1 to {MAX_BACKUP_KEEP} automatic backups")]
     BadBackupKeep,
+    #[error("a tag comes off at a score of 0 (never) to -{MAX_TAG_VOTE_THRESHOLD}")]
+    BadTagVoteThreshold,
 }
 
 /// Trims and checks settings before they are saved.
@@ -83,6 +91,12 @@ pub fn clean_settings(settings: &ServerSettings) -> Result<ServerSettings, Setti
     if settings.trash_days > MAX_TRASH_DAYS {
         return Err(SettingsError::BadTrashDays);
     }
+    if settings
+        .tag_vote_threshold
+        .is_some_and(|t| t > MAX_TAG_VOTE_THRESHOLD)
+    {
+        return Err(SettingsError::BadTagVoteThreshold);
+    }
     Ok(ServerSettings {
         name,
         allow_registration: settings.allow_registration,
@@ -90,6 +104,7 @@ pub fn clean_settings(settings: &ServerSettings) -> Result<ServerSettings, Setti
         auto_meta_tags: settings.auto_meta_tags,
         mode: settings.mode,
         score_kind: settings.score_kind,
+        tag_vote_threshold: settings.tag_vote_threshold,
         changes: Vec::new(),
     })
 }
@@ -150,6 +165,14 @@ pub struct AdminUser {
     pub quota_bytes: Option<u64>,
     /// The latest use of any of its sessions or keys.
     pub last_active: Option<DateTime<Utc>>,
+    /// Its profile, for moderation; left out when not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+    /// Signed, server-relative URL of its 64 px picture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
 }
 
 /// `PATCH /admin/users/{id}`: fields left out stay as they are.
@@ -166,10 +189,26 @@ pub struct UserUpdate {
         skip_serializing_if = "Option::is_none"
     )]
     pub quota_bytes: Option<Option<u64>>,
+    /// Moderation: removes the account's profile picture.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_avatar: bool,
+    /// Moderation: removes the text the account wrote about itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_about: bool,
+    /// Moderation: removes the account's display name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_display_name: bool,
+}
+
+impl UserUpdate {
+    /// Changes only the profile, which an admin may do to their own account.
+    pub fn only_profile(&self) -> bool {
+        self.role.is_none() && self.disabled.is_none() && self.quota_bytes.is_none()
+    }
 }
 
 /// Tells a `null` field (`Some(None)`) from a missing one (`None`).
-fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
@@ -264,6 +303,7 @@ mod tests {
             auto_meta_tags: true,
             mode: Mode::Private,
             score_kind: ScoreKind::Likes,
+            tag_vote_threshold: None,
             changes: Vec::new(),
         }
     }
@@ -277,10 +317,12 @@ mod tests {
         .unwrap();
         assert_eq!(old.mode, Mode::Private);
         assert_eq!(old.score_kind, ScoreKind::Likes);
+        assert_eq!(old.tag_vote_threshold, None);
         assert!(old.auto_meta_tags);
         let out = serde_json::to_value(settings("x", 0)).unwrap();
         assert_eq!(out["mode"], "private");
         assert!(out.get("changes").is_none());
+        assert!(out.get("tag_vote_threshold").is_none());
     }
 
     #[test]
@@ -306,6 +348,16 @@ mod tests {
             clean_settings(&settings("x", MAX_TRASH_DAYS + 1)),
             Err(SettingsError::BadTrashDays)
         );
+        let threshold = |t| ServerSettings {
+            tag_vote_threshold: Some(t),
+            ..settings("x", 0)
+        };
+        assert!(clean_settings(&threshold(0)).is_ok());
+        assert!(clean_settings(&threshold(MAX_TAG_VOTE_THRESHOLD)).is_ok());
+        assert_eq!(
+            clean_settings(&threshold(MAX_TAG_VOTE_THRESHOLD + 1)),
+            Err(SettingsError::BadTagVoteThreshold)
+        );
     }
 
     #[test]
@@ -322,7 +374,16 @@ mod tests {
                 role: None,
                 disabled: Some(true),
                 quota_bytes: Some(Some(5)),
+                ..UserUpdate::default()
             }
+        );
+        let moderate = parse(json!({ "clear_avatar": true, "clear_about": true }));
+        assert!(moderate.clear_avatar && moderate.clear_about && !moderate.clear_display_name);
+        assert!(moderate.only_profile());
+        assert!(!parse(json!({ "role": "user", "clear_avatar": true })).only_profile());
+        assert_eq!(
+            serde_json::to_value(UserUpdate::default()).unwrap(),
+            json!({})
         );
         assert_eq!(parse(json!({ "role": "admin" })).role, Some(Role::Admin));
         assert!(serde_json::from_value::<UserUpdate>(json!({ "quota_bytes": -1 })).is_err());

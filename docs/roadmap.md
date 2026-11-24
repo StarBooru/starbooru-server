@@ -36,9 +36,10 @@ The owner's answers (2026-11-23): in public mode, people without an account can 
 - [x] The mode, a server setting that `/info` reports
 - [x] Switching is destructive, so the switch first offers a backup made for it, on by default
 - [x] Private mode: 0 to 5 star scores as an option, with likes and dislikes as the default
-- [ ] Public mode: accounts with a profile and a profile picture. Sign-up exists (`allow_registration`), but a user has only a name and a role
-- [ ] Public mode: a forum
-- [ ] Public mode: votes on tags. Only posts take votes today
+- [x] Public mode: accounts with a profile and a profile picture
+- [x] Public mode: a forum
+- [ ] A moderator role between users and admins, and forum notifications
+- [x] Public mode: votes on tags
 - [x] Public mode: the other-booru endpoints (`/remote/*`) are off and can't be turned on
 - [x] Public mode: browsing without an account, read-only, and Explore's Trending and Popular tags
 - [x] Share links set up to suit each mode: share links in private mode, a post's own address in public mode

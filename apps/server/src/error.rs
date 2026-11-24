@@ -44,6 +44,9 @@ pub enum AppError {
     /// Too many requests without an account from one address.
     #[error("too many requests without an account; try again in {} or sign in", wait_phrase(*.retry_after))]
     GuestLimit { retry_after: u64 },
+    /// Too much too quickly, saying what and for how long.
+    #[error("{message}")]
+    Slow { retry_after: u64, message: String },
     /// A remote server failed during URL import.
     #[error("{0}")]
     Upstream(String),
@@ -71,9 +74,9 @@ impl AppError {
             AppError::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "too_large"),
             AppError::StorageFull => (StatusCode::INSUFFICIENT_STORAGE, "storage_full"),
             AppError::Unsupported(_) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported"),
-            AppError::TooManyRequests { .. } | AppError::GuestLimit { .. } => {
-                (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
-            }
+            AppError::TooManyRequests { .. }
+            | AppError::GuestLimit { .. }
+            | AppError::Slow { .. } => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
             // Not 502 or 504: Cloudflare swaps those for a page of its own, and the
             // message that says what went wrong never reaches the user.
             AppError::Upstream(_) => (StatusCode::FAILED_DEPENDENCY, "fetch_failed"),
@@ -100,8 +103,9 @@ impl IntoResponse for AppError {
             }),
         )
             .into_response();
-        if let AppError::TooManyRequests { retry_after } | AppError::GuestLimit { retry_after } =
-            self
+        if let AppError::TooManyRequests { retry_after }
+        | AppError::GuestLimit { retry_after }
+        | AppError::Slow { retry_after, .. } = self
         {
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
@@ -153,6 +157,18 @@ impl From<starbooru_core::tag::TagError> for AppError {
 
 impl From<starbooru_core::FigureError> for AppError {
     fn from(e: starbooru_core::FigureError) -> Self {
+        AppError::BadRequest(e.to_string())
+    }
+}
+
+impl From<starbooru_core::ProfileError> for AppError {
+    fn from(e: starbooru_core::ProfileError) -> Self {
+        AppError::BadRequest(e.to_string())
+    }
+}
+
+impl From<starbooru_core::ForumError> for AppError {
+    fn from(e: starbooru_core::ForumError) -> Self {
         AppError::BadRequest(e.to_string())
     }
 }

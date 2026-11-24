@@ -30,6 +30,10 @@ pub const GUEST_READS: &[(&str, u32)] = &[
     ("/tag-corrections", 1),
     // Four sections, two of them the heaviest queries a guest can ask for.
     ("/explore", 5),
+    ("/users/{name}", 1),
+    ("/forum", 1),
+    ("/forum/threads", 1),
+    ("/forum/threads/{id}", 1),
 ];
 
 /// What one client address may ask for without an account in a window.

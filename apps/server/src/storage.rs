@@ -4,6 +4,8 @@
 //! <data>/original/ab/cd/<sha256>.<ext>
 //! <data>/thumb/ab/cd/<sha256>.jpg
 //! <data>/sample/ab/cd/<sha256>.jpg
+//! <data>/avatar/ab/cd/<sha256>.jpg     (profile pictures, 256 px)
+//! <data>/avatar64/ab/cd/<sha256>.jpg   (the same at 64 px)
 //! ```
 
 use std::io::{Cursor, Read, Seek};
@@ -43,6 +45,7 @@ const SAMPLE_MIN_BYTES: usize = 1 << 20;
 const SAMPLE_MAX_PERCENT: usize = 75;
 /// Refuse to decode images whose pixel buffers would exceed this.
 const MAX_DECODE_BYTES: u64 = 1 << 30;
+const AVATAR_EXT: &str = "jpg";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Variant {
@@ -50,24 +53,33 @@ pub enum Variant {
     Thumb,
     /// A smaller copy of a big image, for viewing.
     Sample,
+    /// A profile picture, `AVATAR_SIZE` square.
+    Avatar,
+    /// The same at `AVATAR_SMALL_SIZE`.
+    AvatarSmall,
 }
 
 impl Variant {
+    pub const ALL: [Variant; 5] = [
+        Variant::Original,
+        Variant::Thumb,
+        Variant::Sample,
+        Variant::Avatar,
+        Variant::AvatarSmall,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Variant::Original => "original",
             Variant::Thumb => "thumb",
             Variant::Sample => "sample",
+            Variant::Avatar => "avatar",
+            Variant::AvatarSmall => "avatar64",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "original" => Some(Variant::Original),
-            "thumb" => Some(Variant::Thumb),
-            "sample" => Some(Variant::Sample),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
     }
 }
 
@@ -136,7 +148,7 @@ pub struct Storage {
 
 impl Storage {
     pub async fn open(root: &Path) -> std::io::Result<Self> {
-        for v in [Variant::Original, Variant::Thumb, Variant::Sample] {
+        for v in Variant::ALL {
             tokio::fs::create_dir_all(root.join(v.as_str())).await?;
         }
         let tmp = root.join("tmp");
@@ -199,6 +211,7 @@ impl Storage {
             Variant::Original => format!("{sha_hex}.{ext}"),
             Variant::Thumb => format!("{sha_hex}.{THUMB_EXT}"),
             Variant::Sample => format!("{sha_hex}.{SAMPLE_EXT}"),
+            Variant::Avatar | Variant::AvatarSmall => format!("{sha_hex}.{AVATAR_EXT}"),
         }
     }
 
@@ -543,6 +556,62 @@ impl Storage {
         Ok(())
     }
 
+    /// Stores both copies of a profile picture under its name, unless they
+    /// are there already. Call from a blocking thread.
+    pub fn write_avatar(&self, sha_hex: &str, big: &[u8], small: &[u8]) -> AppResult<()> {
+        for (variant, jpeg) in [(Variant::Avatar, big), (Variant::AvatarSmall, small)] {
+            let path = self
+                .path_for_file(variant, &Self::file_name(variant, sha_hex, AVATAR_EXT))
+                .ok_or_else(|| AppError::internal("bad storage path"))?;
+            self.write_atomic(&path, jpeg)?;
+        }
+        Ok(())
+    }
+
+    /// Deletes both copies of a profile picture. Missing files are not an
+    /// error.
+    pub fn remove_avatar(&self, sha_hex: &str) -> std::io::Result<()> {
+        for variant in [Variant::Avatar, Variant::AvatarSmall] {
+            let Some(path) =
+                self.path_for_file(variant, &Self::file_name(variant, sha_hex, AVATAR_EXT))
+            else {
+                continue;
+            };
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// The names (SHA-256 in hex) of the profile pictures on disk, either
+    /// copy. Call from a blocking thread.
+    pub fn avatar_names(&self) -> std::io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for variant in [Variant::Avatar, Variant::AvatarSmall] {
+            let root = self.root.join(variant.as_str());
+            for a in read_dirs(&root)? {
+                for b in read_dirs(&a)? {
+                    for entry in std::fs::read_dir(&b)? {
+                        let path = entry?.path();
+                        let Some(file) = path.file_name().and_then(|f| f.to_str()) else {
+                            continue;
+                        };
+                        if self.path_for_file(variant, file).as_ref() == Some(&path)
+                            && let Some((sha, _)) = file.split_once('.')
+                            && !names.iter().any(|n| n == sha)
+                        {
+                            names.push(sha.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(names)
+    }
+
     /// Deletes a post's original, thumbnail and sample. Missing files are
     /// not an error.
     pub fn remove(&self, sha_hex: &str, ext: &str) -> std::io::Result<()> {
@@ -581,6 +650,23 @@ impl Storage {
     }
 }
 
+/// The folders in `dir`; none when it doesn't exist.
+fn read_dirs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut dirs = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            dirs.push(entry.path());
+        }
+    }
+    Ok(dirs)
+}
+
 /// The format of a file starting with `head`, or the reason it isn't accepted.
 pub fn sniff(head: &[u8]) -> AppResult<&'static (&'static str, &'static str, MediaKind, bool)> {
     let detected =
@@ -594,11 +680,17 @@ pub fn sniff(head: &[u8]) -> AppResult<&'static (&'static str, &'static str, Med
 /// Decodes an image upright: the EXIF orientation is applied, as browsers
 /// do when they show the original.
 pub fn decode(bytes: &[u8]) -> AppResult<DynamicImage> {
+    decode_within(bytes, MAX_DECODE_BYTES)
+}
+
+/// [`decode`], refusing pictures whose pixels would take over `max_alloc`
+/// bytes.
+pub fn decode_within(bytes: &[u8], max_alloc: u64) -> AppResult<DynamicImage> {
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| AppError::BadRequest(format!("cannot read image: {e}")))?;
     let mut limits = Limits::default();
-    limits.max_alloc = Some(MAX_DECODE_BYTES);
+    limits.max_alloc = Some(max_alloc);
     reader.limits(limits);
     let mut decoder = reader
         .into_decoder()
@@ -708,6 +800,19 @@ pub fn fit_jpeg(img: &DynamicImage, size: u32, filter: FilterKind) -> AppResult<
     } else {
         img.thumbnail(size, size).to_rgba8()
     };
+    flat_jpeg(&small)
+}
+
+/// The image scaled to exactly `side`², larger or smaller, transparency
+/// flattened onto white, JPEG. For a square picture.
+pub fn square_jpeg(img: &DynamicImage, side: u32) -> AppResult<Vec<u8>> {
+    flat_jpeg(
+        &img.resize_exact(side, side, FilterType::CatmullRom)
+            .to_rgba8(),
+    )
+}
+
+fn flat_jpeg(small: &image::RgbaImage) -> AppResult<Vec<u8>> {
     let rgb = RgbImage::from_fn(small.width(), small.height(), |x, y| {
         let [r, g, b, a] = small.get_pixel(x, y).0;
         let a = u16::from(a);

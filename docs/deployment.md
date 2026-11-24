@@ -74,19 +74,23 @@ What a public server shows to anyone who finds its address:
 
 - every post outside the recycle bin, with its tags, rating, source, score and people, and its files through the signed media links;
 - the tags, their tree, aliases and implications, and spelling suggestions;
-- Explore, trending posts and popular tags included.
+- Explore, trending posts and popular tags included;
+- the accounts' profiles: display name, the text about themselves, picture, what they uploaded and wrote, and who uploaded each post;
+- the forum.
 
-They can't vote, upload, edit, tag, save searches or see the recycle bin, the accounts or anything in Administration. Each address may make 300 requests a minute without an account (an IPv6 network counts as one address); past that it waits, with `Retry-After`. Behind a reverse proxy, set `STARBOORU_TRUST_PROXY` so the limit counts each visitor rather than the proxy. A public server counts likes and dislikes, shares posts by their own address instead of share links, and doesn't search other boorus, which can't be turned on there. Library imports stay, for administrators.
+They can't vote, upload, edit, tag, post in the forum, save searches or see the recycle bin, the list of accounts or anything in Administration. Each address may make 300 requests a minute without an account (an IPv6 network counts as one address); past that it waits, with `Retry-After`. Behind a reverse proxy, set `STARBOORU_TRUST_PROXY` so the limit counts each visitor rather than the proxy. A public server counts likes and dislikes, shares posts by their own address instead of share links, and doesn't search other boorus, which can't be turned on there. Library imports stay, for administrators.
 
-To switch, use Administration in the app (or `POST /api/v1/admin/mode`). It first shows what the other mode has no use for and will delete: going public deletes the share links and the saved accounts and searches on other boorus, and turns star votes into likes (3 stars, neither, are dropped). It then backs the database up, unless you say not to, and switches.
+People with an account on a public server also vote on each post's tags: a tag voted down to −3 comes off that post, and edits don't put it back. Administration › Server sets that number (0 turns it off), and lists the tags taken off, each with an undo. The forum starts with three categories, General, Requests and Site, which admins rename, reorder or add to. Each account may post once every 15 seconds and 100 times a day; admins aren't limited. Admins also clear a profile's picture, text or display name from the list of accounts.
+
+To switch, use Administration in the app (or `POST /api/v1/admin/mode`). It first shows what the other mode has no use for and will delete. Going public deletes the share links and the saved accounts and searches on other boorus, and turns star votes into likes (3 stars, neither, are dropped). Going private deletes the profile pictures and texts, the forum's threads and posts, and the votes on tags; display names and the forum's categories stay, for a later switch back. It then backs the database up, unless you say not to, and switches.
 
 A private server can count 1 to 5 stars instead of likes (Administration › Server). Changing it converts the votes after showing how many: a like becomes 5 stars and a dislike 1, 4 or 5 stars a like and 1 or 2 a dislike.
 
-`STARBOORU_MODE` and `STARBOORU_SCORES` set the starting mode and score kind of a new server. The first start stores them, and from then on they have no effect: changes go through Administration, which shows what they delete or convert first. If one is later set to something other than what the server keeps, the server logs a warning at start and keeps what it has. Unset and empty are the same, so the compose file passes them empty by default. When you upgrade from a version without modes, the server stores private with likes, which is what it was. It follows the variables instead only if that deletes and converts nothing (going public with no share links and no saved booru accounts or searches, or stars with no votes yet); otherwise it logs a warning naming the variable and keeps private with likes.
+`STARBOORU_MODE` and `STARBOORU_SCORES` set the starting mode and score kind of a new server. The first start stores them, and from then on they have no effect: changes go through Administration, which shows what they delete or convert first. If one is later set to something other than what the server keeps, the server logs a warning at start and keeps what it has. Unset and empty are the same, so the compose file passes them empty by default. When you upgrade from a version without modes, the server stores private with likes, which is what it was. It follows the variables instead only if that deletes and converts nothing (going public with no share links and no saved booru accounts or searches, or stars with no votes yet); otherwise it logs a warning naming the variable and keeps private with likes. A server that starts public gets the forum's three categories then, as a switch would give it.
 
 ## Configuration
 
-Admins can change the name, open registration, the recycle-bin days, the score kind and the backup schedule in the app (Settings › Administration). Those changes apply at once and override the variables below.
+Admins can change the name, open registration, the recycle-bin days, the score kind, the tag-vote threshold and the backup schedule in the app (Settings › Administration). Those changes apply at once and override the variables below.
 
 | Variable | Default | Meaning |
 |---|---|---|

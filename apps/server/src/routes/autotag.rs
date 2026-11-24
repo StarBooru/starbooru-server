@@ -65,7 +65,15 @@ pub(super) async fn tag_post(
         .execute(&mut **tx)
         .await?;
         let ids = super::tags::resolve_for_post(tx, &names).await?;
-        added = ids.into_iter().filter(|id| !old_ids.contains(id)).collect();
+        let voted_off: Vec<i64> =
+            sqlx::query_scalar("SELECT tag_id FROM tag_removals WHERE post_id = $1")
+                .bind(post_id)
+                .fetch_all(&mut **tx)
+                .await?;
+        added = ids
+            .into_iter()
+            .filter(|id| !old_ids.contains(id) && !voted_off.contains(id))
+            .collect();
     }
     let mut new_ids = old_ids;
     new_ids.extend_from_slice(&added);

@@ -1,5 +1,7 @@
 //! Request and response bodies of the HTTP API.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -332,6 +334,17 @@ pub struct Post {
     /// single-post response.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub figures: Vec<crate::figure::Figure>,
+    /// Who uploaded it, on a public instance. `None` on a private one and
+    /// once the account is deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploader: Option<crate::profile::UserCard>,
+    /// On a public instance: the votes on its tags, for the tags that have
+    /// any. A tag missing here has a score of 0 and no vote of the caller's.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tag_votes: BTreeMap<String, crate::tag_vote::TagVote>,
+    /// On a public instance: tags voted off it, which edits leave off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub voted_off: Vec<String>,
 }
 
 /// One of a post's tags, as the viewer groups it.
@@ -822,6 +835,21 @@ mod tests {
         assert_eq!(info.mode, crate::Mode::Private);
         assert_eq!(info.score_kind, crate::ScoreKind::Likes);
         assert!(!info.guests);
+    }
+
+    #[test]
+    fn a_post_without_public_fields_reads_and_writes_as_before() {
+        let old = serde_json::json!({
+            "id": 7, "kind": "image", "mime": "image/png", "file_size": 10,
+            "width": 8, "height": 8, "duration_ms": null, "sha256": "ab",
+            "rating": "safe", "score": 1, "my_vote": 0, "source": null,
+            "tags": ["sky"], "created_at": "2026-11-24T00:00:00Z", "file_date": null,
+            "deleted": false, "file_url": "/media/original/ab.png", "thumb_url": null,
+            "sample_url": null
+        });
+        let post: Post = serde_json::from_value(old.clone()).unwrap();
+        assert!(post.uploader.is_none() && post.tag_votes.is_empty() && post.voted_off.is_empty());
+        assert_eq!(serde_json::to_value(&post).unwrap(), old);
     }
 
     #[test]

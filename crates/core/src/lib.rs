@@ -14,6 +14,7 @@ pub mod color;
 pub mod edit;
 pub mod figure;
 pub mod filter;
+pub mod forum;
 pub mod keys;
 pub mod library;
 pub mod local_ai;
@@ -23,11 +24,13 @@ pub mod model;
 pub mod oidc;
 pub mod panels;
 pub mod password;
+pub mod profile;
 pub mod query;
 pub mod remote;
 pub mod saved;
 pub mod share;
 pub mod tag;
+pub mod tag_vote;
 pub mod transfer;
 pub mod typo;
 pub mod update;
@@ -52,6 +55,10 @@ pub use figure::{
     COSPLAY_TAG, Figure, FigureError, FigureKind, FiguresUpdate, MAX_FIGURE_TAGS, MAX_FIGURES,
     Slot, clean_figures, cosplay_name, cosplay_tag, count_tags, is_count_tag, required_tags,
 };
+pub use forum::{
+    CategoryUpdate, ForumCategory, ForumError, ForumPost, ForumPostBody, ForumThread, NewCategory,
+    NewThread, PostMention, ThreadPage, ThreadUpdate, ThreadView, post_mentions,
+};
 pub use keys::clean_api_key;
 pub use library::{
     LibraryCheck, LibraryError, LibraryFailure, LibraryImport, LibraryPhase, LibraryRetry,
@@ -67,6 +74,10 @@ pub use model::*;
 pub use oidc::{Identity, OidcBegin, OidcError, OidcFinish, OidcStart, SignInMethods};
 pub use panels::{PanelTranslation, TextBlock, panel_prompt, parse_panel_blocks};
 pub use password::{password_is_weak, password_strength, strength_hue};
+pub use profile::{
+    AvatarCrop, Profile, ProfileError, ProfileUpdate, UserCard, avatar_square, clean_about,
+    clean_display_name,
+};
 pub use query::{
     FigureTerm, Order, SearchQuery, SortKey, parse_query, with_color, with_exact, with_order,
 };
@@ -79,6 +90,7 @@ pub use remote::{
 pub use saved::clean_saved_search;
 pub use share::{NewShare, Share, ShareError, SharedPost, SharedView};
 pub use tag::{normalize_tag, parse_tag_list};
+pub use tag_vote::{TagRemoval, TagRemovalPage, TagVote, TagVoteRequest, voted_off};
 pub use transfer::{Meter, Transfer};
 pub use typo::closest_tag;
 pub use update::{

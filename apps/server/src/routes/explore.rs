@@ -75,7 +75,7 @@ pub async fn explore(
     };
 
     // The sections are independent, so they run at the same time.
-    let mut qb = select_page(user_id);
+    let mut qb = select_page(user_id, popular);
     qb.push(" JOIN (SELECT post_id, sum(value) AS heat FROM post_votes WHERE voted_at >= ")
         .push_bind(since)
         .push(" GROUP BY post_id HAVING sum(value) > 0) h ON h.post_id = p.id");
@@ -123,7 +123,7 @@ pub async fn explore(
         )
     };
 
-    let mut qb = select_page(user_id);
+    let mut qb = select_page(user_id, popular);
     push_filters(&mut qb, &query, &filter);
     qb.push(" AND EXTRACT(MONTH FROM p.created_at AT TIME ZONE 'UTC')::int = ")
         .push_bind(i32::try_from(now.month()).unwrap_or(1))
@@ -138,7 +138,7 @@ pub async fn explore(
 
     let random = async {
         let random_from = |percent: Option<f32>| {
-            let mut qb = select_page(user_id);
+            let mut qb = select_page(user_id, popular);
             if let Some(percent) = percent {
                 qb.push(" TABLESAMPLE SYSTEM (")
                     .push_bind(percent)

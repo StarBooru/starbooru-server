@@ -143,6 +143,19 @@ pub mod changes {
     pub const STAR_VOTES_DROPPED: &str = "star_votes_dropped";
     /// Likes and dislikes that become stars.
     pub const LIKE_VOTES_CONVERTED: &str = "like_votes_converted";
+    /// Profile pictures, deleted going private.
+    pub const PROFILE_PICTURES: &str = "profile_pictures";
+    /// The texts accounts wrote about themselves, deleted going private.
+    pub const PROFILE_TEXTS: &str = "profile_texts";
+    /// Forum posts, deleted going private.
+    pub const FORUM_POSTS: &str = "forum_posts";
+    /// Forum threads, deleted going private.
+    pub const FORUM_THREADS: &str = "forum_threads";
+    /// Votes on posts' tags, deleted going private.
+    pub const TAG_VOTES: &str = "tag_votes";
+    /// Records of tags voted off posts, deleted going private. The tags
+    /// stay off; edits may add them again.
+    pub const TAG_REMOVALS: &str = "tag_removals";
 }
 
 /// `GET /admin/mode/preview?to=`: what switching to `to` would delete or

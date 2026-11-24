@@ -35,7 +35,8 @@ Each app lives in its own repository under [StarBooru](https://github.com/StarBo
 | `backup.rs` | Database backups: runs `pg_dump` (password in the environment, not the arguments) into the backup folder, one at a time, lists and prunes them, signs their download links, and makes the scheduled ones (checked hourly). |
 | `update/` | New releases and updates (see *Updates*). `github.rs` asks for the newest release, `docker.rs` is a small Docker Engine API client over the Unix socket (hyper, which axum and reqwest bring anyway), `container.rs` works out from Docker's description of the container what to pull and how to copy it, `helper.rs` is the `update-helper` process that replaces the container, `package.rs` updates the server package, and `mod.rs` keeps the state and runs the checks, automatic updates and installs. |
 | `settings.rs` | The server settings in force: the `server_settings` row over the environment variables. Read per request, so admin changes apply at once. The mode and the score kind are only what is stored (private with likes before it is); a public server's score kind is likes, whatever is stored. |
-| `modes.rs` | Private and public (see *Modes*). `UNUSED` is the one list of what each mode has no use for; the preview counts it and the switch deletes it. `settle` stores the mode and score kind on the first start. Also the advisory lock that switches, changes of score kind and votes share. |
+| `modes.rs` | Private and public (see *Modes*). `UNUSED` is the one list of what each mode has no use for, a table or a column of `users`; the preview counts it and the switch deletes it. `settle` stores the mode and score kind on the first start. Also the advisory lock that switches, changes of score kind and votes share, and `hold_public`, which takes it for a write that only a public server keeps. |
+| `avatars.rs` | Profile pictures: cuts an upload to a square, scales it to 256 and 64 px JPEGs named by the SHA-256 of the larger, and removes the files once no account uses them (see *Media storage*). |
 | `scores.rs` | Likes or stars: what a vote request asks for under each kind, how a post's tallies move, and the conversion from one kind to the other. |
 | `guests.rs` | People without an account on a public server. `GUEST_READS` is the one list of routes they may read, with what each costs them. A middleware lets such a request through within its address's limit and marks it, and the `Viewer` extractor those handlers take is the signed-in user or a guest. |
 | `throttle.rs` | Sign-in limits: failed attempts per account and per client address (IPv6 by /64) in fixed windows, in memory and capped at 10,000 keys each. The address is the socket peer, or the last `X-Forwarded-For` entry with `STARBOORU_TRUST_PROXY`. The guests' limit is one more of these, counting requests instead of failures. |
@@ -66,7 +67,7 @@ PostgreSQL schema: `apps/server/migrations/`.
 | `import_jobs` | Background URL imports per user: address, source, tags, rating, `state` (`queued`, `running`, `done`, `duplicate`, `failed`), the new `post_id` and a readable `error`. `attempts` and `not_before` are for a site that says it is busy: the tries so far, and when the next may start |
 | `booru_accounts` | Per user: an account on another booru, one per site address. `login` in the clear, the key in `sealed_key` (a 12-byte nonce, then the ciphertext and its tag). A backup holds them sealed; they open only with the same `STARBOORU_SECRET` |
 | `remote_searches` | Per user: a search on other boorus, kept with its name and the sites it goes to (a JSON list of `{api, base}`) |
-| `users` | Usernames are case-insensitively unique. Roles are `admin` and `user`; the first account becomes admin. `disabled_at` blocks sign-in and every token; `quota_bytes` caps the bytes of originals the account may upload (checked under a row lock at insert). |
+| `users` | Usernames are case-insensitively unique. Roles are `admin` and `user`; the first account becomes admin. `disabled_at` blocks sign-in and every token; `quota_bytes` caps the bytes of originals the account may upload (checked under a row lock at insert). The profile: `display_name`, `about` and `avatar_sha`, the picture's name (NULL for none). |
 | `user_identities` | Provider accounts (`issuer`, `subject`, unique together) linked to a user, with the provider's `label` and `last_used_at`. `users.password_hash` is NULL for accounts that only sign in this way. |
 | `oidc_logins` | Provider sign-ins in progress, at most 10 minutes: hashes of the `state`, the client's handle and the result code, the nonce and PKCE verifier, `return_to`, the account linking it (if any), then the provider's issuer, subject and label once the browser is back |
 | `server_settings` | One row of admin overrides (name, open registration, recycle-bin days, automatic meta tags, backup schedule, update checks and automatic updates); NULL follows the environment variable. `mode` and `score_kind` are NULL only until the first start with modes, which stores them (`modes::settle`); the environment doesn't move them after that |
@@ -86,6 +87,11 @@ PostgreSQL schema: `apps/server/migrations/`.
 | `library_imports` | Per user: a whole-library import with its source, address, phase, position and counts. `login` and `secret` are that site's account, and a constraint holds them to `queued` and `running` rows. |
 | `library_import_items` | Every post an import has dealt with: `post_id`, or `error` when it failed, so a retry tries it again and skips the rest. |
 | `tag_implications` | `tag_id → implied_id`. Expanded transitively (a recursive CTE) when tags are set, so implied tags are stored on posts. Cycles are refused. Edits take an advisory lock, since they may rewrite many posts. |
+| `forum_categories` | The forum's categories: a name unique regardless of case, a description and a `position` to list them by. They stay when the server goes private. |
+| `forum_threads` | A title, its category and author, `pinned` and `locked`, and `post_count` and `last_post_at`, kept in step by each reply so lists count nothing. Indexed for a category's list and the latest activity, and by `to_tsvector('simple', title)` for search. |
+| `forum_posts` | A thread's posts in id order: author, body, `edited_at`, and `deleted_at` for a post that keeps its place with an empty body. A GIN index on `to_tsvector('simple', body)` covers the posts not deleted; `(author_id, created_at)` serves the posting limits. Deleting an account keeps its threads and posts, without an author. |
+| `tag_votes` | One vote per user, post and tag, `value` 1 or −1. The primary key starts with the post, so a post's tag scores are an index lookup. |
+| `tag_removals` | Tags voted off a post, with the score they went at. While a row is there `posts::set_tags`, implications, alias merges and the automatic meta tags leave the tag off that post; an admin's undo deletes it. |
 
 ### Automatic meta tags
 
@@ -137,7 +143,7 @@ Tags are stored on each post as a `BIGINT[]` with a GIN index. A query like `blu
 3. The SQL is `tag_ids @> {leaf tags} AND tag_ids && {each parent's tree} AND NOT tag_ids && {excluded trees} AND rating = ANY(...)`.
    A `{girl blonde_hair boots}` term adds `EXISTS` over `figures` and `figure_tags`. A figure's tags are on the post too, so each of its tags also goes into the `tag_ids &&` filter and the GIN index narrows the search first.
 4. Rows are ordered by id, score or random, and paginated by limit and offset (at most 200 per page).
-5. The ordered, paginated query selects only post ids. The full rows, with tag names and the caller's vote, are built for the ids on the page (`select_page` in `routes/posts.rs`). So rows an `OFFSET` skips cost nothing extra.
+5. The ordered, paginated query selects only post ids. The full rows, with tag names and the caller's vote, are built for the ids on the page (`select_page` in `routes/posts.rs`). So rows an `OFFSET` skips cost nothing extra. On a public server each row also gets its uploader (by primary key), its tags' votes (the `tag_votes` primary key) and the tags voted off it (`tag_removals`), per post on the page and never by scanning.
 
 Partial indexes cover live posts, so the recycle bin doesn't slow normal browsing. Explore runs its four sections in parallel. Its random picks come from a sample of the table's pages (`TABLESAMPLE SYSTEM`) once the collection has more than 20,000 posts. When the sample has too few matches for a rare search, all the matches are sorted instead. Timings at a million posts are in `development.md` › *Speed at scale*. The query syntax is in `api.md`.
 
@@ -158,6 +164,8 @@ Only those candidates are scored, and only the top ones get full rows.
 /data/original/ab/cd/<sha256>.<ext>
 /data/thumb/ab/cd/<sha256>.jpg
 /data/sample/ab/cd/<sha256>.jpg
+/data/avatar/ab/cd/<sha256>.jpg     (profile pictures, 256 px)
+/data/avatar64/ab/cd/<sha256>.jpg   (the same, 64 px)
 /data/tmp/            (staging; writes are atomic renames)
 ```
 
@@ -178,6 +186,8 @@ Originals are kept byte for byte. Big still images also get a **sample**, a smal
 
 `posts.has_sample` is null until a post has been looked at. A background task at each start makes samples for older posts. `STARBOORU_SAMPLES=false` stops making them. The viewer swaps in the original when you zoom in or tap *Show original*, or always with Settings › *Always open originals*. Downloads and the editor use the original.
 
+**Profile pictures.** `PUT /auth/avatar` takes a JPEG, PNG, WebP or GIF of up to 5 MiB, sniffed by content, and decodes it within 256 MiB of pixels (a GIF gives its first frame). It cuts the square the client chose, or the largest one in the middle, and scales it to 256 and 64 px JPEGs. Both are named by the SHA-256 of the 256 px one, which goes in `users.avatar_sha`; the upload isn't kept. Two accounts with the same picture share the files. A changed or removed picture's files go once no account names them, under an advisory lock so a picture someone just took up stays. A sweep at each start, after a switch to private and after an account is deleted removes any left over. They are served like thumbnails, through signed `/media/avatar/…` and `/media/avatar64/…` URLs.
+
 **Text in images (OCR).** `posts.ocr_at` is null until a still image has been read by tesseract (`ocr.rs`); `posts.ocr_text` holds what it found, or null. A GIN index on `to_tsvector('simple', ocr_text)` for live posts serves `text:` search. Uploads are read in the background, so OCR never delays or fails one; a task at each start reads older posts one at a time, and `POST /posts/{id}/ocr` reads one again. With an AI provider set up, the viewer's *Translate* sends that text (never the image) to it and shows the answer in the app's language, without storing it. For comics and manga, `panels.rs` sends the image itself and keeps the result in `post_translations` (post, language, JSONB blocks with boxes on a 0–1000 scale, model); the viewer draws the blocks over the image with the same zoom transform.
 
 Media URLs look like `/media/thumb/<sha>.jpg?exp=…&sig=…`:
@@ -189,7 +199,9 @@ Media URLs look like `/media/thumb/<sha>.jpg?exp=…&sig=…`:
 
 A server is private or public (`api.md` › *Modes*). The mode is read from `server_settings` per request, like the other settings, so a switch applies at once.
 
-A switch (`modes::switch`) runs one at a time (a lock in memory and an advisory lock in the database). It makes the backup first, through `backup::create`, then in one transaction deletes the tables `UNUSED` lists for the new mode, writes the mode, and converts the votes when the score kind in force changes, which going public does. Going public also stores likes as the score kind, so a private server that comes back later starts from likes. A later item that gives either mode something of its own (the forum, profiles, tag votes) adds a row to `UNUSED` and nothing else.
+A switch (`modes::switch`) runs one at a time (a lock in memory and an advisory lock in the database). It makes the backup first, through `backup::create`, then in one transaction deletes what `UNUSED` lists for the new mode (whole tables, or a column of `users` set to NULL), writes the mode, and converts the votes when the score kind in force changes, which going public does. Going public also stores likes as the score kind, so a private server that comes back later starts from likes, and gives a forum without categories the three of `starbooru_core::forum::DEFAULT_CATEGORIES`. Going private removes the profile pictures' files after the transaction. Anything else that gives either mode something of its own adds a row to `UNUSED`.
+
+What only a public server keeps (forum threads and posts, tag votes, profile texts and pictures) is written in a transaction that first calls `modes::hold_public`: it takes the advisory lock shared and checks the mode, so a switch to private can't miss a write that started before it. The forum's routes sit behind `forum::gate`, which answers 403 `forum_off` on a private server, and the posting limits count an account's posts under a lock on its `users` row.
 
 `modes::settle` runs at start, before the server serves anything. When `mode` or `score_kind` is NULL (a new server, or the first start after an upgrade) it stores what `STARBOORU_MODE` and `STARBOORU_SCORES` ask for, if `UNUSED` and `scores::plan` say that deletes and converts nothing, and private with likes otherwise, with a warning. It converts nothing itself. Once both are stored it only compares them with the variables and returns one warning when they differ, which `main.rs` logs.
 

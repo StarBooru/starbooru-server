@@ -895,6 +895,8 @@ mod tests {
                 .status,
             StatusCode::OK
         );
+        let forum = app.call(Method::GET, "/api/v1/forum", None, None).await;
+        assert_eq!(forum.json().as_array().map(Vec::len), Some(3));
 
         // Changing the variables afterwards changes nothing.
         let s = settle(app.db(), Some(Mode::Private), Some(ScoreKind::Stars))
@@ -949,6 +951,125 @@ mod tests {
             .unwrap();
         assert_eq!(s.kind, ScoreKind::Likes);
         assert_eq!(stored(&app).await, some("private", "likes"));
+        app.finish().await;
+    }
+
+    #[tokio::test]
+    async fn going_private_deletes_what_only_a_public_server_shows() {
+        let Some(app) = testing::app().await else {
+            return;
+        };
+        let admin = app.register("admin").await;
+        let ann = app.register("ann").await;
+        let p = app.upload_png(&admin, 1, "sky cat").await;
+        app.switch(&admin, "public").await;
+
+        let png = {
+            let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(32, 32));
+            let mut out = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+            out.into_inner()
+        };
+        app.put_bytes("/api/v1/auth/avatar", Some(&ann), png).await;
+        app.call(
+            Method::PATCH,
+            "/api/v1/auth/profile",
+            Some(&ann),
+            Some(json!({ "display_name": "Ann", "about": "Hello" })),
+        )
+        .await;
+        let general = app.get("/api/v1/forum", &ann).await.json()[0]["id"].clone();
+        let r = post(
+            &app,
+            &ann,
+            "/api/v1/forum/threads",
+            json!({ "category_id": general, "title": "Hi", "body": "First" }),
+        )
+        .await;
+        let t = r.json()["id"].as_i64().unwrap();
+        post(
+            &app,
+            &admin,
+            &format!("/api/v1/forum/threads/{t}/posts"),
+            json!({ "body": "Welcome" }),
+        )
+        .await;
+        let mut s = app.get("/api/v1/admin/settings", &admin).await.json();
+        s["tag_vote_threshold"] = json!(1);
+        put(&app, &admin, "/api/v1/admin/settings", s).await;
+        for (tag, value) in [("sky", 1), ("cat", -1)] {
+            app.call(
+                Method::PUT,
+                &format!("/api/v1/posts/{p}/tags/{tag}/vote"),
+                Some(&ann),
+                Some(json!({ "value": value })),
+            )
+            .await;
+        }
+
+        let all = pairs(&[
+            ("profile_pictures", 1),
+            ("profile_texts", 1),
+            ("forum_posts", 2),
+            ("forum_threads", 1),
+            ("tag_votes", 1),
+            ("tag_removals", 1),
+        ]);
+        let r = app
+            .get("/api/v1/admin/mode/preview?to=private", &admin)
+            .await;
+        assert_eq!(kinds(&r.json()["changes"]), all);
+        let messages: Vec<String> = r.json()["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["message"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(
+            messages.contains(&"1 forum thread will be deleted; the categories stay".to_owned())
+        );
+        let r = app.switch(&admin, "private").await;
+        assert_eq!(kinds(&r["changes"]), all);
+
+        let me = app.get("/api/v1/auth/profile", &ann).await.json();
+        assert_eq!(
+            (&me["display_name"], &me["about"], &me["avatar_url"]),
+            (&json!("Ann"), &Value::Null, &Value::Null)
+        );
+        assert!(app.state.storage.avatar_names().unwrap().is_empty());
+        let post_now = app.get(&format!("/api/v1/posts/{p}"), &admin).await.json();
+        assert_eq!(
+            post_now["tags"],
+            json!(["sky"]),
+            "the voted-off tag stays off"
+        );
+        assert!(post_now.get("tag_votes").is_none() && post_now.get("voted_off").is_none());
+        assert!(post_now.get("uploader").is_none());
+        let r = app.get("/api/v1/admin/settings", &admin).await.json();
+        assert!(r.get("tag_vote_threshold").is_none());
+        // Edits may add it again.
+        let r = app
+            .call(
+                Method::PATCH,
+                &format!("/api/v1/posts/{p}"),
+                Some(&admin),
+                Some(json!({ "tags": ["sky", "cat"] })),
+            )
+            .await;
+        assert_eq!(r.json()["tags"], json!(["cat", "sky"]));
+
+        // Back to public: the categories are there, not twice; nothing to
+        // delete for a private server.
+        let r = app
+            .get("/api/v1/admin/mode/preview?to=private", &admin)
+            .await;
+        assert_eq!(r.json()["changes"], json!([]));
+        app.switch(&admin, "public").await;
+        let cats = app.get("/api/v1/forum", &ann).await.json();
+        assert_eq!(cats.as_array().unwrap().len(), 3);
+        assert_eq!(cats[0]["threads"], 0);
+        let r = app.get("/api/v1/admin/settings", &admin).await.json();
+        assert_eq!(r["tag_vote_threshold"], 1, "the threshold was kept");
         app.finish().await;
     }
 

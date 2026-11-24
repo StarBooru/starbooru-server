@@ -14,9 +14,9 @@ use starbooru_core::query::{FigureTerm, SearchQuery, SortKey};
 use starbooru_core::tag::{MAX_TAGS_PER_POST, normalize_tags};
 use starbooru_core::{
     BulkEdit, BulkResult, DEFAULT_PAGE_LIMIT, DEFAULT_RELATED_LIMIT, ImportRequest, MAX_BULK_POSTS,
-    MAX_PAGE_LIMIT, MAX_RELATED_LIMIT, MediaKind, Neighbors, Post, PostPage, PostUpdate, Rating,
-    RelatedPosts, ScoreKind, TagCorrection, VoteRequest, average_stars, is_count_tag, parse_query,
-    parse_tag_list, required_tags, split_category,
+    MAX_PAGE_LIMIT, MAX_RELATED_LIMIT, MediaKind, Mode, Neighbors, Post, PostPage, PostUpdate,
+    Rating, RelatedPosts, ScoreKind, TagCorrection, VoteRequest, average_stars, is_count_tag,
+    parse_query, parse_tag_list, required_tags, split_category,
 };
 use tracing::warn;
 
@@ -57,10 +57,20 @@ pub(super) struct PostRow {
     tags: Vec<String>,
     my_vote: i16,
     my_stars: i16,
+    /// Public instances only: the uploader as `{name, display_name, avatar}`.
+    #[sqlx(default)]
+    uploader: Option<String>,
+    /// Public instances only: `{tag: {score, mine}}`.
+    #[sqlx(default)]
+    tag_votes: Option<String>,
+    #[sqlx(default)]
+    voted_off: Vec<String>,
 }
 
 /// `SELECT <post columns>` with the caller's vote resolved, for `posts p`.
-fn post_columns(user_id: i64) -> QueryBuilder<Postgres> {
+/// `public` adds the uploader and the votes on the tags, each worked out
+/// for the post alone through its own index.
+fn post_columns(user_id: i64, public: bool) -> QueryBuilder<Postgres> {
     let mut qb = QueryBuilder::new(
         "SELECT p.id, p.sha256, p.ext, p.mime, p.kind, p.file_size, p.width, p.height, \
          p.duration_ms, p.has_thumb, p.has_sample, p.rating, p.source, p.score, \
@@ -77,12 +87,31 @@ fn post_columns(user_id: i64) -> QueryBuilder<Postgres> {
     );
     qb.push_bind(user_id);
     qb.push("), 0::smallint) AS my_stars");
+    if public {
+        qb.push(
+            ", (SELECT json_build_object('name', u.username, 'display_name', u.display_name, \
+                   'avatar', encode(u.avatar_sha, 'hex'))::text \
+                FROM users u WHERE u.id = p.uploader_id) AS uploader, \
+             (SELECT json_object_agg(t.name, json_build_object('score', s.score, 'mine', s.mine))::text \
+              FROM (SELECT tv.tag_id, sum(tv.value)::int AS score, \
+                           COALESCE(max(tv.value) FILTER (WHERE tv.user_id = ",
+        );
+        qb.push_bind(user_id);
+        qb.push(
+            "), 0) AS mine \
+                    FROM tag_votes tv WHERE tv.post_id = p.id AND tv.tag_id = ANY(p.tag_ids) \
+                    GROUP BY tv.tag_id) s \
+              JOIN tags t ON t.id = s.tag_id) AS tag_votes, \
+             ARRAY(SELECT t.name FROM tag_removals r JOIN tags t ON t.id = r.tag_id \
+                   WHERE r.post_id = p.id ORDER BY t.name) AS voted_off",
+        );
+    }
     qb
 }
 
 /// `SELECT <post columns> FROM posts p` with the caller's vote resolved.
-pub(super) fn select_posts(user_id: i64) -> QueryBuilder<Postgres> {
-    let mut qb = post_columns(user_id);
+pub(super) fn select_posts(user_id: i64, public: bool) -> QueryBuilder<Postgres> {
+    let mut qb = post_columns(user_id, public);
     qb.push(" FROM posts p");
     qb
 }
@@ -92,8 +121,8 @@ pub(super) fn select_posts(user_id: i64) -> QueryBuilder<Postgres> {
 /// then `end_page` turns those ids into posts in the same order. Only the
 /// rows on the page are built, not every row an `OFFSET` skips or a sort
 /// looks at, which keeps deep pages and big sorts fast.
-pub(super) fn select_page(user_id: i64) -> QueryBuilder<Postgres> {
-    let mut qb = post_columns(user_id);
+pub(super) fn select_page(user_id: i64, public: bool) -> QueryBuilder<Postgres> {
+    let mut qb = post_columns(user_id, public);
     qb.push(" FROM unnest(ARRAY(SELECT p.id FROM posts p");
     qb
 }
@@ -136,10 +165,27 @@ pub(super) fn sample_url(state: &AppState, sha: &str, has_sample: Option<bool>) 
     })
 }
 
+/// The uploader as `post_columns` gives it.
+#[derive(Deserialize)]
+struct UploaderRow {
+    name: String,
+    display_name: Option<String>,
+    /// SHA-256 of the picture, hex.
+    avatar: Option<String>,
+}
+
 pub(super) fn to_post(state: &AppState, row: PostRow) -> Post {
     let sha = hex::encode(&row.sha256);
     let (file_url, thumb_url) = media_urls(state, &sha, &row.ext, row.has_thumb);
     let sample_url = sample_url(state, &sha, row.has_sample);
+    let uploader = row
+        .uploader
+        .and_then(|json| serde_json::from_str::<UploaderRow>(&json).ok())
+        .map(|u| crate::avatars::card(state, u.name, u.display_name, u.avatar.as_deref()));
+    let tag_votes = row
+        .tag_votes
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
     Post {
         id: row.id,
         kind: MediaKind::from_db(row.kind).unwrap_or(MediaKind::Image),
@@ -167,11 +213,19 @@ pub(super) fn to_post(state: &AppState, row: PostRow) -> Post {
         ocr_text: None,
         tag_details: Vec::new(),
         figures: Vec::new(),
+        uploader,
+        tag_votes,
+        voted_off: row.voted_off,
     }
 }
 
+/// Whether posts carry what public instances add to them.
+pub(super) async fn is_public(state: &AppState) -> AppResult<bool> {
+    Ok(settings::mode(state).await? == Mode::Public)
+}
+
 async fn load_row(state: &AppState, user_id: i64, id: i64) -> AppResult<PostRow> {
-    let mut qb = select_posts(user_id);
+    let mut qb = select_posts(user_id, is_public(state).await?);
     qb.push(" WHERE p.id = ").push_bind(id);
     qb.build_query_as::<PostRow>()
         .fetch_optional(&state.db)
@@ -551,7 +605,7 @@ pub async fn search(
     if query.deleted {
         viewer.require_account()?;
     }
-    let kind = settings::score_kind(&state).await?;
+    let (mode, kind) = settings::scoring(&state.db).await?;
     let (query, corrected) = correct_typos(&state, query).await?;
 
     let Some(tags) = tag_filter(&state, &query).await? else {
@@ -565,7 +619,7 @@ pub async fn search(
         }));
     };
 
-    let mut qb = select_page(viewer.id());
+    let mut qb = select_page(viewer.id(), mode == Mode::Public);
     push_filters(&mut qb, &query, &tags);
     if query.order.key == SortKey::Random && params.seed.is_none() {
         qb.push(" ORDER BY random()");
@@ -834,7 +888,7 @@ pub async fn related(
         .fetch_all(&state.db)
         .await?;
 
-    let mut qb = select_posts(viewer.id());
+    let mut qb = select_posts(viewer.id(), is_public(&state).await?);
     qb.push(" WHERE p.id = ANY(").push_bind(&ranked).push(")");
     let mut rows: HashMap<i64, PostRow> = qb
         .build_query_as::<PostRow>()
@@ -1773,7 +1827,8 @@ pub(super) fn clean_source(raw: String) -> AppResult<Option<String>> {
 }
 
 /// Replaces a live post's tags (aliases resolved, implications added),
-/// creating missing tags and keeping `tags.post_count` in step.
+/// creating missing tags and keeping `tags.post_count` in step. Tags voted
+/// off the post stay off, whatever `names` says.
 pub(crate) async fn set_tags(
     tx: &mut Transaction<'_, Postgres>,
     post_id: i64,
@@ -1794,11 +1849,17 @@ pub(crate) async fn set_tags(
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(AppError::NotFound)?;
+    let voted_off: Vec<i64> =
+        sqlx::query_scalar("SELECT tag_id FROM tag_removals WHERE post_id = $1")
+            .bind(post_id)
+            .fetch_all(&mut **tx)
+            .await?;
+    new_ids.retain(|id| !voted_off.contains(id));
     if !figures.is_empty() {
         super::figures::prune(tx, post_id, &new_ids).await?;
         let figures = super::figures::load(&mut **tx, post_id).await?;
         for id in super::tags::resolve_for_post(tx, &required_tags(&figures)).await? {
-            if !new_ids.contains(&id) {
+            if !new_ids.contains(&id) && !voted_off.contains(&id) {
                 new_ids.push(id);
             }
         }

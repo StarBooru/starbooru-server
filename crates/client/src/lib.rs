@@ -28,6 +28,11 @@ use starbooru_core::{
     SaveRemoteSearch, SavedRemoteSearch, TagSuggestions, TranslateRequest, Translation,
     UpdateInstall, UpdateSettings, UpdateStatus,
 };
+use starbooru_core::{
+    AvatarCrop, CategoryUpdate, ForumCategory, ForumPost, ForumPostBody, ForumThread, NewCategory,
+    NewThread, Profile, ProfileUpdate, TagRemovalPage, TagVoteRequest, ThreadPage, ThreadUpdate,
+    ThreadView,
+};
 use starbooru_core::{Mode, ModePreview, ModeSwitch, ModeSwitched, ScoreKind, ScorePreview};
 use std::time::Duration;
 use thiserror::Error;
@@ -958,6 +963,158 @@ impl Client {
         let path = format!("/tags/{}/implications/{}", segment(name), segment(implied));
         Self::send(self.request(Method::DELETE, &path)?).await
     }
+
+    /// Anyone's profile by username, on a public server (without signing
+    /// in too). A private one answers `profiles_off`.
+    pub async fn profile(&self, name: &str) -> Result<Profile> {
+        Self::send(self.request(Method::GET, &format!("/users/{}", segment(name)))?).await
+    }
+
+    /// The signed-in account's own profile, in either mode.
+    pub async fn my_profile(&self) -> Result<Profile> {
+        Self::send(self.request(Method::GET, "/auth/profile")?).await
+    }
+
+    /// Changes the display name or the text about the account; see
+    /// [`ProfileUpdate`] for leaving one alone or clearing it.
+    pub async fn update_profile(&self, update: &ProfileUpdate) -> Result<Profile> {
+        self.json(Method::PATCH, "/auth/profile", update).await
+    }
+
+    /// Makes `bytes` (a JPEG, PNG, WebP or GIF of at most
+    /// `profile::MAX_AVATAR_BYTES`) the profile picture, cut to `crop` or to
+    /// the middle square. Public servers only.
+    pub async fn set_avatar(&self, bytes: Vec<u8>, crop: Option<AvatarCrop>) -> Result<Profile> {
+        let mut req = self
+            .request(Method::PUT, "/auth/avatar")?
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(bytes);
+        if let Some(c) = crop {
+            req = req.query(&[("x", c.x), ("y", c.y), ("size", c.size)]);
+        }
+        Self::send(req).await
+    }
+
+    pub async fn remove_avatar(&self) -> Result<Profile> {
+        Self::send(self.request(Method::DELETE, "/auth/avatar")?).await
+    }
+
+    /// The forum's categories, in order. A private server answers
+    /// `forum_off`.
+    pub async fn forum(&self) -> Result<Vec<ForumCategory>> {
+        Self::send(self.request(Method::GET, "/forum")?).await
+    }
+
+    /// Admins.
+    pub async fn create_forum_category(&self, category: &NewCategory) -> Result<ForumCategory> {
+        self.json(Method::POST, "/forum/categories", category).await
+    }
+
+    /// Admins.
+    pub async fn update_forum_category(
+        &self,
+        id: i64,
+        update: &CategoryUpdate,
+    ) -> Result<ForumCategory> {
+        self.json(Method::PATCH, &format!("/forum/categories/{id}"), update)
+            .await
+    }
+
+    /// Admins; only an empty category.
+    pub async fn delete_forum_category(&self, id: i64) -> Result<()> {
+        Self::send_empty(self.request(Method::DELETE, &format!("/forum/categories/{id}"))?).await
+    }
+
+    /// A page of threads: one category's, pinned first, or every one's.
+    /// A non-empty `query` finds threads whose title or a post has its words.
+    pub async fn forum_threads(
+        &self,
+        category: Option<i64>,
+        query: &str,
+        page: u32,
+        limit: u32,
+    ) -> Result<ThreadPage> {
+        let mut req = self.request(Method::GET, "/forum/threads")?.query(&[
+            ("q", query.to_owned()),
+            ("page", page.to_string()),
+            ("limit", limit.to_string()),
+        ]);
+        if let Some(category) = category {
+            req = req.query(&[("category", category)]);
+        }
+        Self::send(req).await
+    }
+
+    /// A thread with a page of its posts, oldest first.
+    pub async fn forum_thread(&self, id: i64, page: u32, limit: u32) -> Result<ThreadView> {
+        let req = self
+            .request(Method::GET, &format!("/forum/threads/{id}"))?
+            .query(&[("page", page), ("limit", limit)]);
+        Self::send(req).await
+    }
+
+    pub async fn create_forum_thread(&self, thread: &NewThread) -> Result<ForumThread> {
+        self.json(Method::POST, "/forum/threads", thread).await
+    }
+
+    /// The title (its author or an admin), or pinned, locked and the
+    /// category (admins).
+    pub async fn update_forum_thread(&self, id: i64, update: &ThreadUpdate) -> Result<ForumThread> {
+        self.json(Method::PATCH, &format!("/forum/threads/{id}"), update)
+            .await
+    }
+
+    /// Admins: the thread with all its posts.
+    pub async fn delete_forum_thread(&self, id: i64) -> Result<()> {
+        Self::send_empty(self.request(Method::DELETE, &format!("/forum/threads/{id}"))?).await
+    }
+
+    pub async fn reply_in_forum(&self, thread_id: i64, body: &str) -> Result<ForumPost> {
+        let body = ForumPostBody {
+            body: body.to_owned(),
+        };
+        self.json(
+            Method::POST,
+            &format!("/forum/threads/{thread_id}/posts"),
+            &body,
+        )
+        .await
+    }
+
+    /// Its author only.
+    pub async fn edit_forum_post(&self, id: i64, body: &str) -> Result<ForumPost> {
+        let body = ForumPostBody {
+            body: body.to_owned(),
+        };
+        self.json(Method::PATCH, &format!("/forum/posts/{id}"), &body)
+            .await
+    }
+
+    /// Its author or an admin; the post keeps its place, empty.
+    pub async fn delete_forum_post(&self, id: i64) -> Result<()> {
+        Self::send_empty(self.request(Method::DELETE, &format!("/forum/posts/{id}"))?).await
+    }
+
+    /// A vote on one of a post's tags: 1 it belongs, -1 it doesn't, 0 takes
+    /// the vote back. Public servers only.
+    pub async fn vote_tag(&self, post_id: i64, tag: &str, value: i16) -> Result<Post> {
+        let path = format!("/posts/{post_id}/tags/{}/vote", segment(tag));
+        self.json(Method::PUT, &path, &TagVoteRequest { value })
+            .await
+    }
+
+    /// Admins: tags the votes took off posts, newest first.
+    pub async fn tag_removals(&self, page: u32, limit: u32) -> Result<TagRemovalPage> {
+        let req = self
+            .request(Method::GET, "/admin/tag-removals")?
+            .query(&[("page", page), ("limit", limit)]);
+        Self::send(req).await
+    }
+
+    /// Admins: puts a voted-off tag back on its post, its votes cleared.
+    pub async fn undo_tag_removal(&self, id: i64) -> Result<Post> {
+        Self::send(self.request(Method::DELETE, &format!("/admin/tag-removals/{id}"))?).await
+    }
 }
 
 /// Percent-encodes one URL path segment.
@@ -1377,6 +1534,64 @@ mod tests {
         let (url, server) = recorded(post).await;
         Client::new(&url).unwrap().vote(1, -1).await.unwrap();
         assert!(server.await.unwrap().ends_with(r#"{"value":-1}"#));
+    }
+
+    #[tokio::test]
+    async fn sends_pictures_tag_votes_and_forum_posts() {
+        let profile = r#"{"name":"ann","display_name":"Ann","about":null,
+            "avatar_url":"/media/avatar/a.jpg","avatar_small_url":"/media/avatar64/a.jpg",
+            "role":"user","joined":"2026-11-24T00:00:00Z","posts":2,"forum_posts":1}"#;
+        let (url, server) = recorded(profile).await;
+        let crop = AvatarCrop {
+            x: 10,
+            y: 20,
+            size: 300,
+        };
+        let got = Client::new(&url)
+            .unwrap()
+            .set_avatar(b"picture".to_vec(), Some(crop))
+            .await
+            .unwrap();
+        assert_eq!(got.display_name.as_deref(), Some("Ann"));
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with("PUT /api/v1/auth/avatar?x=10&y=20&size=300 "),
+            "{request}"
+        );
+        assert!(request.ends_with("picture"));
+
+        let post = r#"{"id":1,"kind":"image","mime":"image/png","file_size":1,"width":1,
+            "height":1,"sha256":"00","rating":"safe","score":0,"my_vote":0,"source":null,
+            "tags":["blue sky"],"created_at":"2026-11-24T00:00:00Z","deleted":false,
+            "file_url":"/media/x","thumb_url":null,"tag_votes":{"blue sky":{"score":-2,"mine":-1}},
+            "uploader":{"name":"ann"}}"#;
+        let (url, server) = recorded(post).await;
+        let got = Client::new(&url)
+            .unwrap()
+            .vote_tag(1, "blue sky", -1)
+            .await
+            .unwrap();
+        assert_eq!(got.tag_votes["blue sky"].score, -2);
+        assert_eq!(got.uploader.unwrap().name, "ann");
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with("PUT /api/v1/posts/1/tags/blue%20sky/vote "),
+            "{request}"
+        );
+        assert!(request.ends_with(r#"{"value":-1}"#));
+
+        let reply = r#"{"id":5,"thread_id":2,"author":null,"body":"hi","created_at":
+            "2026-11-24T00:00:00Z","edited_at":null,"deleted":false}"#;
+        let (url, server) = recorded(reply).await;
+        let got = Client::new(&url)
+            .unwrap()
+            .reply_in_forum(2, "hi")
+            .await
+            .unwrap();
+        assert_eq!(got.body, "hi");
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /api/v1/forum/threads/2/posts "));
+        assert!(request.ends_with(r#"{"body":"hi"}"#));
     }
 
     #[tokio::test]

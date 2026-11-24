@@ -211,6 +211,33 @@ impl TestApp {
         r.json()["id"].as_i64().unwrap()
     }
 
+    /// Switches the server to `mode` (`public` or `private`) without a
+    /// backup, as an admin does, and returns the answer.
+    pub async fn switch(&self, admin: &str, mode: &str) -> Value {
+        let r = self
+            .call(
+                Method::POST,
+                "/api/v1/admin/mode",
+                Some(admin),
+                Some(serde_json::json!({ "to": mode, "backup": false })),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "switch: {:?}", r.json());
+        r.json()
+    }
+
+    /// Sends `bytes` as the raw body of a `PUT`.
+    pub async fn put_bytes(&self, path: &str, token: Option<&str>, bytes: Vec<u8>) -> Resp {
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/octet-stream");
+        if let Some(t) = token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        self.send(req.body(Body::from(bytes)).unwrap()).await
+    }
+
     pub fn db(&self) -> &PgPool {
         &self.state.db
     }
