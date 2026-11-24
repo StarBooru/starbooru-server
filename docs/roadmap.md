@@ -16,8 +16,6 @@ Left:
 | Upscaling and background removal | M5 |
 | Sync between devices | M4 |
 
-- [ ] Reverse search an image with google images, iqdb, saucenao, trace.moe
-
 ## Next: updates
 
 The server knows only its own version. Installs run the image's `latest` tag, so an administrator finds out about a new release only by looking. starbooru-web's `docs/roadmap.md` (section 10) has the app's side.
