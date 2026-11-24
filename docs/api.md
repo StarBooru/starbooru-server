@@ -2,7 +2,7 @@
 
 All endpoints are under `/api/v1`. Bodies are JSON unless noted. The Rust types are in `crates/core/src/model.rs`, and `starbooru-client` wraps every call.
 
-**Auth.** Send `Authorization: Bearer <token>`. Every endpoint except `info`, `auth/register` and `auth/login` requires it. The token is a session token from sign-in (`sb_…`) or an [API key](#api-keys) (`sbk_…`).
+**Auth.** Send `Authorization: Bearer <token>`. Every endpoint except `info`, `auth/register` and `auth/login` requires it, but on a public server people without an account may also read posts and tags (see [Guests](#guests)). The token is a session token from sign-in (`sb_…`) or an [API key](#api-keys) (`sbk_…`).
 
 **Ratings.** A rating is `safe`, `sensitive`, `questionable` or `explicit`. `general` is also accepted in requests and means `safe`; answers always say `safe`.
 
@@ -12,24 +12,30 @@ All endpoints are under `/api/v1`. Bodies are JSON unless noted. The Rust types 
 |---|---|
 | 400 | bad input (`bad_request`, or `weak_password` for a new account whose password is too easy to guess) |
 | 401 | missing or expired token |
-| 403 | not allowed (`forbidden`, or `quota_exceeded` for an upload past the account's storage limit) |
+| 403 | not allowed (`forbidden`, `quota_exceeded` for an upload past the account's storage limit, or `remote_off` for other boorus on a public server) |
 | 404 | not found |
-| 409 | conflict (`duplicate`, `username_taken`, `deleted`, `not_deleted`, `implication_cycle`, `name_taken`) |
+| 409 | conflict (`duplicate`, `username_taken`, `deleted`, `not_deleted`, `implication_cycle`, `name_taken`, and those of [Modes](#modes) and [Share links](#share-links)) |
 | 413 | upload too large |
 | 507 | `storage_full`: the server's disk is full |
 | 415 | unsupported file type |
 | 424 | `fetch_failed`: another site the request depends on failed, such as an address to import or an AI provider. |
-| 429 | rate limited; `starbooru-client` waits out `Retry-After` (up to 30 s) and retries twice |
+| 429 | rate limited (`rate_limited`, sign-in limits and guests); `starbooru-client` waits out `Retry-After` (up to 30 s) and retries twice |
 | 500 | internal error (details only in the server log) |
 
 ## Server
 
 | Method | Path | |
 |---|---|---|
-| GET | `/info` | `ServerInfo`: `name`, `version`, `has_users`, `registration_open`, `max_upload_bytes`, `url_import` (whether `POST /posts/import` is on), `oidc` (the identity provider's name for a "Sign in with …" button, `null` when OpenID Connect sign-in is off), `video_editing` (whether `POST /posts/{id}/edit` can trim videos: the server has ffmpeg) |
+| GET | `/info` | `ServerInfo`: `name`, `version`, `has_users`, `registration_open`, `max_upload_bytes`, `url_import` (whether `POST /posts/import` is on), `oidc` (the identity provider's name for a "Sign in with …" button, `null` when OpenID Connect sign-in is off), `video_editing` (whether `POST /posts/{id}/edit` can trim videos: the server has ffmpeg), `mode` (`private` or `public`, see [Modes](#modes)), `score_kind` (`likes` or `stars`, see [Scores](#scores)), `guests` (people without an account may browse) |
 | GET | `/healthz` (not under `/api/v1`) | `ok` when the database answers |
 
-`name` and `registration_open` follow the admin settings (see [Administration](#administration)).
+`name` and `registration_open` follow the admin settings (see [Administration](#administration)). A server older than modes leaves out the last three; read them as `private`, `likes` and `false`.
+
+```json
+{ "name": "StarBooru", "version": "0.2.0", "has_users": true, "registration_open": false,
+  "max_upload_bytes": 536870912, "url_import": true, "oidc": null, "video_editing": true,
+  "mode": "public", "score_kind": "likes", "guests": true }
+```
 
 ## Accounts
 
@@ -98,8 +104,8 @@ Admins only; others get 403. API keys may read these but not change anything.
 | Method | Path | Body | Returns |
 |---|---|---|---|
 | GET | `/admin/stats` | | `ServerStats`: `version`, `started_at`, `users`, `disabled_users`, live `images`/`animations`/`videos`, `bin_posts`, `tags`, `media_bytes` (originals, bin included), `bin_bytes`, `database_bytes`, `uploads_by_day` (`[{day, posts}]`, the last 30 UTC days oldest first), `max_upload_bytes`, `video_thumbnails`, `url_import` |
-| GET | `/admin/settings` | | `ServerSettings {name, allow_registration, trash_days, auto_meta_tags}`, the values in force |
-| PUT | `/admin/settings` | `ServerSettings` | The saved settings. They apply at once. Each starts from its environment variable (`STARBOORU_NAME`, `STARBOORU_ALLOW_REGISTRATION`, `STARBOORU_TRASH_DAYS`, `STARBOORU_AUTO_TAGS`), and a value equal to the variable's keeps following it. `name` is 1–64 characters with whitespace collapsed; `trash_days` is 0–3650. `auto_meta_tags` (automatic meta tags such as `highres` and `video` on new posts) may be left out by older clients and then means `true`. |
+| GET | `/admin/settings` | | `ServerSettings {name, allow_registration, trash_days, auto_meta_tags, mode, score_kind}`, the values in force |
+| PUT | `/admin/settings` | `ServerSettings` | The saved settings. They apply at once. Each starts from its environment variable (`STARBOORU_NAME`, `STARBOORU_ALLOW_REGISTRATION`, `STARBOORU_TRASH_DAYS`, `STARBOORU_AUTO_TAGS`), and a value equal to the variable's keeps following it. The mode and the score kind are stored as they are and don't follow the environment. `name` is 1–64 characters with whitespace collapsed; `trash_days` is 0–3650. `auto_meta_tags` (automatic meta tags such as `highres` and `video` on new posts) may be left out by older clients and then means `true`. `mode` changes only through `POST /admin/mode`: the mode in force is accepted, another one is 409 `use_mode_switch`, and leaving it out is fine. `score_kind` left out stays as it is; a new one converts the votes (see [Scores](#scores)) and the answer lists what it did in `changes`, as `GET /admin/scores/preview` would have. `stars` on a public server is 409 `public_counts_likes`. |
 | GET | `/admin/users` | | `AdminUser[] {id, username, role, created_at, disabled, posts, bytes, quota_bytes, last_active}`, oldest first. `posts` and `bytes` count uploads, recycle bin included. `last_active` is the latest use of any session or key. |
 | PATCH | `/admin/users/{id}` | `UserUpdate {role?, disabled?, quota_bytes?}` | The updated `AdminUser`. Missing fields stay as they are; `"quota_bytes": null` removes the limit. Disabling signs the account out everywhere. 400 for your own account (so an admin always remains), 404 for an unknown id. |
 | POST | `/admin/users/{id}/password` | `PasswordReset {new}` | 204. Signs the account out everywhere; its API keys keep working. 400 for your own account (use `PUT /auth/password`). |
@@ -185,6 +191,102 @@ Example:
 }
 ```
 
+## Modes
+
+A server is private (the default) or public. A private server is one person's or a household's: every reader needs an account. A public one is open to other people with their own accounts, and people without one may browse, read-only. `/info` says which, so an app can adapt before anyone signs in.
+
+| | Private | Public |
+|---|---|---|
+| Reading without an account | no | posts, tags and Explore (see [Guests](#guests)) |
+| Scores | likes and dislikes, or 0 to 5 stars | likes and dislikes |
+| Sharing | share links | a post's own address; `POST /shares` is 409 `share_by_address` |
+| Other boorus (`/remote/*`) | as set up | off: 403 `remote_off`, and it can't be turned on |
+| Explore's `trending` and `tags` | empty | worked out |
+| Library imports | anyone, under the URL import rules | administrators only |
+
+Switching deletes what the new mode has no use for. Going public deletes every share link and every saved account and search on other boorus, and turns star votes into likes. Going private deletes nothing yet.
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/admin/mode/preview?to=public\|private` | | `ModePreview {to, changes}`: what switching would delete and convert, without changing anything. Empty `changes` when nothing, or when the server is in that mode already. Admins; API keys may read it. 400 for another `to`. |
+| POST | `/admin/mode` | `ModeSwitch {to, backup?}` | `ModeSwitched {settings, changes, backup}` once the switch is done. `backup` (default `true`) makes a database backup first, named in the answer and listed in `GET /admin/backups`. Then everything happens in one transaction: the deletions, the votes converted, the new mode. Needs an admin signed in with a session; API keys get 403. 409 `same_mode` when the server is in that mode, `backup_unavailable` when a backup was asked for and `pg_dump` is missing or off (say `"backup": false` to switch without one), `backup_running` while another backup is being made, `backup_failed` when it failed (nothing changed then), `mode_switch_running` while another switch is under way. |
+| GET | `/admin/scores/preview?to=likes\|stars` | | `ScorePreview {to, changes}`: what `PUT /admin/settings` with that `score_kind` would convert and delete. 409 `public_counts_likes` for stars on a public server. |
+
+A `Change` is `{kind, count, message}`: a machine name, how many, and the same in an English sentence. Only kinds with something to do are listed. The kinds are in `starbooru_core::mode::changes`:
+
+| `kind` | |
+|---|---|
+| `share_links` | Share links, deleted going public |
+| `booru_accounts` | Saved accounts on other boorus, deleted going public |
+| `remote_searches` | Saved searches on other boorus, deleted going public |
+| `star_votes_converted` | Votes of 1, 2, 4 or 5 stars that become likes and dislikes |
+| `star_votes_dropped` | Votes of 3 stars, which are neither and are deleted |
+| `like_votes_converted` | Likes and dislikes that become stars |
+
+```json
+GET /api/v1/admin/mode/preview?to=public
+{ "to": "public",
+  "changes": [
+    { "kind": "share_links", "count": 12,
+      "message": "12 share links will be deleted; on a public server a post is shared by its own address" },
+    { "kind": "booru_accounts", "count": 3, "message": "3 saved accounts on other boorus will be deleted" },
+    { "kind": "star_votes_converted", "count": 40,
+      "message": "40 star votes will become likes and dislikes: 4 or 5 stars a like, 1 or 2 a dislike" },
+    { "kind": "star_votes_dropped", "count": 6,
+      "message": "6 votes of 3 stars will be deleted, as 3 stars is neither a like nor a dislike" } ] }
+
+POST /api/v1/admin/mode   {"to": "public"}
+{ "settings": { "name": "StarBooru", "allow_registration": true, "trash_days": 0,
+                "auto_meta_tags": true, "mode": "public", "score_kind": "likes" },
+  "changes": [ { "kind": "share_links", "count": 12,
+                 "message": "12 share links were deleted; on a public server a post is shared by its own address" } ],
+  "backup": "starbooru-20261124-022248.dump" }
+```
+
+`STARBOORU_MODE` and `STARBOORU_SCORES` set the mode and score kind of a new server. The first start stores them; after that only this API changes them (see `deployment.md` › *Private or public*).
+
+### Guests
+
+On a public server a request without a token may read what a browser needs, and nothing else:
+
+| Method | Path |
+|---|---|
+| GET | `/posts`, `/posts/{id}`, `/posts/{id}/neighbors`, `/posts/{id}/related` |
+| GET | `/tags`, `/tags/{name}`, `/tag-corrections` |
+| GET | `/explore` |
+
+`/info`, sign-up and sign-in, and the signed `/media` URLs are open in both modes. Everything else answers 401 to a guest, as it does on a private server, where none of these opens without a token. A guest has no vote of their own (`my_vote` is 0) and doesn't see the recycle bin: `status:deleted` is 401 and a binned post 404. A token that is sent but wrong is still 401.
+
+Each client address (IPv6 by its /64, the last `X-Forwarded-For` entry with `STARBOORU_TRUST_PROXY`) may ask for 300 a minute without an account; `/explore` counts as 5. Past that the answer is 429 `rate_limited` with `Retry-After`. Signed-in requests don't count. Page sizes are the same as for accounts.
+
+### Scores
+
+A vote on a post is a like or a dislike, or, on a private server set to stars, 1 to 5 stars. Admins choose with `score_kind` in `PUT /admin/settings` (likes until changed, or what `STARBOORU_SCORES` gave a new server); a public server always counts likes.
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| PUT | `/posts/{id}/vote` | `VoteRequest {value?, stars?}` | `Post` with its new tallies |
+
+- **Likes:** `value` is 1, -1, or 0 to remove the vote; `stars` is 400. `score` is likes minus dislikes, as before.
+- **Stars:** `stars` is 1 to 5, or 0 to remove the vote. An app that sends only `value` is read as likes: 1 gives 5 stars, -1 gives 1, 0 removes it.
+
+Under stars a post also carries `stars` (the average, to two decimals), `votes` (how many) and `my_stars` (the caller's, 1 to 5). They are left out under likes and when there is nothing to say. `score` and `my_vote` keep their types for older apps: a vote of 4 or 5 counts as a like there, 1 or 2 as a dislike and 3 as neither. So `score` is the score the post would have in likes.
+
+`order:score` under stars sorts by a fair rating, a Bayesian average: the post's stars as if it already had five votes of three,
+
+```text
+rating = (sum of stars + 3 × 5) / (number of votes + 5)
+```
+
+A post nobody voted on sits at 3, and one vote of 5 (3.33) doesn't beat fifty of 4 (3.91). Ties go by id.
+
+Changing the kind converts the votes in place: a like becomes 5 stars and a dislike 1; 4 or 5 stars become a like, 1 or 2 a dislike, and votes of 3 are deleted. `score` doesn't move either way. Nothing else converts votes: the server never does at start.
+
+```json
+PUT /api/v1/posts/7/vote   {"stars": 4}
+{ "id": 7, "score": 2, "my_vote": 1, "stars": 4.33, "votes": 3, "my_stars": 4, "…": "…" }
+```
+
 ## Posts
 
 | Method | Path | Body | Returns |
@@ -208,7 +310,7 @@ Example:
 | GET | `/posts/{id}/translations` | | `[PanelTranslation {lang, blocks: [TextBlock {x, y, w, h, text, translation}], model, created_at}]`: the kept translations drawn over the image, newest first. Box edges are on a 0–1000 scale of the image's width and height. 404 for a missing or binned post. |
 | POST | `/posts/{id}/translations` | `TranslateRequest {to}` | `PanelTranslation`: sends the still image (fit in 1536 px) to the translation model, which finds each piece of text, its box and its translation into `to`, for comic and manga pages. Kept per post and language, replacing an older one; an answer with no text (`blocks: []`) is returned but not kept. 400 for a bad code, when translation is off or for a video, GIF or unreadable format; 404 for a missing or binned post; 424 as for suggestions, or when the answer has no block list. |
 | PUT | `/posts/{id}/figures` | `FiguresUpdate {figures: [Figure]}` | `Post`: replaces the post's people and updates its tags to match. See [People](#people-in-a-post). 400 for more than 20 people, more than 64 tags on one, more tags than a post can hold (512) or an invalid tag; 404 for a missing post; 409 `deleted` for a post in the recycle bin. |
-| PUT | `/posts/{id}/vote` | `{value: -1 \| 0 \| 1}` | `Post` with the new `score` and `my_vote` |
+| PUT | `/posts/{id}/vote` | `{value: -1 \| 0 \| 1}`, or `{stars: 0–5}` under stars | `Post` with the new `score` and `my_vote` (and `stars`, `votes`, `my_stars` under stars; see [Scores](#scores)) |
 
 A `Post` carries `file_url`, `thumb_url` and `sample_url`. These are signed paths relative to the server, valid for at least 6 hours. Fetch them without the bearer token. `thumb_url` is null when no thumbnail exists. `sample_url` is a smaller JPEG copy of a big image, meant for viewing; it is null for most posts, and `file_url` stays the original to download. `duration_ms` is the length of a video, or null. `file_date` is the date in the file, or null: EXIF for images (its wall clock, marked UTC, because EXIF has no time zone) and the creation time for videos. `palette` lists the picture's main colours as `#rrggbb`, most common first; it is left out when there are none. `GET /posts/{id}` (and `POST /posts/{id}/ocr`) also carry `ocr_text`, the text found in a still image by OCR, lines separated by `\n`; it is left out when there is none, when the image is not read yet, and in lists.
 
@@ -261,7 +363,7 @@ Terms are separated by spaces, with at most 40 terms.
 | `ratio:16:9`, `ratio:1.78`, `ratio:>1` | width over height, in the same forms. A bare value has a margin of 0.01, so `ratio:1` is square. |
 | `color:red`, `color:2060e0`, `color:#2060e0`, `color:26e` | the picture has that colour (`colour:` works too). The names are `red`, `orange`, `yellow`, `green`, `teal`, `blue`, `purple`, `pink`, `brown`, `black`, `gray` (or `grey`) and `white`. The search widens until it finds a post that fits the rest of the query, up to a limit, so it finds the nearest colours stored and can still come back empty. |
 | `-date:…`, `-width:…`, `-color:…` and so on | excludes. A post of unknown size stays in. A bad value is a 400, not a tag search. |
-| `order:newest` (default), `order:oldest`, `order:score`, `order:size`, `order:pixels`, `order:longside`, `order:tags`, `order:updated`, `order:random` | sort (`sort:` works too). Add `_asc` or `_desc` to set the direction, e.g. `order:size_asc` for the smallest files first. `pixels` (or `mpixels`) is width × height; `longside` is the longer of the two; posts of unknown size sort last in both. `tags` is the tag count; `updated` is the last edit. |
+| `order:newest` (default), `order:oldest`, `order:score`, `order:size`, `order:pixels`, `order:longside`, `order:tags`, `order:updated`, `order:random` | sort (`sort:` works too). Add `_asc` or `_desc` to set the direction, e.g. `order:size_asc` for the smallest files first. `score` is likes minus dislikes, or the fair rating under stars (see [Scores](#scores)). `pixels` (or `mpixels`) is width × height; `longside` is the longer of the two; posts of unknown size sort last in both. `tags` is the tag count; `updated` is the last edit. |
 | `status:deleted` | browse the recycle bin |
 | `exact:true` | take tags as typed, without correcting unknown ones. Any other value is an ordinary tag name. |
 | `text:hello` / `text:"no parking"` / `-text:sale` | the text OCR read in the image has (or doesn't have) all these words, in any case. Quotes keep several words in one term; several `text:` terms all apply. Matches whole words (`simple` full-text search), at most 200 characters per term. |
@@ -311,7 +413,7 @@ Tags are resolved the same way everywhere: an alias in a post's tags or in a sea
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| GET | `/explore?days=&q=` | | `Explore {days, trending, tags, on_this_day, random, corrected?}`. `days` is the window, 1 to 365 (default 7). `trending`: up to 24 posts with the most net upvotes cast or changed in the window (only those above zero). `tags`: up to 20 `TagTrend {tag, recent}`, the tags most used on posts added in the window, without the tags `q` requires. `on_this_day`: up to 12 posts added on today's month and day (UTC) in earlier years, newest first. `random`: 12 random posts. `q` uses the search syntax and narrows every section; its `order:` and `status:` are ignored, and `corrected` is as in `/posts`. 400 for a bad query. |
+| GET | `/explore?days=&q=` | | `Explore {days, trending, tags, on_this_day, random, corrected?}`. `days` is the window, 1 to 365 (default 7). `trending`: up to 24 posts with the most net upvotes cast or changed in the window (only those above zero). `tags`: up to 20 `TagTrend {tag, recent}`, the tags most used on posts added in the window, without the tags `q` requires. `on_this_day`: up to 12 posts added on today's month and day (UTC) in earlier years, newest first. `random`: 12 random posts. `q` uses the search syntax and narrows every section; its `order:` and `status:` are ignored, and `corrected` is as in `/posts`. 400 for a bad query. On a private server `trending` and `tags` are always empty: the apps don't show them there, and they are the two costliest queries. |
 
 ## Other boorus
 
@@ -329,6 +431,8 @@ Tags are resolved the same way everywhere: an alias in a post's tags or in a sea
 | DELETE | `/remote/accounts/{id}` | | 204; 404 if it isn't yours |
 
 The server searches another booru for you, so the app needs no cross-site access and the same address rules as `POST /posts/import` apply (public addresses only unless the server allows private ones; off when URL import is off).
+
+On a public server every endpoint here answers 403 `remote_off`, and switching to public deletes the saved accounts and searches. URL imports still work there, without saved accounts, and so do [library imports](#library-imports) by administrators: they bring files in and don't browse other boorus.
 
 - `api` is `danbooru`, `gelbooru` (Gelbooru 0.2 and forks such as Safebooru and Rule34's `api.rule34.xxx`), `moebooru` (yande.re, Konachan), `e621` (e621, e926) or `blombooru` (Danbooru's API, but its `s` rating means safe).
 - `base` is the site's http(s) address without query or credentials; a trailing slash is dropped. `tags` is in the site's own syntax. `page` starts at 1. Each page asks for 40 posts.
@@ -381,6 +485,7 @@ Moves a whole library from another self-hosted booru. The server walks that site
 - `login` and `secret` are sent only to that site and never returned or logged. They stay in the database only while the import is waiting or running, so a restart can go on, and are erased when it ends.
 - `LibraryImport` is `{id, source, base, state, phase, total?, imported, merged, failed, rules, note?, error?, created_at, finished_at?}`. `state` is `queued`, `running`, `done`, `stopped` or `failed`. `phase` is `rules`, `posts` or `groups`. `merged` counts files that were already here, whose tags and likes are added to the post. `note` says what was left out and `error` why it stopped; the server writes both in English.
 - An administrator's import can reach the server's own network. Anyone else's follows the rules of `POST /posts/import`. Only an administrator's import brings aliases and implications, as they apply to everyone. With URL import off, checking, starting or retrying one answers 400.
+- On a public server only administrators may check, start or retry one; anyone else gets 403 `forbidden`. They stay available there although `/remote/*` is off, as they bring files in rather than browse another booru.
 
 Errors: 400 `bad_request` for a bad address or key, or an address the server won't reach; 424 `fetch_failed` when the site can't be reached, refuses the account or doesn't answer like that system.
 
@@ -397,6 +502,8 @@ Each user's own list; other users never see it.
 ## Share links
 
 A share link shows chosen posts to anyone who has it, without an account. It shows only the media: no tags, votes, ids or account details. Any signed-in user can share any post they can see.
+
+Share links are for private servers. On a public one a post is shared by its own address, as guests can open it: `POST /shares` answers 409 `share_by_address`, `GET /shares` an empty list and `GET /shared/{token}` 404. Switching to public deletes the links.
 
 | Method | Path | Body | Returns |
 |---|---|---|---|

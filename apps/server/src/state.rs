@@ -16,7 +16,7 @@ use crate::remote::accounts::Vault;
 use crate::remote::pace::Pace;
 use crate::remote::relay::Relay;
 use crate::storage::Storage;
-use crate::throttle::Guards;
+use crate::throttle::{Guards, Throttle};
 use crate::transfers::Transfers;
 use crate::update::Updates;
 use crate::uploads::Uploads;
@@ -37,6 +37,10 @@ pub struct Inner {
     pub trusted_fetcher: Option<Fetcher>,
     /// Sign-in and sign-up limits.
     pub guards: Guards,
+    /// Requests without an account per address, on a public instance.
+    pub guests: Throttle,
+    /// One switch of mode at a time.
+    pub mode_switch: tokio::sync::Mutex<()>,
     /// Chunked uploads under way.
     pub uploads: Uploads,
     pub backups: Backups,
@@ -96,6 +100,8 @@ impl AppState {
             fetcher,
             trusted_fetcher,
             guards: Guards::default(),
+            guests: crate::guests::throttle(),
+            mode_switch: tokio::sync::Mutex::new(()),
             uploads: Uploads::default(),
             backups,
             oidc,

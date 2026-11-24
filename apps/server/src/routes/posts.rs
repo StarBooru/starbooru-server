@@ -15,17 +15,19 @@ use starbooru_core::tag::{MAX_TAGS_PER_POST, normalize_tags};
 use starbooru_core::{
     BulkEdit, BulkResult, DEFAULT_PAGE_LIMIT, DEFAULT_RELATED_LIMIT, ImportRequest, MAX_BULK_POSTS,
     MAX_PAGE_LIMIT, MAX_RELATED_LIMIT, MediaKind, Neighbors, Post, PostPage, PostUpdate, Rating,
-    RelatedPosts, TagCorrection, VoteRequest, is_count_tag, parse_query, parse_tag_list,
-    required_tags, split_category,
+    RelatedPosts, ScoreKind, TagCorrection, VoteRequest, average_stars, is_count_tag, parse_query,
+    parse_tag_list, required_tags, split_category,
 };
 use tracing::warn;
 
 use crate::auth::AuthUser;
 use crate::error::{AppError, AppResult};
-use crate::similar;
+use crate::guests::Viewer;
+use crate::scores::{self, Vote};
 use crate::state::AppState;
 use crate::storage::{Ingested, Storage, Variant};
 use crate::uploads::PostFields;
+use crate::{settings, similar};
 
 const MAX_PAGE: u32 = 10_000;
 const MAX_SOURCE_CHARS: usize = 2048;
@@ -46,26 +48,35 @@ pub(super) struct PostRow {
     rating: i16,
     source: Option<String>,
     score: i32,
+    star_sum: i32,
+    star_count: i32,
     created_at: DateTime<Utc>,
     file_date: Option<DateTime<Utc>>,
     palette: Vec<i32>,
     deleted_at: Option<DateTime<Utc>>,
     tags: Vec<String>,
     my_vote: i16,
+    my_stars: i16,
 }
 
 /// `SELECT <post columns>` with the caller's vote resolved, for `posts p`.
 fn post_columns(user_id: i64) -> QueryBuilder<Postgres> {
     let mut qb = QueryBuilder::new(
         "SELECT p.id, p.sha256, p.ext, p.mime, p.kind, p.file_size, p.width, p.height, \
-         p.duration_ms, p.has_thumb, p.has_sample, p.rating, p.source, p.score, p.created_at, p.file_date, p.palette, p.deleted_at, \
+         p.duration_ms, p.has_thumb, p.has_sample, p.rating, p.source, p.score, \
+         p.star_sum, p.star_count, p.created_at, p.file_date, p.palette, p.deleted_at, \
          COALESCE((SELECT array_agg(t.name ORDER BY t.name) FROM tags t \
                    WHERE t.id = ANY(p.tag_ids)), '{}'::text[]) AS tags, \
          COALESCE((SELECT v.value FROM post_votes v \
                    WHERE v.post_id = p.id AND v.user_id = ",
     );
     qb.push_bind(user_id);
-    qb.push("), 0::smallint) AS my_vote");
+    qb.push(
+        "), 0::smallint) AS my_vote, \
+         COALESCE((SELECT v.stars FROM post_votes v WHERE v.post_id = p.id AND v.user_id = ",
+    );
+    qb.push_bind(user_id);
+    qb.push("), 0::smallint) AS my_stars");
     qb
 }
 
@@ -141,6 +152,9 @@ pub(super) fn to_post(state: &AppState, row: PostRow) -> Post {
         rating: Rating::from_db(row.rating).unwrap_or_default(),
         score: row.score,
         my_vote: row.my_vote,
+        stars: average_stars(i64::from(row.star_sum), i64::from(row.star_count)),
+        votes: u32::try_from(row.star_count).unwrap_or(0),
+        my_stars: u8::try_from(row.my_stars).unwrap_or(0),
         source: row.source,
         tags: row.tags,
         created_at: row.created_at,
@@ -341,12 +355,19 @@ async fn resolve_colors(
     Ok(())
 }
 
+/// `order:score` under stars: `starbooru_core::fair_rating`, as the index of
+/// migration 0035 has it.
+const STARS_RANK: &str = "((p.star_sum + 15)::float8 / (p.star_count + 5))";
+
 /// Sort expression for a key; the id is always the tie-breaker. These match
-/// the partial indexes in migrations 0002 and 0024.
-fn sort_column(key: SortKey) -> Option<&'static str> {
+/// the partial indexes in migrations 0002, 0024 and 0035.
+fn sort_column(key: SortKey, kind: ScoreKind) -> Option<&'static str> {
     match key {
         SortKey::Id | SortKey::Random => None,
-        SortKey::Score => Some("p.score"),
+        SortKey::Score => Some(match kind {
+            ScoreKind::Likes => "p.score",
+            ScoreKind::Stars => STARS_RANK,
+        }),
         SortKey::Size => Some("p.file_size"),
         SortKey::Pixels => Some("(p.width::bigint * p.height)"),
         SortKey::LongSide => Some("GREATEST(p.width, p.height)"),
@@ -380,10 +401,10 @@ impl SortExpr {
 
 /// The sort expression for a search, if it sorts by more than the id.
 /// `order:random` without a seed has none: it is sorted by `random()`.
-fn sort_expr(key: SortKey, seed: Option<i64>) -> Option<SortExpr> {
+fn sort_expr(key: SortKey, seed: Option<i64>, kind: ScoreKind) -> Option<SortExpr> {
     match key {
         SortKey::Random => seed.map(SortExpr::Shuffle),
-        _ => sort_column(key).map(SortExpr::Sql),
+        _ => sort_column(key, kind).map(SortExpr::Sql),
     }
 }
 
@@ -518,7 +539,7 @@ pub struct SearchParams {
 /// `GET /posts?q=&page=&limit=&seed=`. Query language: `starbooru_core::query`.
 pub async fn search(
     State(state): State<AppState>,
-    user: AuthUser,
+    viewer: Viewer,
     Query(params): Query<SearchParams>,
 ) -> AppResult<Json<PostPage>> {
     let page = params.page.unwrap_or(1).clamp(1, MAX_PAGE);
@@ -526,7 +547,12 @@ pub async fn search(
         .limit
         .unwrap_or(DEFAULT_PAGE_LIMIT)
         .clamp(1, MAX_PAGE_LIMIT);
-    let (query, corrected) = correct_typos(&state, parse_query(&params.q)?).await?;
+    let query = parse_query(&params.q)?;
+    if query.deleted {
+        viewer.require_account()?;
+    }
+    let kind = settings::score_kind(&state).await?;
+    let (query, corrected) = correct_typos(&state, query).await?;
 
     let Some(tags) = tag_filter(&state, &query).await? else {
         // a required tag does not exist
@@ -539,7 +565,7 @@ pub async fn search(
         }));
     };
 
-    let mut qb = select_page(user.id);
+    let mut qb = select_page(viewer.id());
     push_filters(&mut qb, &query, &tags);
     if query.order.key == SortKey::Random && params.seed.is_none() {
         qb.push(" ORDER BY random()");
@@ -550,7 +576,7 @@ pub async fn search(
             " ASC"
         };
         qb.push(" ORDER BY ");
-        if let Some(column) = sort_expr(query.order.key, params.seed) {
+        if let Some(column) = sort_expr(query.order.key, params.seed, kind) {
             column.push(&mut qb);
             qb.push(dir);
             if matches!(query.order.key, SortKey::Pixels | SortKey::LongSide) {
@@ -590,13 +616,18 @@ pub struct NeighborParams {
 /// The sort expression used to step from one post to the next. Unlike
 /// `sort_expr` it is never NULL, so row comparisons work: posts without
 /// dimensions sort last either way, as in `search`.
-fn step_column(key: SortKey, descending: bool, seed: Option<i64>) -> Option<SortExpr> {
+fn step_column(
+    key: SortKey,
+    descending: bool,
+    seed: Option<i64>,
+    kind: ScoreKind,
+) -> Option<SortExpr> {
     let sql = match (key, descending) {
         (SortKey::Pixels, true) => "COALESCE(p.width::bigint * p.height, -1)",
         (SortKey::Pixels, false) => "COALESCE(p.width::bigint * p.height, 9223372036854775807)",
         (SortKey::LongSide, true) => "COALESCE(GREATEST(p.width, p.height), -1)",
         (SortKey::LongSide, false) => "COALESCE(GREATEST(p.width, p.height), 2147483647)",
-        _ => return sort_expr(key, seed),
+        _ => return sort_expr(key, seed, kind),
     };
     Some(SortExpr::Sql(sql))
 }
@@ -606,11 +637,14 @@ fn step_column(key: SortKey, descending: bool, seed: Option<i64>) -> Option<Sort
 /// `order:random` has neighbours only with the seed its search was given.
 pub async fn neighbors(
     State(state): State<AppState>,
-    _user: AuthUser,
+    viewer: Viewer,
     Path(id): Path<i64>,
     Query(params): Query<NeighborParams>,
 ) -> AppResult<Json<Neighbors>> {
     let query = parse_query(&params.q)?;
+    if query.deleted {
+        viewer.require_account()?;
+    }
     let none = Neighbors {
         prev: None,
         next: None,
@@ -618,11 +652,12 @@ pub async fn neighbors(
     if query.order.key == SortKey::Random && params.seed.is_none() {
         return Ok(Json(none));
     }
+    let kind = settings::score_kind(&state).await?;
     let (query, _) = correct_typos(&state, query).await?;
     let Some(tags) = tag_filter(&state, &query).await? else {
         return Ok(Json(none));
     };
-    let column = step_column(query.order.key, query.order.descending, params.seed);
+    let column = step_column(query.order.key, query.order.descending, params.seed, kind);
 
     let step = |forward: bool| {
         // Forward follows the gallery order; backward reverses it.
@@ -706,7 +741,7 @@ fn tag_weight(total: f64, count: i32) -> f64 {
 /// one by walking the newest posts.
 pub async fn related(
     State(state): State<AppState>,
-    user: AuthUser,
+    viewer: Viewer,
     Path(id): Path<i64>,
     Query(params): Query<RelatedParams>,
 ) -> AppResult<Json<RelatedPosts>> {
@@ -714,12 +749,15 @@ pub async fn related(
         .limit
         .unwrap_or(DEFAULT_RELATED_LIMIT)
         .clamp(1, MAX_RELATED_LIMIT);
-    let (tags, hash): (Vec<i64>, Option<i64>) =
-        sqlx::query_as("SELECT tag_ids, phash FROM posts WHERE id = $1")
+    let (tags, hash, binned): (Vec<i64>, Option<i64>, bool) =
+        sqlx::query_as("SELECT tag_ids, phash, deleted_at IS NOT NULL FROM posts WHERE id = $1")
             .bind(id)
             .fetch_optional(&state.db)
             .await?
             .ok_or(AppError::NotFound)?;
+    if binned && viewer.is_guest() {
+        return Err(AppError::NotFound);
+    }
 
     // Tags no other post has can't relate it to anything.
     let mut counts: Vec<(i64, i32)> =
@@ -796,7 +834,7 @@ pub async fn related(
         .fetch_all(&state.db)
         .await?;
 
-    let mut qb = select_posts(user.id);
+    let mut qb = select_posts(viewer.id());
     qb.push(" WHERE p.id = ANY(").push_bind(&ranked).push(")");
     let mut rows: HashMap<i64, PostRow> = qb
         .build_query_as::<PostRow>()
@@ -833,10 +871,15 @@ async fn live_posts(state: &AppState) -> AppResult<f64> {
 
 pub async fn get_one(
     State(state): State<AppState>,
-    user: AuthUser,
+    viewer: Viewer,
     Path(id): Path<i64>,
 ) -> AppResult<Json<Post>> {
-    Ok(Json(load_full(&state, user.id, id).await?))
+    let post = load_full(&state, viewer.id(), id).await?;
+    // Guests don't see the recycle bin.
+    if post.deleted && viewer.is_guest() {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(post))
 }
 
 /// The single-post response: the post with its OCR text and tag details.
@@ -1127,6 +1170,7 @@ pub(super) async fn import_vote(
     value: i16,
 ) -> AppResult<()> {
     let mut tx = state.db.begin().await?;
+    crate::modes::lock_shared(&mut tx).await?;
     let live: Option<i64> =
         sqlx::query_scalar("SELECT id FROM posts WHERE id = $1 AND deleted_at IS NULL FOR UPDATE")
             .bind(post_id)
@@ -1135,9 +1179,10 @@ pub(super) async fn import_vote(
     if live.is_none() {
         return Ok(());
     }
+    let (_, kind) = settings::scoring(&mut *tx).await?;
     let old = current_vote(&mut tx, post_id, user_id).await?;
-    if old == 0 {
-        apply_vote(&mut tx, post_id, user_id, old, value).await?;
+    if old.is_none() {
+        apply_vote(&mut tx, post_id, user_id, old, Vote::imported(kind, value)).await?;
     }
     tx.commit().await?;
     Ok(())
@@ -1147,49 +1192,61 @@ async fn current_vote(
     tx: &mut Transaction<'_, Postgres>,
     post_id: i64,
     user_id: i64,
-) -> AppResult<i16> {
-    Ok(
-        sqlx::query_scalar("SELECT value FROM post_votes WHERE post_id = $1 AND user_id = $2")
+) -> AppResult<Option<Vote>> {
+    let row: Option<(i16, Option<i16>)> =
+        sqlx::query_as("SELECT value, stars FROM post_votes WHERE post_id = $1 AND user_id = $2")
             .bind(post_id)
             .bind(user_id)
             .fetch_optional(&mut **tx)
-            .await?
-            .unwrap_or(0),
-    )
+            .await?;
+    Ok(row.map(|(like, stars)| Vote { like, stars }))
 }
 
-/// Changes an account's vote from `old` to `value`, and the post's score with it.
+/// Changes an account's vote from `old` to `new` (`None` is no vote), and
+/// the post's tallies with it.
 async fn apply_vote(
     tx: &mut Transaction<'_, Postgres>,
     post_id: i64,
     user_id: i64,
-    old: i16,
-    value: i16,
+    old: Option<Vote>,
+    new: Option<Vote>,
 ) -> AppResult<()> {
-    if value == 0 {
-        sqlx::query("DELETE FROM post_votes WHERE post_id = $1 AND user_id = $2")
+    match new {
+        None => {
+            sqlx::query("DELETE FROM post_votes WHERE post_id = $1 AND user_id = $2")
+                .bind(post_id)
+                .bind(user_id)
+                .execute(&mut **tx)
+                .await?;
+        }
+        Some(vote) => {
+            sqlx::query(
+                "INSERT INTO post_votes (post_id, user_id, value, stars) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (post_id, user_id) DO UPDATE SET value = EXCLUDED.value, \
+                 stars = EXCLUDED.stars, \
+                 voted_at = CASE WHEN post_votes.value = EXCLUDED.value \
+                                  AND post_votes.stars IS NOT DISTINCT FROM EXCLUDED.stars \
+                             THEN post_votes.voted_at ELSE now() END",
+            )
             .bind(post_id)
             .bind(user_id)
+            .bind(vote.like)
+            .bind(vote.stars)
             .execute(&mut **tx)
             .await?;
-    } else {
-        sqlx::query(
-            "INSERT INTO post_votes (post_id, user_id, value) VALUES ($1, $2, $3) \
-             ON CONFLICT (post_id, user_id) DO UPDATE SET value = EXCLUDED.value, \
-             voted_at = CASE WHEN post_votes.value = EXCLUDED.value \
-                             THEN post_votes.voted_at ELSE now() END",
-        )
-        .bind(post_id)
-        .bind(user_id)
-        .bind(value)
-        .execute(&mut **tx)
-        .await?;
+        }
     }
-    sqlx::query("UPDATE posts SET score = score + $2 WHERE id = $1")
-        .bind(post_id)
-        .bind(i32::from(value) - i32::from(old))
-        .execute(&mut **tx)
-        .await?;
+    let (score, star_sum, star_count) = scores::tally_change(old, new);
+    sqlx::query(
+        "UPDATE posts SET score = score + $2, star_sum = star_sum + $3, \
+         star_count = star_count + $4 WHERE id = $1",
+    )
+    .bind(post_id)
+    .bind(score)
+    .bind(star_sum)
+    .bind(star_count)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -1972,10 +2029,11 @@ pub async fn vote(
     Path(id): Path<i64>,
     Json(req): Json<VoteRequest>,
 ) -> AppResult<Json<Post>> {
-    if !(-1..=1).contains(&req.value) {
-        return Err(AppError::BadRequest("vote must be -1, 0 or 1".into()));
-    }
     let mut tx = state.db.begin().await?;
+    // The score kind can't change until this vote is in.
+    crate::modes::lock_shared(&mut tx).await?;
+    let (_, kind) = settings::scoring(&mut *tx).await?;
+    let new = scores::requested(kind, req).map_err(|e| AppError::BadRequest(e.into()))?;
     let exists: Option<i64> =
         sqlx::query_scalar("SELECT id FROM posts WHERE id = $1 AND deleted_at IS NULL FOR UPDATE")
             .bind(id)
@@ -1983,7 +2041,7 @@ pub async fn vote(
             .await?;
     exists.ok_or(AppError::NotFound)?;
     let old = current_vote(&mut tx, id, user.id).await?;
-    apply_vote(&mut tx, id, user.id, old, req.value).await?;
+    apply_vote(&mut tx, id, user.id, old, new).await?;
     tx.commit().await?;
     Ok(Json(load_full(&state, user.id, id).await?))
 }

@@ -28,6 +28,7 @@ use starbooru_core::{
     SaveRemoteSearch, SavedRemoteSearch, TagSuggestions, TranslateRequest, Translation,
     UpdateInstall, UpdateSettings, UpdateStatus,
 };
+use starbooru_core::{Mode, ModePreview, ModeSwitch, ModeSwitched, ScoreKind, ScorePreview};
 use std::time::Duration;
 use thiserror::Error;
 use url::Url;
@@ -555,6 +556,30 @@ impl Client {
             .await
     }
 
+    /// What switching to `to` would delete and convert. Admins only.
+    pub async fn mode_preview(&self, to: Mode) -> Result<ModePreview> {
+        let req = self
+            .request(Method::GET, "/admin/mode/preview")?
+            .query(&[("to", to.as_str())]);
+        Self::send(req).await
+    }
+
+    /// Switches between private and public, after a backup unless
+    /// `switch.backup` is false. Answers once it is done. Needs a sign-in
+    /// session, not an API key.
+    pub async fn switch_mode(&self, switch: &ModeSwitch) -> Result<ModeSwitched> {
+        self.json(Method::POST, "/admin/mode", switch).await
+    }
+
+    /// What changing the score kind to `to` with `set_admin_settings` would
+    /// convert and delete. Admins only.
+    pub async fn score_preview(&self, to: ScoreKind) -> Result<ScorePreview> {
+        let req = self
+            .request(Method::GET, "/admin/scores/preview")?
+            .query(&[("to", to.as_str())]);
+        Self::send(req).await
+    }
+
     /// One page of the results of search `query`. A `seed` shuffles
     /// `order:random` the same way on every page; other orders ignore it.
     pub async fn search_posts(
@@ -650,11 +675,24 @@ impl Client {
             .await
     }
 
+    /// A like (1), a dislike (-1), or no vote (0). On a server that counts
+    /// stars, a like gives 5 and a dislike 1.
     pub async fn vote(&self, id: i64, value: i16) -> Result<Post> {
         self.json(
             Method::PUT,
             &format!("/posts/{id}/vote"),
-            &VoteRequest { value },
+            &VoteRequest::like(value),
+        )
+        .await
+    }
+
+    /// 1 to 5 stars, or 0 to remove the vote, where `ServerInfo::score_kind`
+    /// is stars.
+    pub async fn vote_stars(&self, id: i64, stars: u8) -> Result<Post> {
+        self.json(
+            Method::PUT,
+            &format!("/posts/{id}/vote"),
+            &VoteRequest::stars(stars),
         )
         .await
     }
@@ -1221,12 +1259,124 @@ mod tests {
             url_import: false,
             oidc: None,
             video_editing: false,
+            mode: Mode::Public,
+            score_kind: ScoreKind::Likes,
+            guests: true,
         })
         .unwrap();
         format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    /// Answers one request with `body` as JSON and hands back the request.
+    async fn recorded(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Until the head and as much body as it announces are in.
+            let mut seen = Vec::new();
+            loop {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap();
+                seen.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&seen).into_owned();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let wanted = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= wanted {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let answer = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(answer.as_bytes()).await.unwrap();
+            sock.shutdown().await.unwrap();
+            String::from_utf8_lossy(&seen).into_owned()
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn asks_for_mode_previews_and_switches() {
+        let (url, server) = recorded(r#"{"to":"public","changes":[]}"#).await;
+        let preview = Client::new(&url)
+            .unwrap()
+            .mode_preview(Mode::Public)
+            .await
+            .unwrap();
+        assert_eq!(preview.to, Mode::Public);
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /api/v1/admin/mode/preview?to=public "));
+
+        let (url, server) = recorded(r#"{"to":"stars","changes":[]}"#).await;
+        let scores = Client::new(&url)
+            .unwrap()
+            .score_preview(ScoreKind::Stars)
+            .await
+            .unwrap();
+        assert_eq!(scores.to, ScoreKind::Stars);
+        assert!(
+            server
+                .await
+                .unwrap()
+                .starts_with("GET /api/v1/admin/scores/preview?to=stars ")
+        );
+
+        let answer = r#"{"settings":{"name":"S","allow_registration":true,"trash_days":0,
+            "mode":"public","score_kind":"likes"},
+            "changes":[{"kind":"share_links","count":2,"message":"2 share links were deleted"}],
+            "backup":"starbooru-20261124-020000.dump"}"#;
+        let (url, server) = recorded(answer).await;
+        let switched = Client::new(&url)
+            .unwrap()
+            .switch_mode(&ModeSwitch {
+                to: Mode::Public,
+                backup: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(switched.settings.mode, Mode::Public);
+        assert_eq!(switched.changes[0].count, 2);
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /api/v1/admin/mode "));
+        assert!(
+            request.ends_with(r#"{"to":"public","backup":true}"#),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn votes_with_likes_or_stars() {
+        let post = r#"{"id":1,"kind":"image","mime":"image/png","file_size":1,"width":1,
+            "height":1,"sha256":"00","rating":"safe","score":1,"my_vote":1,"stars":4.0,
+            "votes":1,"my_stars":4,"source":null,"tags":[],"created_at":"2026-11-24T00:00:00Z",
+            "deleted":false,"file_url":"/media/x","thumb_url":null}"#;
+        let (url, server) = recorded(post).await;
+        let got = Client::new(&url).unwrap().vote_stars(1, 4).await.unwrap();
+        assert_eq!((got.stars, got.votes, got.my_stars), (Some(4.0), 1, 4));
+        let request = server.await.unwrap();
+        assert!(request.starts_with("PUT /api/v1/posts/1/vote "));
+        assert!(request.ends_with(r#"{"value":0,"stars":4}"#), "{request}");
+
+        let (url, server) = recorded(post).await;
+        Client::new(&url).unwrap().vote(1, -1).await.unwrap();
+        assert!(server.await.unwrap().ends_with(r#"{"value":-1}"#));
     }
 
     #[tokio::test]

@@ -73,6 +73,9 @@ pub async fn app_with(tweak: impl FnOnce(&mut Config)) -> Option<TestApp> {
     let mut config = Config::for_tests(dir.path());
     config.database_url = url.clone();
     tweak(&mut config);
+    crate::modes::settle(&db, config.mode, config.score_kind)
+        .await
+        .unwrap();
     let storage = Storage::open(&config.data_dir)
         .await
         .unwrap()

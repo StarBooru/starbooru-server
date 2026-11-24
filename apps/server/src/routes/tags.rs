@@ -15,6 +15,7 @@ use starbooru_core::{
 
 use crate::auth::AuthUser;
 use crate::error::{AppError, AppResult};
+use crate::guests::Viewer;
 use crate::sources::Rule;
 use crate::state::AppState;
 
@@ -69,7 +70,7 @@ fn like_prefix(s: &str) -> String {
 /// the autocomplete list, and aliases match too (returning their tag).
 pub async fn list(
     State(state): State<AppState>,
-    _user: AuthUser,
+    _viewer: Viewer,
     Query(q): Query<TagQuery>,
 ) -> AppResult<Json<Vec<Tag>>> {
     let limit = i64::from(q.limit.unwrap_or(20).clamp(1, MAX_TAG_LIMIT));
@@ -172,7 +173,7 @@ pub struct CorrectionQuery {
 /// list being typed. A name with a category prefix is a new tag on purpose.
 pub async fn tag_corrections(
     State(state): State<AppState>,
-    _user: AuthUser,
+    _viewer: Viewer,
     Query(q): Query<CorrectionQuery>,
 ) -> AppResult<Json<Vec<TagCorrection>>> {
     let names: Vec<String> =
@@ -590,7 +591,7 @@ pub async fn seed_vocab(db: &PgPool) -> AppResult<bool> {
 /// `GET /tags/{name}`: the tag (or the tag an alias points to) with its relations.
 pub async fn detail(
     State(state): State<AppState>,
-    _user: AuthUser,
+    _viewer: Viewer,
     Path(name): Path<String>,
 ) -> AppResult<Json<TagDetail>> {
     let tag = find(&state.db, &name).await?;

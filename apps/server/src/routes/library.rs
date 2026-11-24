@@ -118,6 +118,19 @@ fn site_of(
 
 /// The client for what this account may reach: an administrator may read a site
 /// on the server's own network, others only as far as URL import allows.
+/// On a public instance only administrators import libraries: an import
+/// brings in a whole site, for everyone to see.
+async fn may_import(state: &AppState, user: &AuthUser) -> AppResult<()> {
+    if user.role != Role::Admin
+        && crate::settings::mode(state).await? == starbooru_core::Mode::Public
+    {
+        return Err(AppError::Denied(
+            "on a public server only administrators import libraries",
+        ));
+    }
+    Ok(())
+}
+
 fn fetcher_for(state: &AppState, admin: bool) -> AppResult<&Fetcher> {
     let fetcher = if admin {
         state.trusted_fetcher.as_ref()
@@ -211,6 +224,7 @@ pub async fn check(
     user: AuthUser,
     Json(req): Json<LibrarySite>,
 ) -> AppResult<Json<LibraryCheck>> {
+    may_import(&state, &user).await?;
     let req = req
         .clean()
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
@@ -269,6 +283,7 @@ pub async fn create(
     user: AuthUser,
     Json(req): Json<LibrarySite>,
 ) -> AppResult<(StatusCode, Json<LibraryImport>)> {
+    may_import(&state, &user).await?;
     fetcher_for(&state, user.role == Role::Admin)?;
     let req = req
         .clean()
@@ -346,6 +361,7 @@ pub async fn retry(
     Path(id): Path<i64>,
     Json(req): Json<LibraryRetry>,
 ) -> AppResult<Json<LibraryImport>> {
+    may_import(&state, &user).await?;
     fetcher_for(&state, user.role == Role::Admin)?;
     let import = owned(&state, user.id, id).await?;
     if import.state.is_active() {

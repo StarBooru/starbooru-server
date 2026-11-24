@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use sqlx::FromRow;
 use starbooru_core::share::{MAX_SHARES, SHARE_TOKEN_CHARS, is_share_token};
-use starbooru_core::{MediaKind, NewShare, Share, SharedPost, SharedView};
+use starbooru_core::{MediaKind, Mode, NewShare, Share, SharedPost, SharedView};
 
 use super::posts::{media_urls, sample_url};
 use crate::auth::AuthUser;
@@ -62,8 +62,16 @@ fn to_share(state: &AppState, row: ShareRow) -> Share {
     }
 }
 
+/// A public instance shares a post by its own address, so it has no links.
+async fn public(state: &AppState) -> AppResult<bool> {
+    Ok(settings::mode(state).await? == Mode::Public)
+}
+
 /// `GET /shares`: the caller's links, newest first, expired ones included.
 pub async fn list(State(state): State<AppState>, user: AuthUser) -> AppResult<Json<Vec<Share>>> {
+    if public(&state).await? {
+        return Ok(Json(Vec::new()));
+    }
     let rows: Vec<ShareRow> = sqlx::query_as(SELECT_SHARES)
         .bind(user.id)
         .bind(None::<i64>)
@@ -80,6 +88,12 @@ pub async fn create(
     user: AuthUser,
     Json(req): Json<NewShare>,
 ) -> AppResult<Json<Share>> {
+    if public(&state).await? {
+        return Err(AppError::Conflict {
+            code: "share_by_address",
+            message: "this server is public: share a post by its own address".into(),
+        });
+    }
     let req = req
         .clean()
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
@@ -172,7 +186,7 @@ type OpenedRow = (Option<String>, Vec<i64>, Option<DateTime<Utc>>);
 /// `GET /shared/{token}`: no account needed. Unknown, expired and removed
 /// links, and links of disabled accounts, are all 404.
 pub async fn view(State(state): State<AppState>, Path(token): Path<String>) -> AppResult<Response> {
-    if !is_share_token(&token) {
+    if !is_share_token(&token) || public(&state).await? {
         return Err(AppError::NotFound);
     }
     let found: Option<OpenedRow> = sqlx::query_as(

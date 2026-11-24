@@ -18,6 +18,10 @@ services:
       STARBOORU_SECRET: ${STARBOORU_SECRET:?set STARBOORU_SECRET to 32+ random characters}
       STARBOORU_NAME: ${STARBOORU_NAME:-StarBooru}
       STARBOORU_ALLOW_REGISTRATION: ${STARBOORU_ALLOW_REGISTRATION:-false}
+      # The mode and score kind of a new server only; empty means private
+      # and likes. Afterwards they change in Administration.
+      STARBOORU_MODE: ${STARBOORU_MODE:-}
+      STARBOORU_SCORES: ${STARBOORU_SCORES:-}
       STARBOORU_MAX_UPLOAD_MB: ${STARBOORU_MAX_UPLOAD_MB:-512}
       STARBOORU_TRASH_DAYS: ${STARBOORU_TRASH_DAYS:-0}
       STARBOORU_SAMPLES: ${STARBOORU_SAMPLES:-true}

@@ -123,8 +123,12 @@ fn api_of(name: &str) -> Option<BooruApi> {
 }
 
 /// Every account `user_id` saved, with the keys opened. One that no longer
-/// opens (the server's secret changed) is left out, as if never saved.
+/// opens (the server's secret changed) is left out, as if never saved. A
+/// public instance uses none.
 pub async fn load(state: &AppState, user_id: i64) -> AppResult<Accounts> {
+    if crate::settings::mode(state).await? == starbooru_core::Mode::Public {
+        return Ok(Accounts::default());
+    }
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT id, api, base, login, sealed_key, updated_at FROM booru_accounts \
          WHERE user_id = $1 ORDER BY id",

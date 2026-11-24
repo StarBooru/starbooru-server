@@ -3,8 +3,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use starbooru_core::AiMode;
 use starbooru_core::admin::{MAX_BACKUP_DAYS, MAX_BACKUP_KEEP};
+use starbooru_core::{AiMode, Mode, ScoreKind};
 use thiserror::Error;
 use url::Url;
 
@@ -62,6 +62,11 @@ pub struct Config {
     /// New releases and updates (`STARBOORU_UPDATE_*`); admins can override
     /// the checks and automatic updates.
     pub updates: UpdateConfig,
+    /// The mode of a new server (`STARBOORU_MODE`); `None` when unset.
+    /// Stored on the first start, then changed only in the app.
+    pub mode: Option<Mode>,
+    /// The score kind of a new server (`STARBOORU_SCORES`), likewise.
+    pub score_kind: Option<ScoreKind>,
 }
 
 /// Where the server learns about releases and how it updates.
@@ -277,6 +282,8 @@ impl Config {
 
         let oidc = oidc_config(&get)?;
         let updates = update_config(&get)?;
+        let mode = named(&get, "STARBOORU_MODE", Mode::parse, "private or public")?;
+        let score_kind = named(&get, "STARBOORU_SCORES", ScoreKind::parse, "likes or stars")?;
 
         let web_dir = get("STARBOORU_WEB_DIR")
             .filter(|s| !s.trim().is_empty())
@@ -347,6 +354,8 @@ impl Config {
                 },
             },
             updates,
+            mode,
+            score_kind,
         })
     }
 
@@ -376,7 +385,26 @@ impl Config {
             oidc: None,
             ai: AiConfig::default(),
             updates: UpdateConfig::for_tests(),
+            mode: None,
+            score_kind: None,
         }
+    }
+}
+
+/// One of a few names from `name`, or `None` when it is unset or empty.
+fn named<T>(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    parse: impl Fn(&str) -> Option<T>,
+    choices: &str,
+) -> Result<Option<T>, ConfigError> {
+    match get(name).map(|v| v.trim().to_ascii_lowercase()) {
+        None => Ok(None),
+        Some(v) if v.is_empty() => Ok(None),
+        Some(v) => parse(&v).map(Some).ok_or_else(|| ConfigError::Invalid {
+            name,
+            reason: format!("`{v}` is not {choices}"),
+        }),
     }
 }
 
@@ -822,6 +850,31 @@ mod tests {
         ] {
             assert!(with(&[bad]).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn mode_and_scores() {
+        let with = |pairs: &[(&str, &str)]| {
+            let mut all = vec![("DATABASE_URL", "x"), ("STARBOORU_SECRET", SECRET)];
+            all.extend_from_slice(pairs);
+            cfg(&all).map(|c| (c.mode, c.score_kind))
+        };
+        // Unset and empty (docker-compose's default) are both unset.
+        assert_eq!(with(&[]).unwrap(), (None, None));
+        assert_eq!(
+            with(&[
+                ("STARBOORU_MODE", " Public "),
+                ("STARBOORU_SCORES", "stars")
+            ])
+            .unwrap(),
+            (Some(Mode::Public), Some(ScoreKind::Stars))
+        );
+        assert_eq!(
+            with(&[("STARBOORU_MODE", ""), ("STARBOORU_SCORES", "likes")]).unwrap(),
+            (None, Some(ScoreKind::Likes))
+        );
+        assert!(with(&[("STARBOORU_MODE", "open")]).is_err());
+        assert!(with(&[("STARBOORU_SCORES", "hearts")]).is_err());
     }
 
     #[test]

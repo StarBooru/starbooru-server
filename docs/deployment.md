@@ -66,9 +66,27 @@ Someone who signs in this way for the first time gets a new account when registr
 
 The desktop and Android apps open the system browser and receive the answer on a loopback address, so nothing else needs registering at the provider.
 
+## Private or public
+
+A server starts private: it is yours or your household's, and everything in it needs an account. A public server is open to other people with their own accounts (turn on `STARBOORU_ALLOW_REGISTRATION` or the setting for sign-ups), and to anyone without one, who may browse.
+
+What a public server shows to anyone who finds its address:
+
+- every post outside the recycle bin, with its tags, rating, source, score and people, and its files through the signed media links;
+- the tags, their tree, aliases and implications, and spelling suggestions;
+- Explore, trending posts and popular tags included.
+
+They can't vote, upload, edit, tag, save searches or see the recycle bin, the accounts or anything in Administration. Each address may make 300 requests a minute without an account (an IPv6 network counts as one address); past that it waits, with `Retry-After`. Behind a reverse proxy, set `STARBOORU_TRUST_PROXY` so the limit counts each visitor rather than the proxy. A public server counts likes and dislikes, shares posts by their own address instead of share links, and doesn't search other boorus, which can't be turned on there. Library imports stay, for administrators.
+
+To switch, use Administration in the app (or `POST /api/v1/admin/mode`). It first shows what the other mode has no use for and will delete: going public deletes the share links and the saved accounts and searches on other boorus, and turns star votes into likes (3 stars, neither, are dropped). It then backs the database up, unless you say not to, and switches.
+
+A private server can count 1 to 5 stars instead of likes (Administration › Server). Changing it converts the votes after showing how many: a like becomes 5 stars and a dislike 1, 4 or 5 stars a like and 1 or 2 a dislike.
+
+`STARBOORU_MODE` and `STARBOORU_SCORES` set the starting mode and score kind of a new server. The first start stores them, and from then on they have no effect: changes go through Administration, which shows what they delete or convert first. If one is later set to something other than what the server keeps, the server logs a warning at start and keeps what it has. Unset and empty are the same, so the compose file passes them empty by default. When you upgrade from a version without modes, the server stores private with likes, which is what it was. It follows the variables instead only if that deletes and converts nothing (going public with no share links and no saved booru accounts or searches, or stars with no votes yet); otherwise it logs a warning naming the variable and keeps private with likes.
+
 ## Configuration
 
-Admins can change the name, open registration, the recycle-bin days and the backup schedule in the app (Settings › Administration). Those changes apply at once and override the variables below.
+Admins can change the name, open registration, the recycle-bin days, the score kind and the backup schedule in the app (Settings › Administration). Those changes apply at once and override the variables below.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -76,6 +94,8 @@ Admins can change the name, open registration, the recycle-bin days and the back
 | `STARBOORU_SECRET` | required | At least 32 characters; signs media URLs and encrypts the keys of saved accounts on other boorus. Changing it invalidates existing media links, which clients refresh on reload, and makes those saved accounts unusable until they are entered again. Keep it with your backups: a restored database needs the same one to open them. |
 | `STARBOORU_NAME` | `StarBooru` | Instance name shown at sign-in |
 | `STARBOORU_ALLOW_REGISTRATION` | `false` | Allow sign-ups after the first (admin) account |
+| `STARBOORU_MODE` | `private` | The mode of a new server, `private` or `public` (see [Private or public](#private-or-public)). Stored on the first start, then changed only in Administration. |
+| `STARBOORU_SCORES` | `likes` | The score kind of a new server, `likes` (likes and dislikes) or `stars` (1 to 5, private servers only). Stored on the first start, then changed only in Administration. |
 | `STARBOORU_MAX_UPLOAD_MB` | `512` | Largest upload, 1 to 16384 |
 | `STARBOORU_SAMPLES` | `true` | Make smaller JPEG copies of big images for viewing (see `architecture.md` › *Media storage*). Turned on later, copies are made for older posts at the next start. |
 | `STARBOORU_AUTO_TAGS` | `true` | Tag posts with what the file shows, in the `meta` category: `lowres`, `highres`, `absurdres`, `wide_image`, `tall_image`, `animated`, `video`, `sound`, `long_video` (see `architecture.md` › *Automatic meta tags*). Each post is tagged once; turned on later, older posts are tagged at the next start. Admins can override it in Administration › Server. |
@@ -104,7 +124,7 @@ Admins can change the name, open registration, the recycle-bin days and the back
 | `STARBOORU_AI_COMICS` | see meaning | Where comic translation starts, the same way |
 | `STARBOORU_AI_WORKER` | next to the server | A specific AI worker binary, instead of `starbooru-ai-worker-gpu` then `starbooru-ai-worker` |
 | `STARBOORU_AI_TRANSLATE_TO` | unset | Translate new uploads in which OCR finds text into this language (`en`, `it`, `pt-BR`), drawn over the image (see *Comics and manga* below). Unset: only when someone asks in the viewer. |
-| `STARBOORU_TRUST_PROXY` | `false` (`true` in `docker-compose.yml`) | Take the client address from the last `X-Forwarded-For` entry, for the sign-in limits. Turn it on only behind a reverse proxy that sets the header (Traefik does); otherwise clients could pick their own address. |
+| `STARBOORU_TRUST_PROXY` | `false` (`true` in `docker-compose.yml`) | Take the client address from the last `X-Forwarded-For` entry, for the sign-in limits and the limit on visitors without an account. Turn it on only behind a reverse proxy that sets the header (Traefik does); otherwise clients could pick their own address. |
 | `STARBOORU_BIND` | `0.0.0.0:8080` | Listen address |
 | `STARBOORU_DATA_DIR` | `/data` in the image | Media storage |
 | `STARBOORU_WEB_DIR` | `/app/web` in the image, else unset | A compiled web app to serve, such as starbooru-web's bundle; unset means the server runs API-only. `starbooru-server precompress <dir>` writes a `.br` and a `.gz` of each text file, which are then sent as they are; without them the server compresses each file as it goes out. |

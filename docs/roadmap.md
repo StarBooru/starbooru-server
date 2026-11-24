@@ -33,15 +33,16 @@ An instance runs in one of two modes: private, as today, or public, open to othe
 
 The owner's answers (2026-11-23): in public mode, people without an account can browse everything, read-only. A post is shared by its own address there; share links stay for private mode. Switching deletes what the new mode doesn't use, after a preview of it and a backup made for the switch.
 
-- [ ] The mode, a server setting that `/info` reports
-- [ ] Switching is destructive, so the switch first offers a backup made for it, on by default
-- [ ] Private mode: 0 to 5 star scores as an option, with likes and dislikes as the default. A vote is -1, 0 or 1 today
+- [x] The mode, a server setting that `/info` reports
+- [x] Switching is destructive, so the switch first offers a backup made for it, on by default
+- [x] Private mode: 0 to 5 star scores as an option, with likes and dislikes as the default
 - [ ] Public mode: accounts with a profile and a profile picture. Sign-up exists (`allow_registration`), but a user has only a name and a role
 - [ ] Public mode: a forum
 - [ ] Public mode: votes on tags. Only posts take votes today
-- [ ] Public mode: the other-booru endpoints (`/remote/*`) are off and can't be turned on
-- [ ] Public mode: browsing without an account, read-only, and Explore's Trending and Popular tags
-- [ ] Share links set up to suit each mode: share links in private mode, a post's own address in public mode
+- [x] Public mode: the other-booru endpoints (`/remote/*`) are off and can't be turned on
+- [x] Public mode: browsing without an account, read-only, and Explore's Trending and Popular tags
+- [x] Share links set up to suit each mode: share links in private mode, a post's own address in public mode
+- [ ] The guests' rate limit shared between replicas (it's per process, in memory, like the sign-in limits)
 - [ ] A tag blacklist for each account
 - [ ] A home page setting: on or off, and how it's customised. Its background shows the most popular posts rated safe
 

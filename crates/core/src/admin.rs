@@ -6,6 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::Role;
+use crate::mode::{Change, Mode, ScoreKind};
 
 pub const MAX_INSTANCE_NAME_CHARS: usize = 64;
 pub const MAX_TRASH_DAYS: u32 = 3650;
@@ -29,6 +30,18 @@ pub struct ServerSettings {
     /// (`STARBOORU_AUTO_TAGS`). Missing from older clients, it means on.
     #[serde(default = "default_true")]
     pub auto_meta_tags: bool,
+    /// Private or public (`STARBOORU_MODE`). Changed only by
+    /// `POST /admin/mode`; `PUT /admin/settings` refuses another value.
+    #[serde(default)]
+    pub mode: Mode,
+    /// Likes or stars in force (`STARBOORU_SCORES`); always likes on a
+    /// public instance. Left out of a `PUT`, it stays as it is.
+    #[serde(default)]
+    pub score_kind: ScoreKind,
+    /// Only in the answer to a `PUT` that changed `score_kind`: the votes
+    /// it converted and dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<Change>,
 }
 
 fn default_true() -> bool {
@@ -75,6 +88,9 @@ pub fn clean_settings(settings: &ServerSettings) -> Result<ServerSettings, Setti
         allow_registration: settings.allow_registration,
         trash_days: settings.trash_days,
         auto_meta_tags: settings.auto_meta_tags,
+        mode: settings.mode,
+        score_kind: settings.score_kind,
+        changes: Vec::new(),
     })
 }
 
@@ -246,7 +262,25 @@ mod tests {
             allow_registration: true,
             trash_days,
             auto_meta_tags: true,
+            mode: Mode::Private,
+            score_kind: ScoreKind::Likes,
+            changes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn old_clients_settings_still_read() {
+        // Before modes and stars: no `mode`, no `score_kind`.
+        let old: ServerSettings = serde_json::from_value(json!({
+            "name": "Home", "allow_registration": false, "trash_days": 3
+        }))
+        .unwrap();
+        assert_eq!(old.mode, Mode::Private);
+        assert_eq!(old.score_kind, ScoreKind::Likes);
+        assert!(old.auto_meta_tags);
+        let out = serde_json::to_value(settings("x", 0)).unwrap();
+        assert_eq!(out["mode"], "private");
+        assert!(out.get("changes").is_none());
     }
 
     #[test]

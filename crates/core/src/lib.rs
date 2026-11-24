@@ -18,6 +18,7 @@ pub mod keys;
 pub mod library;
 pub mod local_ai;
 pub mod media;
+pub mod mode;
 pub mod model;
 pub mod oidc;
 pub mod panels;
@@ -58,6 +59,10 @@ pub use library::{
 };
 pub use local_ai::{Gpu, GpuKind, Hardware};
 pub use media::{FORMATS, SIZE_BYTES, SNIFF_BYTES, detect_mime, is_media, picture_size};
+pub use mode::{
+    Change, MAX_STARS, Mode, ModePreview, ModeSwitch, ModeSwitched, ScoreKind, ScorePreview,
+    average_stars, fair_rating, like_of, stars_of,
+};
 pub use model::*;
 pub use oidc::{Identity, OidcBegin, OidcError, OidcFinish, OidcStart, SignInMethods};
 pub use panels::{PanelTranslation, TextBlock, panel_prompt, parse_panel_blocks};

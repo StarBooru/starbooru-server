@@ -63,14 +63,41 @@ impl Throttle {
     /// Counts one attempt against `key`.
     pub fn hit(&self, key: &str, now: DateTime<Utc>) {
         let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
+        self.count(&mut windows, key, now, 1);
+    }
+
+    /// Counts a request worth `cost` attempts against `key`, or
+    /// `Err(seconds)` when its window has no room for it. A refused request
+    /// isn't counted.
+    pub fn take(&self, key: &str, now: DateTime<Utc>, cost: u32) -> Result<(), u64> {
+        let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(w) = windows.get(key)
+            && w.count.saturating_add(cost) > self.max
+        {
+            let left = (w.start + self.window - now).num_seconds();
+            if left > 0 {
+                return Err(u64::try_from(left).unwrap_or(1));
+            }
+        }
+        self.count(&mut windows, key, now, cost);
+        Ok(())
+    }
+
+    fn count(
+        &self,
+        windows: &mut HashMap<String, Window>,
+        key: &str,
+        now: DateTime<Utc>,
+        cost: u32,
+    ) {
         if let Some(w) = windows.get_mut(key) {
             if now - w.start >= self.window {
                 *w = Window {
                     start: now,
-                    count: 1,
+                    count: cost,
                 };
             } else {
-                w.count = w.count.saturating_add(1);
+                w.count = w.count.saturating_add(cost);
             }
             return;
         }
@@ -90,7 +117,7 @@ impl Throttle {
             key.to_owned(),
             Window {
                 start: now,
-                count: 1,
+                count: cost,
             },
         );
     }
@@ -238,6 +265,30 @@ mod tests {
         t.hit("alice", at(2));
         t.clear("alice");
         assert_eq!(t.check("alice", at(3)), Ok(()));
+    }
+
+    #[test]
+    fn take_counts_until_full() {
+        let t = Throttle::new(2, TimeDelta::minutes(1));
+        assert_eq!(t.take("a", at(0), 1), Ok(()));
+        assert_eq!(t.take("a", at(1), 1), Ok(()));
+        assert_eq!(t.take("a", at(20), 1), Err(40));
+        // Refusals don't stretch the window.
+        assert_eq!(t.take("a", at(30), 1), Err(30));
+        assert_eq!(t.take("b", at(30), 1), Ok(()));
+        assert_eq!(t.take("a", at(60), 1), Ok(()));
+        assert_eq!(t.take("a", at(61), 1), Ok(()));
+        assert_eq!(t.take("a", at(62), 1), Err(58));
+        // A dearer request needs room for all it costs.
+        let t = Throttle::new(5, TimeDelta::minutes(1));
+        assert_eq!(t.take("a", at(0), 4), Ok(()));
+        assert_eq!(t.take("a", at(1), 2), Err(59));
+        assert_eq!(t.take("a", at(1), 1), Ok(()));
+        assert_eq!(
+            t.take("b", at(0), 9),
+            Ok(()),
+            "a fresh window takes anything"
+        );
     }
 
     #[test]

@@ -9,14 +9,17 @@ mod config;
 mod edit;
 mod error;
 mod fetch;
+mod guests;
 mod local_ai;
 mod media;
+mod modes;
 mod ocr;
 mod oidc;
 mod panels;
 mod probe;
 mod remote;
 mod routes;
+mod scores;
 mod settings;
 mod similar;
 mod sources;
@@ -95,6 +98,22 @@ async fn run() -> Result<bool, StartupError> {
         .await?
         .with_tools(config.tools.clone())
         .with_samples(config.samples);
+    // Before anything reads them. Unsettled, they read as private with likes.
+    match modes::settle(&db, config.mode, config.score_kind).await {
+        Ok(settled) => {
+            if settled.first {
+                info!(
+                    "this server is {}, with {} as scores",
+                    settled.mode.as_str(),
+                    settled.kind.as_str()
+                );
+            }
+            for warning in &settled.warnings {
+                warn!("{warning}");
+            }
+        }
+        Err(e) => warn!("the mode and score kind weren't stored: {e}"),
+    }
     let state = AppState::new(config, db, storage);
     update::start(&state).await;
     let app = routes::router(state.clone());

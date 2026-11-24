@@ -176,6 +176,15 @@ pub struct ServerInfo {
     /// Whether videos can be trimmed (the server has ffmpeg).
     #[serde(default)]
     pub video_editing: bool,
+    /// Private or public.
+    #[serde(default)]
+    pub mode: crate::Mode,
+    /// What a vote is: likes and dislikes, or stars.
+    #[serde(default)]
+    pub score_kind: crate::ScoreKind,
+    /// People without an account may browse (public instances).
+    #[serde(default)]
+    pub guests: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -276,9 +285,22 @@ pub struct Post {
     /// Lowercase hex SHA-256 of the original file.
     pub sha256: String,
     pub rating: Rating,
+    /// Likes minus dislikes. Under stars, the votes of 4 or 5 minus those of
+    /// 1 or 2: the score the post would have in likes.
     pub score: i32,
-    /// The caller's own vote: -1, 0 or 1.
+    /// The caller's own vote: -1, 0 or 1. Under stars, the like their stars
+    /// count as (see `my_stars`).
     pub my_vote: i16,
+    /// Under stars: the average of the post's votes, 1 to 5, to two
+    /// decimals. `None` without votes, and under likes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stars: Option<f64>,
+    /// Under stars: how many votes the post has.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub votes: u32,
+    /// Under stars: the caller's own, 1 to 5; 0 for none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub my_stars: u8,
     pub source: Option<String>,
     pub tags: Vec<String>,
     pub created_at: DateTime<Utc>,
@@ -527,10 +549,35 @@ pub struct PostUpdate {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// `PUT /posts/{id}/vote`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoteRequest {
-    /// -1, 0 (remove vote) or 1.
+    /// -1, 0 (remove vote) or 1. Under stars, without `stars`, a like gives
+    /// 5 stars and a dislike 1, so apps that only know likes still vote.
+    #[serde(default)]
     pub value: i16,
+    /// Under stars: 1 to 5, or 0 to remove the vote. Refused under likes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stars: Option<u8>,
+}
+
+impl VoteRequest {
+    /// A like (1), a dislike (-1), or none (0).
+    pub fn like(value: i16) -> Self {
+        Self { value, stars: None }
+    }
+
+    /// 1 to 5 stars, or 0 for none.
+    pub fn stars(stars: u8) -> Self {
+        Self {
+            value: 0,
+            stars: Some(stars),
+        }
+    }
+}
+
+fn is_zero<T: Default + PartialEq>(n: &T) -> bool {
+    *n == T::default()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -750,6 +797,31 @@ mod tests {
             "\"explicit\""
         );
         assert_eq!(serde_json::to_string(&Role::Admin).unwrap(), "\"admin\"");
+    }
+
+    #[test]
+    fn votes_read_old_and_new_bodies() {
+        let old: VoteRequest = serde_json::from_str(r#"{"value": -1}"#).unwrap();
+        assert_eq!(old, VoteRequest::like(-1));
+        let stars: VoteRequest = serde_json::from_str(r#"{"stars": 4}"#).unwrap();
+        assert_eq!(stars, VoteRequest::stars(4));
+        assert_eq!(
+            serde_json::to_string(&VoteRequest::like(1)).unwrap(),
+            r#"{"value":1}"#
+        );
+        assert!(serde_json::from_str::<VoteRequest>(r#"{"stars": -1}"#).is_err());
+    }
+
+    #[test]
+    fn old_server_info_still_reads() {
+        let info: ServerInfo = serde_json::from_str(
+            r#"{"name":"S","version":"0.1.0","has_users":true,"registration_open":false,
+                "max_upload_bytes":1}"#,
+        )
+        .unwrap();
+        assert_eq!(info.mode, crate::Mode::Private);
+        assert_eq!(info.score_kind, crate::ScoreKind::Likes);
+        assert!(!info.guests);
     }
 
     #[test]

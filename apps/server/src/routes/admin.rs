@@ -14,8 +14,8 @@ use starbooru_core::{
 
 use crate::auth::{self, AuthUser, hash_password};
 use crate::error::{AppError, AppResult};
-use crate::settings;
 use crate::state::AppState;
+use crate::{modes, scores, settings};
 
 /// Serialises account changes, so two admins can't demote each other at once
 /// and leave none.
@@ -116,16 +116,45 @@ pub async fn get_settings(
     settings::current(&state).await.map(Json)
 }
 
-/// `PUT /admin/settings`: takes effect at once.
+/// `PUT /admin/settings`: takes effect at once. A `mode` other than the one
+/// in force is refused, as switching has its own endpoint; a new
+/// `score_kind` converts the votes, and the answer says how many. Older
+/// clients leave both out, and they stay as they are.
 pub async fn put_settings(
     State(state): State<AppState>,
     user: AuthUser,
-    Json(req): Json<ServerSettings>,
+    Json(body): Json<serde_json::Value>,
 ) -> AppResult<Json<ServerSettings>> {
     require_admin_session(&user)?;
+    let has_mode = body.get("mode").is_some();
+    let has_kind = body.get("score_kind").is_some();
+    let req: ServerSettings =
+        serde_json::from_value(body).map_err(|e| AppError::BadRequest(e.to_string()))?;
     let clean = clean_settings(&req).map_err(|e| AppError::BadRequest(e.to_string()))?;
-    settings::save(&state, &clean).await?;
-    settings::current(&state).await.map(Json)
+
+    let mut tx = state.db.begin().await?;
+    modes::lock(&mut tx).await?;
+    let (mode, kind) = settings::scoring(&mut *tx).await?;
+    if has_mode && clean.mode != mode {
+        return Err(AppError::Conflict {
+            code: "use_mode_switch",
+            message: "switch the mode with POST /admin/mode, which shows what it deletes and \
+                      backs up first"
+                .into(),
+        });
+    }
+    let wanted = if has_kind { clean.score_kind } else { kind };
+    super::modes::check_kind(mode, wanted)?;
+    settings::save(&mut *tx, &state.config, &clean).await?;
+    let mut changes = Vec::new();
+    if wanted != kind {
+        settings::save_score_kind(&mut *tx, wanted).await?;
+        changes = scores::convert(&mut tx, wanted).await?;
+    }
+    tx.commit().await?;
+    let mut answer = settings::current(&state).await?;
+    answer.changes = changes;
+    Ok(Json(answer))
 }
 
 #[derive(FromRow)]
@@ -315,9 +344,12 @@ pub async fn delete_user(
     Path(id): Path<i64>,
 ) -> AppResult<StatusCode> {
     let mut tx = begin_change(&state, &user, id, "you can't delete your own account").await?;
+    modes::lock_shared(&mut tx).await?;
     // Votes go with the account, so take them off the scores first.
     sqlx::query(
-        "UPDATE posts p SET score = p.score - v.value \
+        "UPDATE posts p SET score = p.score - v.value, \
+             star_sum = p.star_sum - coalesce(v.stars, 0), \
+             star_count = p.star_count - (v.stars IS NOT NULL)::int \
          FROM post_votes v WHERE v.post_id = p.id AND v.user_id = $1",
     )
     .bind(id)
@@ -356,7 +388,9 @@ mod tests {
                 "name": "StarBooru",
                 "allow_registration": false,
                 "trash_days": 0,
-                "auto_meta_tags": false
+                "auto_meta_tags": false,
+                "mode": "private",
+                "score_kind": "likes"
             })
         );
         let put = |token: &str, body: serde_json::Value| {

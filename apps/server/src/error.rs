@@ -20,6 +20,12 @@ pub enum AppError {
     /// Forbidden, with the reason.
     #[error("{0}")]
     Denied(&'static str),
+    /// Forbidden, with a code of its own and the reason.
+    #[error("{message}")]
+    Refused {
+        code: &'static str,
+        message: &'static str,
+    },
     #[error("not found")]
     NotFound,
     #[error("{message}")]
@@ -35,6 +41,9 @@ pub enum AppError {
     /// Too many failed attempts; try again after `retry_after` seconds.
     #[error("too many attempts, try again in {}", wait_phrase(*.retry_after))]
     TooManyRequests { retry_after: u64 },
+    /// Too many requests without an account from one address.
+    #[error("too many requests without an account; try again in {} or sign in", wait_phrase(*.retry_after))]
+    GuestLimit { retry_after: u64 },
     /// A remote server failed during URL import.
     #[error("{0}")]
     Upstream(String),
@@ -55,13 +64,16 @@ impl AppError {
             AppError::WeakPassword => (StatusCode::BAD_REQUEST, "weak_password"),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             AppError::Forbidden | AppError::Denied(_) => (StatusCode::FORBIDDEN, "forbidden"),
+            AppError::Refused { code, .. } => (StatusCode::FORBIDDEN, code),
             AppError::QuotaExceeded => (StatusCode::FORBIDDEN, "quota_exceeded"),
             AppError::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             AppError::Conflict { code, .. } => (StatusCode::CONFLICT, code),
             AppError::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "too_large"),
             AppError::StorageFull => (StatusCode::INSUFFICIENT_STORAGE, "storage_full"),
             AppError::Unsupported(_) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported"),
-            AppError::TooManyRequests { .. } => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+            AppError::TooManyRequests { .. } | AppError::GuestLimit { .. } => {
+                (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
+            }
             // Not 502 or 504: Cloudflare swaps those for a page of its own, and the
             // message that says what went wrong never reaches the user.
             AppError::Upstream(_) => (StatusCode::FAILED_DEPENDENCY, "fetch_failed"),
@@ -88,7 +100,9 @@ impl IntoResponse for AppError {
             }),
         )
             .into_response();
-        if let AppError::TooManyRequests { retry_after } = self {
+        if let AppError::TooManyRequests { retry_after } | AppError::GuestLimit { retry_after } =
+            self
+        {
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
         }

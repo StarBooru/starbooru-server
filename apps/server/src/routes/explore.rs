@@ -8,15 +8,16 @@ use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use serde::Deserialize;
 use sqlx::QueryBuilder;
 use starbooru_core::{
-    DEFAULT_EXPLORE_DAYS, Explore, MAX_EXPLORE_DAYS, Post, TagTrend, parse_query,
+    DEFAULT_EXPLORE_DAYS, Explore, MAX_EXPLORE_DAYS, Mode, Post, TagTrend, parse_query,
 };
 
 use super::posts::{
     PostRow, correct_typos, end_page, push_filters, select_page, tag_filter, to_post,
 };
 use super::tags::{TagRow, to_tag};
-use crate::auth::AuthUser;
 use crate::error::AppResult;
+use crate::guests::Viewer;
+use crate::settings;
 use crate::state::AppState;
 
 const TRENDING_LIMIT: i64 = 24;
@@ -36,13 +37,17 @@ pub struct ExploreParams {
 
 pub async fn explore(
     State(state): State<AppState>,
-    user: AuthUser,
+    viewer: Viewer,
     Query(params): Query<ExploreParams>,
 ) -> AppResult<Json<Explore>> {
     let days = params
         .days
         .unwrap_or(DEFAULT_EXPLORE_DAYS)
         .clamp(1, MAX_EXPLORE_DAYS);
+    // A private instance's apps don't show what's popular, and it is the
+    // costliest part, so only public ones work it out.
+    let popular = settings::mode(&state).await? == Mode::Public;
+    let user_id = viewer.id();
     let mut query = parse_query(&params.q)?;
     query.deleted = false;
     let (query, corrected) = correct_typos(&state, query).await?;
@@ -70,7 +75,7 @@ pub async fn explore(
     };
 
     // The sections are independent, so they run at the same time.
-    let mut qb = select_page(user.id);
+    let mut qb = select_page(user_id);
     qb.push(" JOIN (SELECT post_id, sum(value) AS heat FROM post_votes WHERE voted_at >= ")
         .push_bind(since)
         .push(" GROUP BY post_id HAVING sum(value) > 0) h ON h.post_id = p.id");
@@ -78,7 +83,13 @@ pub async fn explore(
     qb.push(" ORDER BY h.heat DESC, p.score DESC, p.id DESC LIMIT ")
         .push_bind(TRENDING_LIMIT);
     end_page(&mut qb);
-    let trending = fetch_posts(qb);
+    let trending = async {
+        if popular {
+            fetch_posts(qb).await
+        } else {
+            Ok(Vec::new())
+        }
+    };
 
     // Counted by id first, so only the top tags are joined.
     let mut qb = QueryBuilder::new(
@@ -97,6 +108,9 @@ pub async fn explore(
     qb.push(" GROUP BY u.tag_id) c JOIN tags t ON t.id = c.tag_id ORDER BY c.recent DESC, t.name LIMIT ")
         .push_bind(TAGS_LIMIT);
     let tags = async {
+        if !popular {
+            return Ok(Vec::new());
+        }
         let rows: Vec<(i64, String, i16, i32, i64)> =
             qb.build_query_as().fetch_all(&state.db).await?;
         AppResult::Ok(
@@ -109,7 +123,7 @@ pub async fn explore(
         )
     };
 
-    let mut qb = select_page(user.id);
+    let mut qb = select_page(user_id);
     push_filters(&mut qb, &query, &filter);
     qb.push(" AND EXTRACT(MONTH FROM p.created_at AT TIME ZONE 'UTC')::int = ")
         .push_bind(i32::try_from(now.month()).unwrap_or(1))
@@ -124,7 +138,7 @@ pub async fn explore(
 
     let random = async {
         let random_from = |percent: Option<f32>| {
-            let mut qb = select_page(user.id);
+            let mut qb = select_page(user_id);
             if let Some(percent) = percent {
                 qb.push(" TABLESAMPLE SYSTEM (")
                     .push_bind(percent)
@@ -214,8 +228,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explores_trending_tags_and_this_day() {
+    async fn a_private_instance_skips_what_is_popular() {
         let Some(app) = testing::app().await else {
+            return;
+        };
+        let alice = app.register("alice").await;
+        let a = app.upload_png(&alice, 1, "cat").await;
+        app.call(
+            Method::PUT,
+            &format!("/api/v1/posts/{a}/vote"),
+            Some(&alice),
+            Some(json!({ "value": 1 })),
+        )
+        .await;
+        let e = app.get("/api/v1/explore", &alice).await.json();
+        assert_eq!(e["trending"], json!([]));
+        assert_eq!(e["tags"], json!([]));
+        assert_eq!(ids(&e["random"]), [a]);
+        app.finish().await;
+    }
+
+    #[tokio::test]
+    async fn explores_trending_tags_and_this_day() {
+        let Some(app) = testing::app_with(|c| c.mode = Some(Mode::Public)).await else {
             return;
         };
         let alice = app.register("alice").await;

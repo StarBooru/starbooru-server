@@ -12,6 +12,7 @@ mod figures;
 mod imports;
 mod keys;
 mod library;
+mod modes;
 mod oidc;
 mod posts;
 mod remote;
@@ -41,7 +42,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use starbooru_core::{ApiError, ServerInfo};
+use starbooru_core::{ApiError, Mode, ServerInfo};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any as AnyOrigin, CorsLayer};
@@ -117,6 +118,9 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/updates/check", post(updates::check))
         .route("/admin/updates/settings", put(updates::set_settings))
         .route("/admin/updates/install", post(updates::install))
+        .route("/admin/mode", post(modes::switch))
+        .route("/admin/mode/preview", get(modes::preview))
+        .route("/admin/scores/preview", get(modes::scores_preview))
         .route("/keys", get(keys::list).post(keys::create))
         .route("/keys/{id}", axum::routing::delete(keys::delete))
         .route(
@@ -155,26 +159,7 @@ pub fn router(state: AppState) -> Router {
         .route("/library-imports/{id}/stop", post(library::stop))
         .route("/library-imports/{id}/retry", post(library::retry))
         .route("/library-imports/{id}/failures", get(library::failures))
-        .route("/remote/search", post(remote::search))
-        .route("/remote/tags", post(remote::tags))
-        .route("/remote/post", post(remote::post))
-        .route("/remote/media", get(crate::remote::relay::serve))
-        .route(
-            "/remote/searches",
-            get(remote::searches).post(remote::save_search),
-        )
-        .route(
-            "/remote/searches/{id}",
-            axum::routing::delete(remote::delete_search),
-        )
-        .route(
-            "/remote/accounts",
-            get(remote::accounts).put(remote::save_account),
-        )
-        .route(
-            "/remote/accounts/{id}",
-            axum::routing::delete(remote::delete_account),
-        )
+        .merge(remote_routes(&state))
         .route("/posts/bulk", post(posts::bulk))
         .route("/posts/{id}/neighbors", get(posts::neighbors))
         .route("/posts/{id}/related", get(posts::related))
@@ -208,6 +193,10 @@ pub fn router(state: AppState) -> Router {
             axum::routing::delete(tags::remove_implication),
         )
         .fallback(api_not_found)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::guests::gate,
+        ))
         .layer(CompressionLayer::new());
 
     // Native and Android clients run on other origins and authenticate with
@@ -248,6 +237,48 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Other boorus, searched through the server. A public instance turns
+/// every one of these off.
+fn remote_routes(state: &AppState) -> Router<AppState> {
+    Router::new()
+        .route("/remote/search", post(remote::search))
+        .route("/remote/tags", post(remote::tags))
+        .route("/remote/post", post(remote::post))
+        .route("/remote/media", get(crate::remote::relay::serve))
+        .route(
+            "/remote/searches",
+            get(remote::searches).post(remote::save_search),
+        )
+        .route(
+            "/remote/searches/{id}",
+            axum::routing::delete(remote::delete_search),
+        )
+        .route(
+            "/remote/accounts",
+            get(remote::accounts).put(remote::save_account),
+        )
+        .route(
+            "/remote/accounts/{id}",
+            axum::routing::delete(remote::delete_account),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            remote_gate,
+        ))
+}
+
+async fn remote_gate(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    match crate::settings::mode(&state).await {
+        Ok(Mode::Public) => AppError::Refused {
+            code: "remote_off",
+            message: "a public server doesn't reach other boorus",
+        }
+        .into_response(),
+        Ok(Mode::Private) => next.run(req).await,
+        Err(e) => e.into_response(),
+    }
+}
+
 async fn info(State(state): State<AppState>) -> AppResult<Json<ServerInfo>> {
     let has_users: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users)")
         .fetch_one(&state.db)
@@ -262,6 +293,9 @@ async fn info(State(state): State<AppState>) -> AppResult<Json<ServerInfo>> {
         url_import: state.fetcher.is_some(),
         oidc: state.oidc.as_ref().map(|o| o.name().to_owned()),
         video_editing: state.storage.has_tools(),
+        mode: settings.mode,
+        score_kind: settings.score_kind,
+        guests: settings.mode.guests(),
     }))
 }
 
