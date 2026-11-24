@@ -59,6 +59,44 @@ pub struct Config {
     pub oidc: Option<OidcConfig>,
     /// OpenAI-compatible AI provider (`STARBOORU_AI_*`); admins can override it.
     pub ai: AiConfig,
+    /// New releases and updates (`STARBOORU_UPDATE_*`); admins can override
+    /// the checks and automatic updates.
+    pub updates: UpdateConfig,
+}
+
+/// Where the server learns about releases and how it updates.
+#[derive(Debug, Clone)]
+pub struct UpdateConfig {
+    /// Ask for new releases now and then (`STARBOORU_UPDATE_CHECK`, on by default).
+    pub check: bool,
+    /// Install new releases by themselves (`STARBOORU_AUTO_UPDATE`, off by default).
+    pub auto: bool,
+    /// The hour, server time, automatic updates start at.
+    pub auto_hour: u8,
+    /// The newest release's address (`STARBOORU_UPDATE_URL`, for testing).
+    pub release_url: Url,
+    /// The image repository updates pull from (`STARBOORU_UPDATE_IMAGE`, for
+    /// testing); `None` keeps the one the container runs.
+    pub image: Option<String>,
+}
+
+/// GitHub's newest published release that isn't a draft or a pre-release.
+pub const RELEASES_URL: &str =
+    "https://api.github.com/repos/StarBooru/starbooru-server/releases/latest";
+
+impl UpdateConfig {
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        Self {
+            // Off, so tests never ask GitHub.
+            check: false,
+            auto: false,
+            auto_hour: starbooru_core::update::DEFAULT_AUTO_UPDATE_HOUR,
+            // The discard port: nothing answers.
+            release_url: Url::parse("http://127.0.0.1:9/").unwrap(),
+            image: None,
+        }
+    }
 }
 
 /// The AI defaults from the environment; the admin's panel overrides them.
@@ -238,6 +276,7 @@ impl Config {
         .then(|| PathBuf::from(pg_dump.trim()));
 
         let oidc = oidc_config(&get)?;
+        let updates = update_config(&get)?;
 
         let web_dir = get("STARBOORU_WEB_DIR")
             .filter(|s| !s.trim().is_empty())
@@ -307,6 +346,7 @@ impl Config {
                     })?,
                 },
             },
+            updates,
         })
     }
 
@@ -335,8 +375,66 @@ impl Config {
             backup_keep: 7,
             oidc: None,
             ai: AiConfig::default(),
+            updates: UpdateConfig::for_tests(),
         }
     }
+}
+
+/// `STARBOORU_UPDATE_CHECK`, `STARBOORU_AUTO_UPDATE`, `STARBOORU_AUTO_UPDATE_HOUR`,
+/// and the two addresses tests point elsewhere.
+fn update_config(get: &impl Fn(&str) -> Option<String>) -> Result<UpdateConfig, ConfigError> {
+    let auto_hour = whole(
+        get,
+        "STARBOORU_AUTO_UPDATE_HOUR",
+        u32::from(starbooru_core::update::DEFAULT_AUTO_UPDATE_HOUR),
+    )?;
+    let auto_hour = u8::try_from(auto_hour)
+        .ok()
+        .filter(|h| *h <= 23)
+        .ok_or_else(|| ConfigError::Invalid {
+            name: "STARBOORU_AUTO_UPDATE_HOUR",
+            reason: "must be an hour from 0 to 23".into(),
+        })?;
+    let raw_url = get("STARBOORU_UPDATE_URL")
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| RELEASES_URL.to_owned());
+    let release_url = Url::parse(&raw_url)
+        .ok()
+        .filter(|u| matches!(u.scheme(), "http" | "https") && u.username().is_empty())
+        .ok_or_else(|| ConfigError::Invalid {
+            name: "STARBOORU_UPDATE_URL",
+            reason: format!("`{raw_url}` is not an http(s) address"),
+        })?;
+    let image = get("STARBOORU_UPDATE_IMAGE")
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    if let Some(image) = &image
+        && (image.contains('@')
+            || image
+                .rsplit('/')
+                .next()
+                .is_some_and(|last| last.contains(':'))
+            || !image.bytes().all(|b| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'.' | b'-' | b'_' | b'/' | b':')
+            }))
+    {
+        return Err(ConfigError::Invalid {
+            name: "STARBOORU_UPDATE_IMAGE",
+            reason: format!(
+                "`{image}` is not an image repository (no tag, such as ghcr.io/starbooru/starbooru-server)"
+            ),
+        });
+    }
+    Ok(UpdateConfig {
+        check: get("STARBOORU_UPDATE_CHECK").is_none_or(|v| flag(Some(v))),
+        auto: flag(get("STARBOORU_AUTO_UPDATE")),
+        auto_hour,
+        release_url,
+        image,
+    })
 }
 
 /// `STARBOORU_OIDC_*`: all of issuer, client id and secret, or none.
@@ -682,6 +780,48 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn updates() {
+        let with = |pairs: &[(&str, &str)]| {
+            let mut all = vec![("DATABASE_URL", "x"), ("STARBOORU_SECRET", SECRET)];
+            all.extend_from_slice(pairs);
+            cfg(&all).map(|c| c.updates)
+        };
+        let u = with(&[]).unwrap();
+        assert!(u.check);
+        assert!(!u.auto);
+        assert_eq!(u.auto_hour, 4);
+        assert_eq!(u.release_url.as_str(), RELEASES_URL);
+        assert_eq!(u.image, None);
+        let u = with(&[
+            ("STARBOORU_UPDATE_CHECK", "off"),
+            ("STARBOORU_AUTO_UPDATE", "true"),
+            ("STARBOORU_AUTO_UPDATE_HOUR", " 23 "),
+            ("STARBOORU_UPDATE_URL", "http://sbtest-releases/latest.json"),
+            ("STARBOORU_UPDATE_IMAGE", "localhost:5110/starbooru-server"),
+        ])
+        .unwrap();
+        assert!(!u.check);
+        assert!(u.auto);
+        assert_eq!(u.auto_hour, 23);
+        assert_eq!(u.release_url.as_str(), "http://sbtest-releases/latest.json");
+        assert_eq!(u.image.as_deref(), Some("localhost:5110/starbooru-server"));
+        for bad in [
+            ("STARBOORU_AUTO_UPDATE_HOUR", "24"),
+            ("STARBOORU_AUTO_UPDATE_HOUR", "4am"),
+            ("STARBOORU_UPDATE_URL", "ftp://example.com/latest"),
+            ("STARBOORU_UPDATE_URL", "not an address"),
+            (
+                "STARBOORU_UPDATE_IMAGE",
+                "ghcr.io/starbooru/starbooru-server:latest",
+            ),
+            ("STARBOORU_UPDATE_IMAGE", "Upper/Case"),
+            ("STARBOORU_UPDATE_IMAGE", "repo@sha256:00"),
+        ] {
+            assert!(with(&[bad]).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

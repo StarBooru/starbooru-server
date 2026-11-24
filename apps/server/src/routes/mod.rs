@@ -19,6 +19,7 @@ mod searches;
 mod shares;
 mod tags;
 mod trash;
+mod updates;
 mod uploads;
 
 pub use autotag::backfill_meta_tags;
@@ -112,6 +113,10 @@ pub fn router(state: AppState) -> Router {
             "/admin/backups/{name}",
             axum::routing::delete(backups::delete),
         )
+        .route("/admin/updates", get(updates::status))
+        .route("/admin/updates/check", post(updates::check))
+        .route("/admin/updates/settings", put(updates::set_settings))
+        .route("/admin/updates/install", post(updates::install))
         .route("/keys", get(keys::list).post(keys::create))
         .route("/keys/{id}", axum::routing::delete(keys::delete))
         .route(

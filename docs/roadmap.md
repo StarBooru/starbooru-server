@@ -22,10 +22,12 @@ Left:
 
 The server knows only its own version. Installs run the image's `latest` tag, so an administrator finds out about a new release only by looking. starbooru-web's `docs/roadmap.md` (section 10) has the app's side.
 
-- [ ] The server checks for a new release now and then (it can be turned off) and tells administrators, with the release notes
-- [ ] Updating from the app: the Docker image replaces itself when the administrator has given it the Docker socket; the server package downloads, checks and swaps itself
-- [ ] Automatic updates, an option, with a backup first
-- [ ] The image serves starbooru-web, a pinned release checked against its `SHA256SUMS`, and `web.rs` knows Trunk's file names (long cache, preloads)
+- [x] The server checks for a new release now and then (it can be turned off) and tells administrators, with the release notes
+- [x] Updating from the app: the Docker image replaces itself when the administrator has given it the Docker socket; the server package downloads, checks and swaps itself
+- [x] Automatic updates, an option, with a backup first
+- [ ] Docker Swarm updates, tested on a real swarm (unit-tested only)
+- [ ] The server package rolls back by itself when a new binary won't start
+- [x] The image serves starbooru-web, a pinned release checked against its `SHA256SUMS`, and `web.rs` knows Trunk's file names (long cache, preloads)
 
 ## Next: private and public instances
 
@@ -64,7 +66,7 @@ Each app starts from its docs and is rebuilt natively, with the archived Dioxus 
 | Windows (windows-reactor) | [starbooru-windows](https://github.com/StarBooru/starbooru-windows) | docs only |
 | Linux (GTK 4 and libadwaita) | [starbooru-linux](https://github.com/StarBooru/starbooru-linux) | docs only |
 
-Until starbooru-web is ready, the image serves no web app. Installs that need one stay on `ghcr.io/filipnone/starbooru`, the last image with the Dioxus web app inside.
+The image serves starbooru-web, a release pinned in the `Dockerfile`.
 
 ## Known gaps and risks
 
@@ -75,4 +77,3 @@ Until starbooru-web is ready, the image serves no web app. Installs that need on
 - **OCR coverage.** GIFs and videos are not read, and a scan that failed or timed out counts as done until `POST /posts/{id}/ocr` redoes it. The Docker image has English and Japanese; other languages need their `tesseract-ocr-*` package.
 - **Panel translation.** Small local models miss text and place boxes loosely, and may translate sound effects literally. Long webtoon strips are shrunk to 1536 px, so their text may be too small to read; there is no splitting yet.
 - **Sideways photos from before EXIF orientation.** Posts uploaded earlier keep the thumbnail and the size they got without it, so a crop can be refused as "outside the image". Rebuilding them needs a backfill.
-- **`web.rs` knows only `dx` bundles.** It caches files for a year only when they are named `<name>-dxh<hex>.<ext>`, and finds the wasm to preload in `dx`'s loader script. starbooru-web's bundle is served, but checked on every visit and without preloads, until the module learns its names.

@@ -18,6 +18,7 @@ use crate::remote::relay::Relay;
 use crate::storage::Storage;
 use crate::throttle::Guards;
 use crate::transfers::Transfers;
+use crate::update::Updates;
 use crate::uploads::Uploads;
 
 /// Cheap-to-clone handle shared by all handlers.
@@ -57,6 +58,8 @@ pub struct Inner {
     pub library_imports: tokio::sync::Notify,
     /// The built-in AI models and the process that runs them.
     pub local_ai: LocalAi,
+    /// New releases, and the update under way.
+    pub updates: Updates,
     pub started_at: DateTime<Utc>,
 }
 
@@ -104,6 +107,7 @@ impl AppState {
             relay,
             library_imports: tokio::sync::Notify::new(),
             local_ai,
+            updates: Updates::new(),
             started_at: Utc::now(),
         }))
     }

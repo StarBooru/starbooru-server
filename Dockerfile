@@ -1,5 +1,6 @@
-# StarBooru server image: the API, media storage and local AI in one container.
-# Works with BuildKit and the legacy builder (no cache mounts).
+# StarBooru server image: the API, media storage, local AI and the web app in one
+# container. Works with BuildKit and the legacy builder of Docker 25 or newer (no
+# cache mounts).
 #
 # AI_GPU picks what local AI can use besides the processor:
 #   none    processor only, x86-64 and ARM64 (the default)
@@ -19,6 +20,23 @@ RUN mkdir -p /out/ai \
     && cargo build --release --locked -p starbooru-server -p starbooru-ai-worker \
     && cp target/release/starbooru-server /out/starbooru-server \
     && cp target/release/starbooru-ai-worker /out/ai/starbooru-ai-worker
+
+# The web app, a release of starbooru-web pinned by version and hash, checked against
+# its SHA256SUMS too, and compressed once here rather than on every request.
+ARG WEB_VERSION=0.23.0
+ARG WEB_SHA256=df6988bf2c46ee52986d6701f154e1f9e3e7a0a57219cddcbdfe3622c77a09e7
+RUN set -eux; \
+    base="https://github.com/StarBooru/starbooru-web/releases/download/v$WEB_VERSION"; \
+    file="starbooru-web-$WEB_VERSION.tar.gz"; \
+    cd /tmp; \
+    curl -fsSL -A starbooru-build -o "$file" "$base/$file"; \
+    curl -fsSL -A starbooru-build -o SHA256SUMS "$base/SHA256SUMS"; \
+    echo "$WEB_SHA256  $file" | sha256sum -c -; \
+    grep -E "^[0-9a-f]{64} [ *]$file\$" SHA256SUMS | sha256sum -c -; \
+    mkdir -p /out/web; \
+    tar -xzf "$file" -C /out/web --strip-components=1 --no-same-owner; \
+    /out/starbooru-server precompress /out/web; \
+    rm -f "$file" SHA256SUMS
 
 # ONNX Runtime, which runs the models, pinned by version and hash. It comes from
 # Microsoft's NuGet packages: the GitHub releases are gone since 2026-11-17, and
@@ -83,10 +101,11 @@ ARG AI_GPU=none
 # ffmpeg makes thumbnails for video, AVIF and JPEG XL; pg_dump makes database backups;
 # tesseract reads text in images (OCR): English, and Japanese across and down for manga.
 # For more OCR languages add their packages here, e.g. tesseract-ocr-ita or
-# tesseract-ocr-deu, and list them in STARBOORU_OCR_LANGS (eng+ita).
+# tesseract-ocr-deu, and list them in STARBOORU_OCR_LANGS (eng+ita). tzdata lets TZ
+# name a time zone, which automatic updates keep their hour in.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates ffmpeg postgresql-client \
-       tesseract-ocr tesseract-ocr-eng tesseract-ocr-jpn tesseract-ocr-jpn-vert \
+       tesseract-ocr tesseract-ocr-eng tesseract-ocr-jpn tesseract-ocr-jpn-vert tzdata \
     && rm -rf /var/lib/apt/lists/*
 # Vulkan drivers for the graphics card worker. Without the software renderer,
 # which is slower than the processor worker, a server with no card finds none.
@@ -103,15 +122,23 @@ RUN useradd --system --uid 10001 --user-group --no-create-home --home-dir /data 
 
 COPY --from=build /out/starbooru-server /app/starbooru-server
 COPY --from=build /out/ai/ /app/
+COPY --from=build /out/web/ /app/web/
 
-# A web client's bundle can be mounted and served with STARBOORU_WEB_DIR.
+# Updates read the version from this label before switching to a new image.
+ARG STARBOORU_VERSION=
+LABEL org.opencontainers.image.version=$STARBOORU_VERSION
+
+# Another web bundle can be mounted and named in STARBOORU_WEB_DIR instead.
 ENV STARBOORU_BIND=0.0.0.0:8080 \
     LD_LIBRARY_PATH=/app \
-    STARBOORU_DATA_DIR=/data
+    STARBOORU_DATA_DIR=/data \
+    STARBOORU_WEB_DIR=/app/web
 
 USER starbooru
 VOLUME /data
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+# Every 2 s while starting, so a new container counts as healthy (and Traefik sends
+# it requests) as soon as it answers, not 30 s later.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --start-interval=2s --retries=3 \
     CMD ["/app/starbooru-server", "healthcheck"]
 ENTRYPOINT ["/app/starbooru-server"]

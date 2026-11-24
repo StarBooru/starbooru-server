@@ -29,6 +29,7 @@ pub mod share;
 pub mod tag;
 pub mod transfer;
 pub mod typo;
+pub mod update;
 pub mod vocab;
 
 pub use admin::{
@@ -75,6 +76,10 @@ pub use share::{NewShare, Share, ShareError, SharedPost, SharedView};
 pub use tag::{normalize_tag, parse_tag_list};
 pub use transfer::{Meter, Transfer};
 pub use typo::closest_tag;
+pub use update::{
+    Release, UpdateBlock, UpdateInstall, UpdateKind, UpdateMethod, UpdateRun, UpdateSettings,
+    UpdateState, UpdateStatus, Version, is_newer,
+};
 pub use vocab::{SECTIONS, VARIANTS, VOCAB, VOCAB_VERSION, split_category};
 
 /// Path prefix of the versioned JSON API.

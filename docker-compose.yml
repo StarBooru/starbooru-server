@@ -40,10 +40,20 @@ services:
       STARBOORU_AI_COMICS: ${STARBOORU_AI_COMICS:-}
       STARBOORU_AI_TRANSLATE_TO: ${STARBOORU_AI_TRANSLATE_TO:-}
       STARBOORU_LOCAL_AI: ${STARBOORU_LOCAL_AI:-false}
+      STARBOORU_UPDATE_CHECK: ${STARBOORU_UPDATE_CHECK:-true}
+      STARBOORU_AUTO_UPDATE: ${STARBOORU_AUTO_UPDATE:-false}
+      STARBOORU_AUTO_UPDATE_HOUR: ${STARBOORU_AUTO_UPDATE_HOUR:-4}
+      TZ: ${TZ:-UTC}
       # Behind Dokploy's Traefik the client address is in X-Forwarded-For.
       STARBOORU_TRUST_PROXY: ${STARBOORU_TRUST_PROXY:-true}
     volumes:
       - media:/data
+      # Updates from the app (Administration > Updates). The Docker socket is root on
+      # this machine, so it's off; uncomment this and group_add to turn it on, with
+      # STARBOORU_DOCKER_GID set to `stat -c %g /var/run/docker.sock`.
+      # - /var/run/docker.sock:/var/run/docker.sock
+    # group_add:
+    #   - "${STARBOORU_DOCKER_GID:?set STARBOORU_DOCKER_GID}"
     expose:
       - "8080"
     depends_on:

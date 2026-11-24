@@ -17,7 +17,7 @@
   <a href="https://www.postgresql.org"><img src="https://img.shields.io/badge/PostgreSQL-1b1342?style=flat-square&logo=postgresql&logoColor=white" alt="PostgreSQL"></a>
 </p>
 
-It stores the files, searches them and answers a JSON API: tags, imports from other boorus, OCR, and AI on local models or any OpenAI-compatible API. It has no interface of its own. The apps each have a repository:
+It stores the files, searches them and answers a JSON API: tags, imports from other boorus, OCR, and AI on local models or any OpenAI-compatible API. It has no interface of its own, but its Docker image serves the web app. The apps each have a repository:
 
 | App | Repository |
 |---|---|
@@ -37,7 +37,7 @@ cp .env.example .env   # set POSTGRES_PASSWORD and STARBOORU_SECRET
 docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
 ```
 
-The API is then on http://localhost:8080. The first account to register becomes admin. Dokploy, graphics cards and every setting are in [docs/deployment.md](docs/deployment.md).
+StarBooru is then on http://localhost:8080, web app included. The first account to register becomes admin. Dokploy, graphics cards and every setting are in [docs/deployment.md](docs/deployment.md).
 
 From source, with [Rust](https://rustup.rs) 1.88 or newer and PostgreSQL 13 or newer:
 

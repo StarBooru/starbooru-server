@@ -1,15 +1,19 @@
 //! The compiled web app (`STARBOORU_WEB_DIR`): its files, how long browsers
 //! keep them, and the page that starts it.
 //!
-//! `dx bundle` names every asset after its content (`main-dxh1a2b….css`), so
-//! those never change and browsers keep them for a year without asking again.
-//! `index.html` names the current ones, so it is checked on every visit.
+//! Two bundlers are known. Trunk, which builds starbooru-web, puts every file
+//! at the top and names the ones it processed after their content
+//! (`base-a6b86b29b8c0894a.css`, `starbooru-web-40e294ea2139a9d_bg.wasm`).
+//! `dx bundle`, which built the first app, puts them under `/assets/` as
+//! `main-dxh1a2b….css`. Either way those never change, and browsers keep them
+//! for a year without asking again. `index.html`, the service worker, the
+//! manifest and the icons keep their names, so they are checked on every visit.
 //!
 //! The page as `dx` writes it names its script and the stylesheet the app
 //! links from the start. The browser then learns about the wasm from the
 //! script, and about any other stylesheet from the running app, one round trip
 //! after another. [`with_preloads`] names those in the page too, so everything
-//! downloads together.
+//! downloads together. Trunk's page has its preloads already.
 //!
 //! `starbooru-server precompress <dir>` ([`precompress`]) writes a `.br` and a
 //! `.gz` next to each text file. They are served as they are, which is smaller
@@ -42,9 +46,21 @@ const MAX_WASM_BYTES: u64 = 128 << 20;
 
 /// What `precompress` compresses, by extension. Images and fonts are
 /// compressed already.
-const TEXT: [&str; 9] = [
-    "html", "js", "mjs", "css", "wasm", "svg", "json", "txt", "map",
+const TEXT: [&str; 10] = [
+    "html",
+    "js",
+    "mjs",
+    "css",
+    "wasm",
+    "svg",
+    "json",
+    "txt",
+    "map",
+    "webmanifest",
 ];
+/// Trunk writes its content hash in hex without leading zeros, so it is
+/// sometimes shorter than 16 digits. Fewer than this could be a word.
+const MIN_TRUNK_HASH: usize = 12;
 /// Smaller files than this aren't worth a second copy.
 const MIN_COMPRESS_BYTES: u64 = 1024;
 
@@ -91,12 +107,18 @@ impl WebApp {
         let status = response.status();
         // Single-page app: the router in the page knows the other paths. A
         // missing asset stays missing, as a page is no use to a script tag.
-        if status == StatusCode::NOT_FOUND && reads && !path.starts_with("/assets/") {
+        if status == StatusCode::NOT_FOUND && reads && !is_asset(&path) {
             return self.page();
         }
         if status.is_success() || status == StatusCode::NOT_MODIFIED {
             let keep = HeaderValue::from_static(cache_policy(&path));
             response.headers_mut().insert(header::CACHE_CONTROL, keep);
+            if path.ends_with(".webmanifest") {
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/manifest+json"),
+                );
+            }
         }
         response
     }
@@ -116,11 +138,26 @@ impl WebApp {
 /// How long a browser may keep the file at `path`.
 fn cache_policy(path: &str) -> &'static str {
     let name = path.rsplit('/').next().unwrap_or_default();
-    if path.starts_with("/assets/") && is_hashed(name) {
+    let dx = path.starts_with("/assets/") && is_hashed(name);
+    if dx || is_trunk_file(path) {
         KEEP
     } else {
         CHECK
     }
+}
+
+/// A file of the bundle's rather than a page of the app's, so a missing one
+/// is a 404: anything under `/assets/`, and a script, stylesheet, wasm or
+/// manifest at the top, such as `sw.js`. The app's own paths have no
+/// extension there.
+fn is_asset(path: &str) -> bool {
+    const KINDS: [&str; 6] = ["js", "mjs", "css", "wasm", "webmanifest", "map"];
+    let top = path
+        .strip_prefix('/')
+        .filter(|name| !name.contains('/'))
+        .and_then(|name| name.rsplit_once('.'))
+        .is_some_and(|(_, ext)| KINDS.contains(&ext));
+    path.starts_with("/assets/") || top
 }
 
 /// Whether `dx` named this file after its content: `<name>-dxh<hex>.<ext>`.
@@ -130,6 +167,28 @@ fn is_hashed(name: &str) -> bool {
     };
     let hash = rest.split('.').next().unwrap_or_default();
     hash.len() >= 8 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Whether Trunk named the file at `path` after its content: at the top,
+/// `<name>-<hex>.<ext>`, or `<name>-<hex>_bg.wasm` for the app itself.
+fn is_trunk_file(path: &str) -> bool {
+    let Some(name) = path.strip_prefix('/').filter(|n| !n.contains('/')) else {
+        return false;
+    };
+    let Some((base, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let base = match ext {
+        "wasm" => base.strip_suffix("_bg").unwrap_or(base),
+        _ => base,
+    };
+    let Some((stem, hash)) = base.rsplit_once('-') else {
+        return false;
+    };
+    !stem.is_empty()
+        && !ext.is_empty()
+        && (MIN_TRUNK_HASH..=16).contains(&hash.len())
+        && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The file a URL path names inside `dir`, or `None` if it could leave it.
@@ -228,6 +287,10 @@ fn stylesheets_of(wasm: &[u8]) -> BTreeSet<String> {
 /// script and the script to its wasm. Anything that can't be found is left
 /// out, and the page works as before.
 fn with_preloads(page: &str, dir: &Path) -> String {
+    // Trunk's page preloads its script and wasm itself.
+    if page.contains("rel=\"modulepreload\"") || page.contains("type=\"application/wasm\"") {
+        return page.to_owned();
+    }
     let mut links = String::new();
     let script = script_of(page)
         .and_then(|src| local(dir, src))
@@ -555,6 +618,133 @@ mod tests {
         let (response, body) = get(&app, &path, None).await;
         assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
         assert_eq!(body, original);
+    }
+
+    const TRUNK_JS: &str = "starbooru-web-e65146129cba245f.js";
+    // Trunk drops the hash's leading zeros: this one has 15 digits.
+    const TRUNK_WASM: &str = "starbooru-web-40e294ea2139a9d_bg.wasm";
+    const TRUNK_CSS: &str = "base-a6b86b29b8c0894a.css";
+
+    /// A directory like the one Trunk writes for starbooru-web.
+    fn trunk_bundle() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let page = format!(
+            "<!DOCTYPE html><html><head><title>StarBooru</title>\
+             <link rel=\"icon\" href=\"/favicon-7e14a15279059c64.svg\"/>\
+             <link rel=\"manifest\" href=\"/manifest.webmanifest\">\
+             <link rel=\"stylesheet\" href=\"/{TRUNK_CSS}\"/>\
+             <script type=\"module\">import init from '/{TRUNK_JS}';\
+             await init({{ module_or_path: '/{TRUNK_WASM}' }});</script>\
+             <link rel=\"modulepreload\" href=\"/{TRUNK_JS}\" crossorigin=\"anonymous\">\
+             <link rel=\"preload\" href=\"/{TRUNK_WASM}\" crossorigin=\"anonymous\" as=\"fetch\" type=\"application/wasm\"></head>\
+             <body></body></html>"
+        );
+        std::fs::write(dir.path().join("index.html"), page).unwrap();
+        for (name, body) in [
+            (TRUNK_JS, "export default function init() {}".to_owned()),
+            (TRUNK_WASM, "\0asm".to_owned()),
+            (TRUNK_CSS, "body { margin: 0 }".to_owned()),
+            ("favicon-7e14a15279059c64.svg", "<svg/>".to_owned()),
+            ("favicon-32.png", "png".to_owned()),
+            ("apple-touch-icon.png", "png".to_owned()),
+            (
+                "sw.js",
+                "self.addEventListener('fetch', () => {})".to_owned(),
+            ),
+            (
+                "manifest.webmanifest",
+                "{\"name\":\"StarBooru\"}".to_owned(),
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn knows_trunks_names() {
+        for kept in [
+            format!("/{TRUNK_JS}"),
+            format!("/{TRUNK_WASM}"),
+            format!("/{TRUNK_CSS}"),
+            "/favicon-7e14a15279059c64.svg".to_owned(),
+            "/starbooru-web-0123456789ab_bg.wasm".to_owned(),
+        ] {
+            assert_eq!(cache_policy(&kept), KEEP, "{kept}");
+        }
+        for checked in [
+            "/index.html",
+            "/sw.js",
+            "/manifest.webmanifest",
+            "/favicon-32.png",
+            "/apple-touch-icon.png",
+            "/icon-192x192.png",
+            // Too short to be a hash, too long, not lowercase hex, or not at the top.
+            "/app-0123456789a.js",
+            "/app-0123456789abcdef0.js",
+            "/app-0123456789ABCDEF.js",
+            "/app-0123456789abcdeg.js",
+            "/sub/app-0123456789abcdef.js",
+            "/-0123456789abcdef.js",
+            "/app-0123456789abcdef",
+            "/post/0123456789abcdef",
+        ] {
+            assert_eq!(cache_policy(checked), CHECK, "{checked}");
+        }
+    }
+
+    #[tokio::test]
+    async fn serves_a_trunk_bundle() {
+        let dir = trunk_bundle();
+        let page = std::fs::read(dir.path().join("index.html")).unwrap();
+        let app = service(dir.path()).unwrap();
+        // The page as Trunk wrote it: its preloads are there already.
+        for path in ["/", "/index.html", "/post/12", "/settings"] {
+            let (response, body) = get(&app, path, None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(cache(&response), CHECK, "{path}");
+            assert_eq!(body, page, "{path}");
+        }
+        for (path, policy, kind) in [
+            (format!("/{TRUNK_WASM}"), KEEP, "application/wasm"),
+            (format!("/{TRUNK_JS}"), KEEP, "text/javascript"),
+            (format!("/{TRUNK_CSS}"), KEEP, "text/css"),
+            ("/sw.js".to_owned(), CHECK, "text/javascript"),
+            (
+                "/manifest.webmanifest".to_owned(),
+                CHECK,
+                "application/manifest+json",
+            ),
+            ("/favicon-32.png".to_owned(), CHECK, "image/png"),
+        ] {
+            let (response, _) = get(&app, &path, None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(cache(&response), policy, "{path}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], kind, "{path}");
+        }
+        // A page left open across an update asks for the old wasm: a 404, not
+        // the page. So does a bundle's file that isn't there.
+        for missing in [
+            "/starbooru-web-0123456789abcdef_bg.wasm",
+            "/old-0123456789abcdef.css",
+            "/sw2.js",
+            "/site.webmanifest",
+        ] {
+            let (response, _) = get(&app, missing, None).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{missing}");
+        }
+        // The app's own paths stay pages, dots and all.
+        for page in ["/tag/k.k.", "/post/12", "/search"] {
+            let (response, _) = get(&app, page, None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{page}");
+        }
+    }
+
+    #[test]
+    fn a_page_with_its_own_preloads_is_left_alone() {
+        let dir = trunk_bundle();
+        let page = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert_eq!(with_preloads(&page, dir.path()), page);
     }
 
     #[test]

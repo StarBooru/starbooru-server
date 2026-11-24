@@ -26,6 +26,7 @@ use starbooru_core::{
     AiAdminStatus, AiGeneralUpdate, AiStatus, AiTestResult, AiTool, AiToolUpdate, BooruAccount,
     PanelTranslation, RemotePost, RemotePostQuery, RemoteTag, RemoteTagQuery, SaveBooruAccount,
     SaveRemoteSearch, SavedRemoteSearch, TagSuggestions, TranslateRequest, Translation,
+    UpdateInstall, UpdateSettings, UpdateStatus,
 };
 use std::time::Duration;
 use thiserror::Error;
@@ -526,6 +527,32 @@ impl Client {
     pub async fn delete_backup(&self, name: &str) -> Result<()> {
         let path = format!("/admin/backups/{}", segment(name));
         Self::send_empty(self.request(Method::DELETE, &path)?).await
+    }
+
+    /// The version running, the newest release, how this server updates and
+    /// the update under way or the last one's result. Admins only.
+    pub async fn update_status(&self) -> Result<UpdateStatus> {
+        Self::send(self.request(Method::GET, "/admin/updates")?).await
+    }
+
+    /// Asks for the newest release now. The server allows one a minute;
+    /// sooner is `RateLimited`.
+    pub async fn check_for_updates(&self) -> Result<UpdateStatus> {
+        Self::send(self.request(Method::POST, "/admin/updates/check")?).await
+    }
+
+    /// Checks for new releases and automatic updates.
+    pub async fn set_update_settings(&self, settings: &UpdateSettings) -> Result<UpdateStatus> {
+        self.json(Method::PUT, "/admin/updates/settings", settings)
+            .await
+    }
+
+    /// Starts installing the newest release and answers at once. Follow it
+    /// with [`Self::update_status`]: the server goes away for a moment while
+    /// it restarts, and its `version` in [`Self::info`] changes after.
+    pub async fn install_update(&self, install: &UpdateInstall) -> Result<UpdateStatus> {
+        self.json(Method::POST, "/admin/updates/install", install)
+            .await
     }
 
     /// One page of the results of search `query`. A `seed` shuffles
@@ -1298,6 +1325,54 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ClientError::InvalidUrl(_)));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn starts_an_update_and_reads_its_state() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let body = serde_json::json!({
+            "current": "0.2.0",
+            "latest": { "version": "0.3.0", "name": "StarBooru server 0.3.0", "published_at": "2026-12-01T09:00:00Z",
+                        "notes": "- Faster search", "url": "https://github.com/StarBooru/starbooru-server/releases/tag/v0.3.0" },
+            "available": true,
+            "checked_at": "2026-12-01T10:00:00Z",
+            "check_error": null,
+            "settings": { "check": true, "auto": false, "auto_hour": 4 },
+            "method": { "kind": "docker", "can_update": true, "image": "ghcr.io/starbooru/starbooru-server:latest", "pinned": false },
+            "server_time": "2026-12-01T11:00:00+01:00",
+            "run": { "state": "downloading", "from": "0.2.0", "to": "0.3.0", "automatic": false,
+                     "started_at": "2026-12-01T10:00:05Z", "finished_at": null, "error": null, "backup": null }
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            sock.write_all(response.as_bytes()).await.unwrap();
+            sock.shutdown().await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        let status = Client::new(&url)
+            .unwrap()
+            .with_token(Some("sb_x".into()))
+            .install_update(&starbooru_core::UpdateInstall { backup: false })
+            .await
+            .unwrap();
+        assert!(status.available);
+        assert_eq!(status.method.kind, starbooru_core::UpdateKind::Docker);
+        assert_eq!(
+            status.run.unwrap().state,
+            starbooru_core::UpdateState::Downloading
+        );
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST /api/v1/admin/updates/install HTTP/1.1"));
+        assert!(request.ends_with("{\"backup\":false}"));
     }
 
     #[test]

@@ -15,7 +15,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 axum = { version = "0.8", features = ["multipart", "macros"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "io-util", "time", "process", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "io-util", "time", "process", "sync", "net"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "fs", "trace", "limit", "catch-panic", "compression-gzip", "compression-br", "set-header"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -42,6 +42,11 @@ base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "rayon"] }
 kamadak-exif = "0.6.1"
 rayon = "1.12"
+# The Docker Engine API over its Unix socket, for updates. axum and reqwest bring
+# the same crates, so this costs no build time; bollard would add a large one.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

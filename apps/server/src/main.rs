@@ -26,6 +26,7 @@ mod storage;
 mod testing;
 mod throttle;
 mod transfers;
+mod update;
 mod uploads;
 mod web;
 
@@ -47,6 +48,11 @@ async fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("healthcheck") => return healthcheck(),
         Some("precompress") => return precompress(std::env::args().nth(2)),
+        Some("version" | "--version") => {
+            println!("{}", starbooru_core::VERSION);
+            return ExitCode::SUCCESS;
+        }
+        Some("update-helper") => return update::helper::run().await,
         _ => {}
     }
     tracing_subscriber::fmt()
@@ -59,7 +65,9 @@ async fn main() -> ExitCode {
         .init();
 
     match run().await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::SUCCESS,
+        // A service manager starts the new binary.
+        Ok(true) => ExitCode::from(update::RESTART_EXIT_CODE),
         Err(e) => {
             error!("fatal: {e}");
             ExitCode::FAILURE
@@ -67,10 +75,15 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<(), StartupError> {
+/// Serves until asked to stop. `true` when it stops for an update.
+async fn run() -> Result<bool, StartupError> {
     let config = Config::from_env()?;
     let db = connect(&config.database_url).await?;
-    sqlx::migrate!("./migrations").run(&db).await?;
+    let mut migrations = sqlx::migrate!("./migrations");
+    // A failed update starts the old version again on a database the new one
+    // has migrated already. Migrations only add, so it runs on it.
+    migrations.set_ignore_missing(true);
+    migrations.run(&db).await?;
     info!("database migrations applied");
     match routes::seed_vocab(&db).await {
         Ok(true) => info!("starter tag vocabulary added"),
@@ -83,6 +96,7 @@ async fn run() -> Result<(), StartupError> {
         .with_tools(config.tools.clone())
         .with_samples(config.samples);
     let state = AppState::new(config, db, storage);
+    update::start(&state).await;
     let app = routes::router(state.clone());
     tokio::spawn(routes::auto_purge(state.clone()));
     tokio::spawn(uploads::sweep(state.clone()));
@@ -90,6 +104,8 @@ async fn run() -> Result<(), StartupError> {
     tokio::spawn(routes::run_imports(state.clone()));
     tokio::spawn(routes::run_library_imports(state.clone()));
     tokio::spawn(local_ai::run(state.clone()));
+    tokio::spawn(update::run_checks(state.clone()));
+    tokio::spawn(update::run_auto(state.clone()));
     let backfill = state.clone();
     tokio::spawn(async move {
         routes::backfill_media(backfill.clone()).await;
@@ -112,14 +128,21 @@ async fn run() -> Result<(), StartupError> {
             }
         });
     info!("StarBooru listening on http://{}", state.config.bind);
+    let mut restart = state.updates.restart_requested();
+    let stop = async move {
+        tokio::select! {
+            () = shutdown_signal() => {}
+            _ = restart.wait_for(|asked| *asked) => info!("restarting for the update"),
+        }
+    };
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(stop)
     .await?;
     info!("shut down cleanly");
-    Ok(())
+    Ok(*state.updates.restart_requested().borrow())
 }
 
 /// `starbooru-server healthcheck`: probes `/healthz` on the local listener so

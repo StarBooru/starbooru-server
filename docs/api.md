@@ -126,6 +126,65 @@ Database backups (`pg_dump` archives, custom format). They hold every account's 
 
 A `Backup`'s `url` is a signed path relative to the server, valid for an hour. Fetch it without the bearer token; it answers with the file as an attachment.
 
+### Updates
+
+The server asks GitHub for the newest published release (not a draft or a pre-release) at start and every 6 hours, unless the checks are off. Admins only; API keys may read `GET /admin/updates` but not change anything.
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/admin/updates` | | `UpdateStatus`, below |
+| POST | `/admin/updates/check` | | `UpdateStatus` after asking GitHub now. 429 `rate_limited` with `Retry-After` within a minute of the last one; 403 when the checks are off. A failed check is not an error here: `check_error` says what went wrong. |
+| PUT | `/admin/updates/settings` | `UpdateSettings {check, auto, auto_hour}` | `UpdateStatus`. `auto_hour` is 0 to 23; 400 otherwise. Each starts from its variable (`STARBOORU_UPDATE_CHECK`, `STARBOORU_AUTO_UPDATE`, `STARBOORU_AUTO_UPDATE_HOUR`). |
+| POST | `/admin/updates/install` | `UpdateInstall {backup}`, or no body | 202 with `UpdateStatus` once the update has started; follow `run` with `GET /admin/updates`. `backup` (default `true`) backs the database up first. 409 `up_to_date` when nothing newer is known, `cannot_update` when `method.can_update` is false, `backup_unavailable` when a backup was asked for and `pg_dump` is missing or off, `update_running` while one is under way. |
+
+`UpdateStatus`:
+
+| Field | |
+|---|---|
+| `current` | The version running, as `/info` says |
+| `latest` | `Release {version, name, published_at, notes, url}` from the last check that worked: `notes` is Markdown, `url` the release's page. `null` before the first check, and when GitHub has no release yet (it answers 404 while every release is a pre-release). |
+| `available` | `latest` is newer than `current` (Semantic Versioning: `0.1.0-beta.6` < `0.2.0` < `0.10.0`) |
+| `checked_at`, `check_error` | When the last check ran, and why it failed (`null` when it worked). A failed check keeps the `latest` found before it. |
+| `settings` | `UpdateSettings`: `check` (ask GitHub; off sends nothing), `auto` (install new releases by themselves, with a backup, at `auto_hour` in the server's time) |
+| `method` | `UpdateMethod {kind, can_update, reason?, message?, image?, pinned}`, below |
+| `server_time` | The server's clock with its offset, such as `2026-12-01T03:12:00+01:00`, which `auto_hour` is in |
+| `run` | `UpdateRun {state, from, to, automatic, started_at, finished_at, error, backup}`: the update under way, or the last one's result. `state` is `checking`, `downloading`, `backing_up`, `restarting`, `done` or `failed`. `backup` names the backup made before it. The server goes away while `restarting`; the version that starts next sets `done` or `failed`, so it survives the restart. |
+
+`method.kind` says how the server runs:
+
+| `kind` | How it updates |
+|---|---|
+| `docker` | A container. With the Docker socket it pulls the new image and replaces itself through a short-lived helper container, keeping the name, volumes, networks, labels and the rest; if the new container doesn't become healthy, the old one starts again. `image` is the image it runs. `pinned` is true for a version tag (`…:0.2.0`): the update pulls the new version's tag, but the compose file still names the old one, so a redeploy goes back to it until `STARBOORU_VERSION` is changed. |
+| `swarm` | A Docker Swarm task: the service is moved to the new image and Swarm replaces it. |
+| `package` | The server package under a service manager: it downloads the release's tarball, checks it against `SHA256SUMS`, swaps the binary (keeping `starbooru-server.old`) and exits to be started again. |
+| `manual` | Neither, such as a development build. |
+
+When `can_update` is false, `reason` says why and `message` says the same in English: `no_docker_socket` (a container without the socket: run `docker compose pull && docker compose up -d`, or Redeploy in Dokploy), `docker_unreachable` (the socket is there but Docker refused or didn't know the container), `unknown_image` (a tag that is neither `latest` nor a version, such as a local build, or an image pinned by digest), `removed_on_stop` (`docker run --rm`), `development_build`, `not_supervised` (no systemd to start it again), `read_only_folder`, `unsupported`.
+
+Example:
+
+```json
+{
+  "current": "0.2.0",
+  "latest": {
+    "version": "0.3.0",
+    "name": "StarBooru server 0.3.0",
+    "published_at": "2026-12-01T09:00:00Z",
+    "notes": "## What's new\n\n- …",
+    "url": "https://github.com/StarBooru/starbooru-server/releases/tag/v0.3.0"
+  },
+  "available": true,
+  "checked_at": "2026-12-01T10:00:00Z",
+  "check_error": null,
+  "settings": { "check": true, "auto": false, "auto_hour": 4 },
+  "method": { "kind": "docker", "can_update": true, "image": "ghcr.io/starbooru/starbooru-server:latest", "pinned": false },
+  "server_time": "2026-12-01T11:00:00+01:00",
+  "run": { "state": "done", "from": "0.1.0", "to": "0.2.0", "automatic": true,
+           "started_at": "2026-11-30T03:00:12Z", "finished_at": "2026-11-30T03:01:40Z",
+           "error": null, "backup": "starbooru-20261130-030014.dump" }
+}
+```
+
 ## Posts
 
 | Method | Path | Body | Returns |

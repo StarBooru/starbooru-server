@@ -91,12 +91,20 @@ Results at 1,000,000 posts (Ryzen 9 5900X, PostgreSQL 17 in Docker, default sett
 
 ## Making a release
 
-`.github/workflows/release.yml` builds the server package (`starbooru-server-<version>-linux-x86_64.tar.gz`) on a push of a `v*` tag and puts it in a draft release. A hyphen in the tag (`v0.1.0-beta.1`) makes it a prerelease. Running the workflow by hand builds without releasing, which is how to try a change to the workflow; the filename then says `main`.
+Releases are plain versions (`v0.2.0`); there are no more betas. Cargo's version follows them: the workspace `Cargo.toml` holds the version of the next release (now `0.2.0`), and the commit you tag must have the tag's version there.
 
-Cargo's version stays `0.1.0`. What the server shows comes from `STARBOORU_VERSION`, which both workflows set to the tag at build time (`starbooru_core::VERSION`). A local build without it shows Cargo's.
+Before tagging, move the web app's pin in the `Dockerfile` to the newest starbooru-web release: `WEB_VERSION`, and `WEB_SHA256` from that release's `SHA256SUMS` (`gh release download v<version> -R StarBooru/starbooru-web -p SHA256SUMS -O -`).
 
-`.github/workflows/image.yml` builds the image from the same tag and pushes it to `ghcr.io/starbooru/starbooru-server` under its version: x86-64 and ARM64, plus `<version>-vulkan` and `<version>-nvidia`. Publishing the release moves `latest`, and `latest-vulkan` and `latest-nvidia` with it, which is what every install runs, so a draft reaches nobody. A beta moves them only until there is a stable release. Running it by hand builds an existing tag again, with `latest` moved only if you tick that.
+`.github/workflows/release.yml` builds the server package (`starbooru-server-<version>-linux-x86_64.tar.gz`) on a push of a `v*` tag and puts it in a draft release. Running the workflow by hand builds without releasing, which is how to try a change to the workflow; the filename then says `main`.
 
-Write the notes, add a `SHA256SUMS`, wait for the Image workflow to finish, as publishing needs its images, then publish with `gh release edit <tag> --draft=false`. Add `--prerelease` for a beta.
+What the server shows comes from `STARBOORU_VERSION`, which both workflows set to the tag at build time (`starbooru_core::VERSION`). A local build without it shows Cargo's version and counts as a development build, which doesn't update itself.
+
+`.github/workflows/image.yml` builds the image from the same tag and pushes it to `ghcr.io/starbooru/starbooru-server` under its version: x86-64 and ARM64, plus `<version>-vulkan` and `<version>-nvidia`. Publishing the release moves `latest`, and `latest-vulkan` and `latest-nvidia` with it, which is what every install runs, so a draft reaches nobody. Running it by hand builds an existing tag again, with `latest` moved only if you tick that.
+
+Write the notes (the workflow attaches a `SHA256SUMS`, which servers that update themselves check the package against), wait for the Image workflow to finish, as publishing needs its images, then publish with `gh release edit <tag> --draft=false`. Servers see the release within 6 hours, and the notes are what their admins read before updating.
 
 The apps release from their own repositories. A release that changes the API says so in its notes, so the apps can follow.
+
+### Trying an update
+
+Two variables point a server at something other than GitHub and the image's own repository: `STARBOORU_UPDATE_URL`, an address that answers like `releases/latest` (a JSON file served by any web server will do), and `STARBOORU_UPDATE_IMAGE`, an image repository such as a local registry (`docker run -d -p 5000:5000 registry:2`). Build the image twice with different `STARBOORU_VERSION` build arguments, push both, run the older one with the Docker socket, and serve a release JSON that names the newer version. For the package, build it as `release.yml` does, serve a second tarball and its `SHA256SUMS` from the release JSON's `assets`, and run the first under `systemd-run --user -p Restart=always`.

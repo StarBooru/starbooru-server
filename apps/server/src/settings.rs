@@ -4,6 +4,7 @@
 
 use starbooru_core::{
     AiGeneralUpdate, AiMode, AiPreset, AiTool, AiToolUpdate, BackupSchedule, ServerSettings,
+    UpdateSettings,
 };
 
 use crate::ai::{AiSetup, Provider, ToolSetup};
@@ -85,6 +86,41 @@ pub async fn save_backup_schedule(state: &AppState, schedule: BackupSchedule) ->
     )
     .bind((schedule.every_days != config.backup_days).then_some(days))
     .bind((schedule.keep != config.backup_keep).then_some(keep))
+    .execute(&state.db)
+    .await?;
+    Ok(())
+}
+
+/// The update checks and automatic updates in force.
+pub async fn updates(state: &AppState) -> AppResult<UpdateSettings> {
+    let row: Option<(Option<bool>, Option<bool>, Option<i16>)> =
+        sqlx::query_as("SELECT update_check, auto_update, auto_update_hour FROM server_settings")
+            .fetch_optional(&state.db)
+            .await?;
+    let (check, auto, hour) = row.unwrap_or_default();
+    let config = &state.config.updates;
+    Ok(UpdateSettings {
+        check: check.unwrap_or(config.check),
+        auto: auto.unwrap_or(config.auto),
+        auto_hour: hour
+            .and_then(|h| u8::try_from(h).ok())
+            .filter(|h| *h <= 23)
+            .unwrap_or(config.auto_hour),
+    })
+}
+
+/// Saves `settings` (already checked), like [`save`].
+pub async fn save_updates(state: &AppState, settings: UpdateSettings) -> AppResult<()> {
+    let config = &state.config.updates;
+    sqlx::query(
+        "INSERT INTO server_settings (id, update_check, auto_update, auto_update_hour) \
+         VALUES (true, $1, $2, $3) \
+         ON CONFLICT (id) DO UPDATE SET update_check = $1, auto_update = $2, \
+         auto_update_hour = $3, updated_at = now()",
+    )
+    .bind((settings.check != config.check).then_some(settings.check))
+    .bind((settings.auto != config.auto).then_some(settings.auto))
+    .bind((settings.auto_hour != config.auto_hour).then_some(i16::from(settings.auto_hour)))
     .execute(&state.db)
     .await?;
     Ok(())

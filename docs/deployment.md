@@ -1,6 +1,6 @@
 # Deployment
 
-The server ships as one ready-made image, `ghcr.io/starbooru/starbooru-server`, next to a PostgreSQL container. The repository's `docker-compose.yml` runs it and is ready for Dokploy. The image holds no web app; to serve [starbooru-web](https://github.com/StarBooru/starbooru-web) from the same address, mount its bundle and set `STARBOORU_WEB_DIR`.
+The server ships as one ready-made image, `ghcr.io/starbooru/starbooru-server`, next to a PostgreSQL container. The repository's `docker-compose.yml` runs it and is ready for Dokploy. The image includes the web app, a pinned release of [starbooru-web](https://github.com/StarBooru/starbooru-web), served from the same address. To serve another build of it, mount its bundle and point `STARBOORU_WEB_DIR` at it.
 
 ## Dokploy
 
@@ -107,7 +107,13 @@ Admins can change the name, open registration, the recycle-bin days and the back
 | `STARBOORU_TRUST_PROXY` | `false` (`true` in `docker-compose.yml`) | Take the client address from the last `X-Forwarded-For` entry, for the sign-in limits. Turn it on only behind a reverse proxy that sets the header (Traefik does); otherwise clients could pick their own address. |
 | `STARBOORU_BIND` | `0.0.0.0:8080` | Listen address |
 | `STARBOORU_DATA_DIR` | `/data` in the image | Media storage |
-| `STARBOORU_WEB_DIR` | unset | A compiled web app to serve, such as starbooru-web's bundle; unset means the server runs API-only. `starbooru-server precompress <dir>` writes a `.br` and a `.gz` of each text file, which are then sent as they are; without them the server compresses each file as it goes out. |
+| `STARBOORU_WEB_DIR` | `/app/web` in the image, else unset | A compiled web app to serve, such as starbooru-web's bundle; unset means the server runs API-only. `starbooru-server precompress <dir>` writes a `.br` and a `.gz` of each text file, which are then sent as they are; without them the server compresses each file as it goes out. |
+| `STARBOORU_UPDATE_CHECK` | `true` | Ask GitHub for new releases at start and every 6 hours, and tell admins (see [Updating](#updating)). `false` sends no request at all. Admins can override it. |
+| `STARBOORU_AUTO_UPDATE` | `false` | Install new releases by themselves, with a backup first, where the server can update itself. Admins can override it. |
+| `STARBOORU_AUTO_UPDATE_HOUR` | `4` | The hour (0 to 23) automatic updates start at, in the server's time zone |
+| `TZ` | UTC in the image | The server's time zone, such as `Europe/Rome`, for the hour above |
+| `STARBOORU_UPDATE_URL` | GitHub's newest release | For testing updates: another address that answers like `https://api.github.com/repos/StarBooru/starbooru-server/releases/latest` |
+| `STARBOORU_UPDATE_IMAGE` | the image the container runs | For testing updates: another image repository to pull from, such as `localhost:5000/starbooru-server` |
 | `RUST_LOG` | `info,tower_http=info,sqlx=warn` | Log filter |
 
 ## Local AI
@@ -223,6 +229,60 @@ The container runs as uid 10001. A fresh named volume gets the right ownership a
 
 ## Updating
 
-Redeploy, or run the `docker compose … up -d` command again: both download the newest release. Database migrations run at startup, and the media layout is stable. Back up first when the release notes mention a migration.
+When a new release is out, admins see it in the app (Administration › Updates) with its notes, unless `STARBOORU_UPDATE_CHECK=false`. The server asks GitHub at start and every 6 hours, sending nothing about the install.
 
-To stay on one version, set `STARBOORU_VERSION` (`0.1.0-beta.1`). Without it you get `latest`, the newest published release: betas only until the first stable one, then stable releases only.
+### By hand
+
+Redeploy, or run `docker compose pull && docker compose up -d`: both download the newest release. Database migrations run at startup, and the media layout is stable. Back up first when the release notes mention a migration.
+
+To stay on one version, set `STARBOORU_VERSION` (`0.2.0`). Without it you get `latest`, the newest published release.
+
+### From the app
+
+A container can update itself when it has the Docker socket. **The Docker socket is root on the host:** whoever controls the container could control the machine. That is why it's off unless you turn it on. Updating by hand works without it.
+
+To turn it on, uncomment the two lines in `docker-compose.yml` that mount `/var/run/docker.sock` and add the socket's group, and set `STARBOORU_DOCKER_GID` to that group (`stat -c %g /var/run/docker.sock`). The container runs as uid 10001, so it needs the group to use the socket. On Dokploy, Compose services read the compose file from the repository, so keep a compose file of your own with those lines (or switch the service's provider to *Raw* and paste it), and add `STARBOORU_DOCKER_GID` in *Environment*.
+
+*Update now* then:
+
+1. backs the database up (on by default; it can be turned off for that update),
+2. pulls the new image: `latest` again, or the new version's tag for a container that runs a version (`-vulkan` and `-nvidia` stay),
+3. starts a short-lived helper container, which stops the server's container, makes a new one with the same name, volumes, networks and aliases, environment, labels (Compose's and Traefik's, so Dokploy and `docker compose` still know it), ports, restart policy, devices and graphics cards, and waits for it to be healthy. Only then does it remove the old container. If the new one doesn't come up, the old one starts again and the app shows why.
+
+The server is away for a few seconds while it switches. A container that runs a version (`STARBOORU_VERSION=0.2.0`) moves to the new version's tag, but the compose file still names the old one, so a redeploy would go back: change `STARBOORU_VERSION` too. The app says so. Images updated this way stay on disk; `docker image prune` removes the old ones.
+
+A Docker Swarm service updates the same way, except that Swarm replaces the task. The server must run on a manager node.
+
+### Automatic updates
+
+In Administration › Updates (or with `STARBOORU_AUTO_UPDATE=true`), the server installs new releases by itself at the hour you choose, after a backup. It needs what *Update now* needs. If an automatic update fails, the old version keeps running and the next try is a day later. The hour is in the server's time zone: UTC in the image unless you set `TZ`.
+
+### The server package
+
+The release's `starbooru-server-<version>-linux-x86_64.tar.gz` runs without Docker (no local AI). It can update itself when systemd runs it and it may write to its own folder. It downloads the new package, checks it against the release's `SHA256SUMS`, puts the new binary in place, keeps the old one as `starbooru-server.old`, and exits with code 75 for systemd to start it again. To go back, stop the service and rename `starbooru-server.old` to `starbooru-server`.
+
+A unit for it, as `/etc/systemd/system/starbooru.service`:
+
+```ini
+[Unit]
+Description=StarBooru server
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+User=starbooru
+# The binary's folder, which the starbooru user must be able to write to
+WorkingDirectory=/opt/starbooru
+ExecStart=/opt/starbooru/starbooru-server
+# Variables from .env.example, with DATABASE_URL and STARBOORU_DATA_DIR
+EnvironmentFile=/opt/starbooru/.env
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+sudo systemctl daemon-reload && sudo systemctl enable --now starbooru
+```
