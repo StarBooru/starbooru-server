@@ -325,7 +325,8 @@ async fn sign_up(state: &AppState, found: &Finished) -> AppResult<UserRow> {
     let username = username
         .ok_or_else(|| AppError::Internal("no free username for a new provider sign-in".into()))?;
     let row: UserRow = sqlx::query_as(
-        "INSERT INTO users (username, password_hash, role) VALUES ($1, NULL, $2) \
+        "INSERT INTO users (username, password_hash, role, blacklist) \
+         VALUES ($1, NULL, $2, COALESCE((SELECT default_blacklist FROM server_settings), '{}')) \
          RETURNING id, username, role, created_at",
     )
     .bind(&username)

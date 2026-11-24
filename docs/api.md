@@ -26,15 +26,15 @@ All endpoints are under `/api/v1`. Bodies are JSON unless noted. The Rust types 
 
 | Method | Path | |
 |---|---|---|
-| GET | `/info` | `ServerInfo`: `name`, `version`, `has_users`, `registration_open`, `max_upload_bytes`, `url_import` (whether `POST /posts/import` is on), `oidc` (the identity provider's name for a "Sign in with …" button, `null` when OpenID Connect sign-in is off), `video_editing` (whether `POST /posts/{id}/edit` can trim videos: the server has ffmpeg), `mode` (`private` or `public`, see [Modes](#modes)), `score_kind` (`likes` or `stars`, see [Scores](#scores)), `guests` (people without an account may browse) |
+| GET | `/info` | `ServerInfo`: `name`, `version`, `has_users`, `registration_open`, `max_upload_bytes`, `url_import` (whether `POST /posts/import` is on), `oidc` (the identity provider's name for a "Sign in with …" button, `null` when OpenID Connect sign-in is off), `video_editing` (whether `POST /posts/{id}/edit` can trim videos: the server has ffmpeg), `mode` (`private` or `public`, see [Modes](#modes)), `score_kind` (`likes` or `stars`, see [Scores](#scores)), `guests` (people without an account may browse), `home` (the [home page](#home-page) is on) |
 | GET | `/healthz` (not under `/api/v1`) | `ok` when the database answers |
 
-`name` and `registration_open` follow the admin settings (see [Administration](#administration)). A server older than modes leaves out the last three; read them as `private`, `likes` and `false`.
+`name` and `registration_open` follow the admin settings (see [Administration](#administration)). A server older than modes leaves out `mode`, `score_kind` and `guests`; read them as `private`, `likes` and `false`. One older than the home page leaves out `home`: read it as `false`.
 
 ```json
 { "name": "StarBooru", "version": "0.2.0", "has_users": true, "registration_open": false,
   "max_upload_bytes": 536870912, "url_import": true, "oidc": null, "video_editing": true,
-  "mode": "public", "score_kind": "likes", "guests": true }
+  "mode": "public", "score_kind": "likes", "guests": true, "home": true }
 ```
 
 ## Accounts
@@ -54,6 +54,8 @@ All endpoints are under `/api/v1`. Bodies are JSON unless noted. The Rust types 
 | PATCH | `/auth/profile` | `ProfileUpdate {display_name?, about?}` | `Profile` |
 | PUT | `/auth/avatar?x=&y=&size=` | the picture's bytes | `Profile` with the new picture |
 | DELETE | `/auth/avatar` | | `Profile` without a picture |
+| GET | `/auth/blacklist` | | `Blacklist {entries}` (see [Blacklist](#blacklist)) |
+| PUT | `/auth/blacklist` | `Blacklist {entries}` | `Blacklist`, as kept |
 
 Account rules:
 - Usernames are 2 to 32 characters of `A–Z a–z 0–9 _ . -` and are unique regardless of case.
@@ -108,8 +110,8 @@ Admins only; others get 403. API keys may read these but not change anything.
 | Method | Path | Body | Returns |
 |---|---|---|---|
 | GET | `/admin/stats` | | `ServerStats`: `version`, `started_at`, `users`, `disabled_users`, live `images`/`animations`/`videos`, `bin_posts`, `tags`, `media_bytes` (originals, bin included), `bin_bytes`, `database_bytes`, `uploads_by_day` (`[{day, posts}]`, the last 30 UTC days oldest first), `max_upload_bytes`, `video_thumbnails`, `url_import` |
-| GET | `/admin/settings` | | `ServerSettings {name, allow_registration, trash_days, auto_meta_tags, mode, score_kind, tag_vote_threshold?}`, the values in force. `tag_vote_threshold` is there on a public server only (see [Tag votes](#tag-votes)). |
-| PUT | `/admin/settings` | `ServerSettings` | The saved settings. They apply at once. Each starts from its environment variable (`STARBOORU_NAME`, `STARBOORU_ALLOW_REGISTRATION`, `STARBOORU_TRASH_DAYS`, `STARBOORU_AUTO_TAGS`), and a value equal to the variable's keeps following it. The mode and the score kind are stored as they are and don't follow the environment. `name` is 1–64 characters with whitespace collapsed; `trash_days` is 0–3650. `auto_meta_tags` (automatic meta tags such as `highres` and `video` on new posts) may be left out by older clients and then means `true`. `mode` changes only through `POST /admin/mode`: the mode in force is accepted, another one is 409 `use_mode_switch`, and leaving it out is fine. `score_kind` left out stays as it is; a new one converts the votes (see [Scores](#scores)) and the answer lists what it did in `changes`, as `GET /admin/scores/preview` would have. `stars` on a public server is 409 `public_counts_likes`. `tag_vote_threshold` is 0 to 100; left out, it stays as it is. |
+| GET | `/admin/settings` | | `ServerSettings {name, allow_registration, trash_days, auto_meta_tags, mode, score_kind, tag_vote_threshold?, default_blacklist, home}`, the values in force. `tag_vote_threshold` is there on a public server only (see [Tag votes](#tag-votes)). `default_blacklist` is what new accounts start with and guests get (see [Blacklist](#blacklist)); `home` is the [home page](#home-page). |
+| PUT | `/admin/settings` | `ServerSettings` | The saved settings. They apply at once. Each starts from its environment variable (`STARBOORU_NAME`, `STARBOORU_ALLOW_REGISTRATION`, `STARBOORU_TRASH_DAYS`, `STARBOORU_AUTO_TAGS`), and a value equal to the variable's keeps following it. The mode and the score kind are stored as they are and don't follow the environment. `name` is 1–64 characters with whitespace collapsed; `trash_days` is 0–3650. `auto_meta_tags` (automatic meta tags such as `highres` and `video` on new posts) may be left out by older clients and then means `true`. `mode` changes only through `POST /admin/mode`: the mode in force is accepted, another one is 409 `use_mode_switch`, and leaving it out is fine. `score_kind` left out stays as it is; a new one converts the votes (see [Scores](#scores)) and the answer lists what it did in `changes`, as `GET /admin/scores/preview` would have. `stars` on a public server is 409 `public_counts_likes`. `tag_vote_threshold` is 0 to 100; left out, it stays as it is. `default_blacklist` is cleaned like an account's list, at most 100 entries; `home` is checked as [Home page](#home-page) says. Either left out stays as it is. |
 | GET | `/admin/users` | | `AdminUser[] {id, username, role, created_at, disabled, posts, bytes, quota_bytes, last_active, display_name?, about?, avatar_url?}`, oldest first. `posts` and `bytes` count uploads, recycle bin included. `last_active` is the latest use of any session or key. The profile fields are left out when not set; `avatar_url` is the signed 64 px picture. |
 | PATCH | `/admin/users/{id}` | `UserUpdate {role?, disabled?, quota_bytes?, clear_avatar?, clear_about?, clear_display_name?}` | The updated `AdminUser`. Missing fields stay as they are; `"quota_bytes": null` removes the limit. Disabling signs the account out everywhere. The `clear_*` flags (`true`) remove that part of the profile, for moderation. 400 for a role, disabled or limit on your own account (so an admin always remains); clearing your own profile is fine. 404 for an unknown id. |
 | POST | `/admin/users/{id}/password` | `PasswordReset {new}` | 204. Signs the account out everywhere; its API keys keep working. 400 for your own account (use `PUT /auth/password`). |
@@ -280,8 +282,9 @@ On a public server a request without a token may read what a browser needs, and 
 | GET | `/explore` |
 | GET | `/users/{name}` |
 | GET | `/forum`, `/forum/threads`, `/forum/threads/{id}` |
+| GET | `/auth/blacklist` (the admin's default), `/home` |
 
-`/info`, sign-up and sign-in, and the signed `/media` URLs are open in both modes. Everything else answers 401 to a guest, as it does on a private server, where none of these opens without a token. A guest has no vote of their own (`my_vote` is 0) and doesn't see the recycle bin: `status:deleted` is 401 and a binned post 404. A token that is sent but wrong is still 401.
+`/info`, sign-up and sign-in, and the signed `/media` URLs are open in both modes, and so is `/home`, which on a private server shows no posts without a token. Everything else answers 401 to a guest, as it does on a private server, where none of these opens without a token. A guest has no vote of their own (`my_vote` is 0) and doesn't see the recycle bin: `status:deleted` is 401 and a binned post 404. A token that is sent but wrong is still 401.
 
 Each client address (IPv6 by its /64, the last `X-Forwarded-For` entry with `STARBOORU_TRUST_PROXY`) may ask for 300 a minute without an account; `/explore` counts as 5. Past that the answer is 429 `rate_limited` with `Retry-After`. Signed-in requests don't count. Page sizes are the same as for accounts.
 
@@ -405,12 +408,12 @@ PUT /api/v1/posts/7/tags/cat/vote   {"value": -1}
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| GET | `/posts?q=&page=&limit=&seed=` | | `PostPage {posts, page, limit, has_more, corrected?}`. `page` starts at 1 (at most 10000); `limit` is at most 200, default 60. `corrected` lists `TagCorrection {from, to}` for the unknown tags the search corrected; it is left out when there are none. `seed` (any 64-bit integer) makes `order:random` shuffle the same way every time it is given, so pages follow on from each other without repeats; without it each request shuffles anew. Other orders ignore it. |
+| GET | `/posts?q=&page=&limit=&seed=&exclude=` | | `PostPage {posts, page, limit, has_more, corrected?}`. Posts the reader's [blacklist](#blacklist) hides are left out; `exclude` is a guest's own list. `page` starts at 1 (at most 10000); `limit` is at most 200, default 60. `corrected` lists `TagCorrection {from, to}` for the unknown tags the search corrected; it is left out when there are none. `seed` (any 64-bit integer) makes `order:random` shuffle the same way every time it is given, so pages follow on from each other without repeats; without it each request shuffles anew. Other orders ignore it. |
 | POST | `/posts` | multipart: `file` (required), `tags` (space-separated), `rating` (`safe`/`s`/`q`/`e`), `source`, `autotag` (`true` or `false`) | `Post`, or 409 `duplicate` if the same file exists. The message names the post, and says so when it is in the recycle bin. |
 | POST | `/posts/import` | `ImportRequest {url, tags?, rating?, source?, autotag?}`. `tags` is a list; `source` defaults to `url`. An address that is a post's page on a booru, or one of that site's files, becomes the post: its original file, the site's tags after yours (with `artist:`, `character:`, `copyright:` and `meta:` prefixes where the site says), its rating, and the post's page as the source. Any other web page becomes the picture or video it names (`og:video`, `og:image`). An import that comes with a `source` of its own is downloaded as it is. | `Post`, like an upload. 400 for a non-http(s) address, credentials in the URL, a private-network address (unless the server allows them) or import turned off; 413 over the upload limit; 409 `duplicate`; 424 `fetch_failed` when the remote server errors, times out or redirects more than 5 times. |
-| GET | `/posts/{id}` | | `Post`, with `ocr_text` and `tag_details: [PostTag {name, category, section}]`. `section` is the top of the tag's parent chain (`clothing` for `boots`), the tag itself when it heads a tree, or null for a tag on its own; the viewer groups general tags by it. Also `figures`, the people in the picture (see [People](#people-in-a-post)), left out when there are none. The answers of `PATCH /posts/{id}`, the vote, restore and OCR rescan carry the same fields; lists leave them out. |
-| GET | `/posts/{id}/neighbors?q=&seed=` | | `Neighbors {prev, next}`: the ids just before and after the post in the results of search `q` (same filters and order), or null at either end. For `order:random`, pass the `seed` the search was shuffled with; without one both are null. Both are also null when `q` matches nothing. |
-| GET | `/posts/{id}/related?limit=` | | `RelatedPosts {posts}`: up to `limit` live posts like this one (default 12, at most 48), most alike first. Shared tags count by rarity, so a tag on a handful of posts outweighs one on half the collection; posts whose look (difference hash) is close count too, even without tags. Candidates come from the post's 8 rarest tags and from look-alikes, so the list is a suggestion, not an exhaustive search. Empty when nothing is alike. |
+| GET | `/posts/{id}` | | `Post`, with `ocr_text` and `tag_details: [PostTag {name, category, section}]`. `section` is the top of the tag's parent chain (`clothing` for `boots`), the tag itself when it heads a tree, or null for a tag on its own; the viewer groups general tags by it. Also `figures`, the people in the picture (see [People](#people-in-a-post)), left out when there are none. The answers of `PATCH /posts/{id}`, the vote, restore and OCR rescan carry the same fields; lists leave them out. Only this answer has `blacklisted`, the entries of the reader's [blacklist](#blacklist) the post matches (left out when none): the post opens all the same. Takes `exclude` from a guest. |
+| GET | `/posts/{id}/neighbors?q=&seed=&exclude=` | | `Neighbors {prev, next}`: the ids just before and after the post in the results of search `q` (same filters and order, the blacklist included), or null at either end. For `order:random`, pass the `seed` the search was shuffled with; without one both are null. Both are also null when `q` matches nothing. |
+| GET | `/posts/{id}/related?limit=&exclude=` | | `RelatedPosts {posts}`: up to `limit` live posts like this one (default 12, at most 48), most alike first, without what the reader's blacklist hides. Shared tags count by rarity, so a tag on a handful of posts outweighs one on half the collection; posts whose look (difference hash) is close count too, even without tags. Candidates come from the post's 8 rarest tags and from look-alikes, so the list is a suggestion, not an exhaustive search. Empty when nothing is alike. |
 | PATCH | `/posts/{id}` | `PostUpdate {tags?, rating?, source?}` | `Post`. `tags` replaces the whole list. |
 | DELETE | `/posts/{id}` | | 204; moves the post to the recycle bin (admin or uploader) |
 | POST | `/posts/{id}/restore` | | `Post` |
@@ -527,7 +530,60 @@ Tags are resolved the same way everywhere: an alias in a post's tags or in a sea
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| GET | `/explore?days=&q=` | | `Explore {days, trending, tags, on_this_day, random, corrected?}`. `days` is the window, 1 to 365 (default 7). `trending`: up to 24 posts with the most net upvotes cast or changed in the window (only those above zero). `tags`: up to 20 `TagTrend {tag, recent}`, the tags most used on posts added in the window, without the tags `q` requires. `on_this_day`: up to 12 posts added on today's month and day (UTC) in earlier years, newest first. `random`: 12 random posts. `q` uses the search syntax and narrows every section; its `order:` and `status:` are ignored, and `corrected` is as in `/posts`. 400 for a bad query. On a private server `trending` and `tags` are always empty: the apps don't show them there, and they are the two costliest queries. |
+| GET | `/explore?days=&q=&exclude=` | | `Explore {days, trending, tags, on_this_day, random, corrected?}`. The reader's [blacklist](#blacklist) applies to every section: the posts it hides are left out, and `tags` doesn't count them. `days` is the window, 1 to 365 (default 7). `trending`: up to 24 posts with the most net upvotes cast or changed in the window (only those above zero). `tags`: up to 20 `TagTrend {tag, recent}`, the tags most used on posts added in the window, without the tags `q` requires. `on_this_day`: up to 12 posts added on today's month and day (UTC) in earlier years, newest first. `random`: 12 random posts. `q` uses the search syntax and narrows every section; its `order:` and `status:` are ignored, and `corrected` is as in `/posts`. 400 for a bad query. On a private server `trending` and `tags` are always empty: the apps don't show them there, and they are the two costliest queries. |
+
+## Blacklist
+
+Each account keeps a list of tags and ratings whose posts it doesn't want to see, in both modes. The server leaves those posts out of `GET /posts` (colour searches and a tag's posts included), `/posts/{id}/neighbors`, `/posts/{id}/related`, every section of `/explore` and the [home page](#home-page), as if the search had a `-tag` or `-rating:` term for each entry. An entry hides the posts with its tag or a tag under it in the tree, so `footwear` hides `boots`, and an alias stands for its tag.
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/auth/blacklist` | | `Blacklist {entries}`. A guest gets the admin's default. |
+| PUT | `/auth/blacklist` | `Blacklist {entries}` | `Blacklist`, the list as kept. Replaces the whole list; `[]` clears it. 400 for an entry that isn't a tag or a rating, or more than 500 entries. |
+
+- An entry is a tag, or a rating in any form a search takes (`rating:e`), kept as `rating:explicit`. A tag is normalised as when tagging (`Blue Sky` is `blue_sky`), loses a category prefix (`artist:name` is `name`) and is kept as the tag its alias names. A tag that doesn't exist yet is kept and hides posts once it does. Blank entries and repeats are dropped. Other search terms (`type:video`, `order:score`, `-cat`, `{girl}`) are 400.
+- What a search names wins over the list. `q=cat` shows posts tagged `cat` with `cat` on the list, `q=boots` shows boots with `footwear` on it, and `q=rating:explicit` shows explicit posts. Only what it names comes back: with `rating:explicit` on the list too, `q=boots` still leaves out explicit posts with boots. The home page's search is the admin's, so the list applies to it whole.
+- The recycle bin (`status:deleted`) shows everything it holds, as emptying it purges all of it.
+- A post opened by id (`GET /posts/{id}`) still opens, with `blacklisted` listing the entries it matches, such as `["footwear", "rating:explicit"]`, so the app can cover it with "Hidden by your blacklist · Show". When the search it was opened from names the tag, the app may leave it uncovered.
+- New accounts start with the admin's default (`default_blacklist` in `PUT /admin/settings`, at most 100 entries, empty unless set). Changing it doesn't change existing accounts.
+- Guests have no list on the server. Their reads use the admin's default, which `GET /auth/blacklist` gives them, unless they send their own as `exclude`: entries separated by spaces (`exclude=cat+rating:explicit`), at most 100; `exclude=` hides nothing. An app keeps a guest's list on the device and sends it with `GET /posts`, `/posts/{id}`, `/posts/{id}/neighbors`, `/posts/{id}/related`, `/explore` and `/home` (`Client::with_guest_blacklist` does). A bad `exclude` is 400. Signed-in requests ignore it.
+
+```json
+PUT /api/v1/auth/blacklist   {"entries": ["Kitty", "footwear", "rating:e"]}
+{ "entries": ["cat", "footwear", "rating:explicit"] }
+
+GET /api/v1/posts/7
+{ "id": 7, "tags": ["boots", "sky"], "blacklisted": ["footwear"], "…": "…" }
+```
+
+## Home page
+
+A page an app can show at start: a title and a line under it over a moving background of posts, by default the most popular posts rated safe. Off until an admin turns it on; `/info` says whether it is (`home`).
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/home?exclude=` | | `Home {enabled, title, subtitle, posts}` |
+
+- `title` is the admin's, or the server's name; `subtitle` is `null` without one.
+- `posts` are `HomePost {id, thumb_url, sample_url, width, height, palette}`, first the ones the search puts first. `thumb_url` (512 px at most) and `sample_url` (a bigger copy of a big still image, or `null`) are signed media paths, as for a post. Only posts with a thumbnail and a known size are there.
+- `posts` is empty while the page is off, and on a private server without a token: a private collection shows no picture before signing in. Everyone else gets them: accounts, and guests on a public server, whose limit counts it as 1.
+- The background is the admin's `query`, in the search syntax, with `rating:safe` added unless it names a rating (`rating:` or `-rating:`) and sorted by `order:score` (the score kind in force) unless it names an order; live posts only. It shows `posts` of them.
+- The search runs again at most every 5 minutes, so new votes reorder the background within that. Each request checks its posts again by id, so a post binned, rated otherwise or retagged since drops out at once. The reader's [blacklist](#blacklist) applies, and a guest's `exclude`.
+
+Admins set it up with `home` in `PUT /admin/settings`, `HomeSettings {enabled, title, subtitle, query, posts}`. `title` is one line of at most 64 characters, `null` or `""` for the server's name; `subtitle` at most 140, `null` for none. `query` is at most 1000 characters, must parse, and can't be `status:deleted`; `""` is the most popular posts. `posts` is 12 to 60, 36 by default. 400 otherwise.
+
+```json
+GET /api/v1/home
+{ "enabled": true, "title": "StarBooru", "subtitle": "Skies, seas and cats",
+  "posts": [ { "id": 3, "thumb_url": "/media/thumb/c8…41.jpg?exp=1764000000&sig=…",
+               "sample_url": null, "width": 1920, "height": 1080,
+               "palette": ["#2a6fb0", "#e8e4d8"] } ] }
+
+GET /api/v1/admin/settings   (part)
+{ "default_blacklist": ["cat"],
+  "home": { "enabled": true, "title": null, "subtitle": "Skies, seas and cats",
+            "query": "", "posts": 36 } }
+```
 
 ## Other boorus
 

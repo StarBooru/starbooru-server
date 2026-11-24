@@ -4,10 +4,11 @@
 //! only changed in the app.
 
 use sqlx::PgExecutor;
+use starbooru_core::home::DEFAULT_HOME_POSTS;
 use starbooru_core::tag_vote::DEFAULT_TAG_VOTE_THRESHOLD;
 use starbooru_core::{
-    AiGeneralUpdate, AiMode, AiPreset, AiTool, AiToolUpdate, BackupSchedule, Mode, ScoreKind,
-    ServerSettings, UpdateSettings,
+    AiGeneralUpdate, AiMode, AiPreset, AiTool, AiToolUpdate, BackupSchedule, HomeSettings, Mode,
+    ScoreKind, ServerSettings, UpdateSettings,
 };
 
 use crate::ai::{AiSetup, Provider, ToolSetup};
@@ -15,43 +16,104 @@ use crate::config::Config;
 use crate::error::AppResult;
 use crate::state::AppState;
 
-/// name, allow_registration, trash_days, auto_meta_tags, mode, score_kind,
-/// tag_vote_threshold; NULL follows the environment, or the default.
-type SettingsRow = (
-    Option<String>,
-    Option<bool>,
-    Option<i32>,
-    Option<bool>,
-    Option<String>,
-    Option<String>,
-    Option<i32>,
-);
+/// What `server_settings` holds of [`ServerSettings`]. NULL follows the
+/// environment, or the default.
+#[derive(sqlx::FromRow, Default)]
+struct SettingsRow {
+    name: Option<String>,
+    allow_registration: Option<bool>,
+    trash_days: Option<i32>,
+    auto_meta_tags: Option<bool>,
+    mode: Option<String>,
+    score_kind: Option<String>,
+    tag_vote_threshold: Option<i32>,
+    default_blacklist: Option<Vec<String>>,
+    home_enabled: Option<bool>,
+    home_title: Option<String>,
+    home_subtitle: Option<String>,
+    home_query: Option<String>,
+    home_posts: Option<i32>,
+}
 
 /// The settings in force.
 pub async fn current(state: &AppState) -> AppResult<ServerSettings> {
     let row: Option<SettingsRow> = sqlx::query_as(
         "SELECT name, allow_registration, trash_days, auto_meta_tags, mode, score_kind, \
-         tag_vote_threshold FROM server_settings",
+         tag_vote_threshold, default_blacklist, home_enabled, home_title, home_subtitle, \
+         home_query, home_posts FROM server_settings",
     )
     .fetch_optional(&state.db)
     .await?;
-    let (name, allow_registration, trash_days, auto_meta_tags, mode, kind, threshold) =
-        row.unwrap_or_default();
+    let row = row.unwrap_or_default();
     let config = &state.config;
-    let (mode, score_kind) = in_force(mode, kind);
+    let (mode, score_kind) = in_force(row.mode, row.score_kind);
     Ok(ServerSettings {
-        name: name.unwrap_or_else(|| config.instance_name.clone()),
-        allow_registration: allow_registration.unwrap_or(config.allow_registration),
-        trash_days: trash_days
+        name: row.name.unwrap_or_else(|| config.instance_name.clone()),
+        allow_registration: row.allow_registration.unwrap_or(config.allow_registration),
+        trash_days: row
+            .trash_days
             .and_then(|d| u32::try_from(d).ok())
             .unwrap_or(config.trash_days),
-        auto_meta_tags: auto_meta_tags.unwrap_or(config.auto_meta_tags),
+        auto_meta_tags: row.auto_meta_tags.unwrap_or(config.auto_meta_tags),
         mode,
         score_kind,
         // Only public instances vote on tags; old apps never see it.
-        tag_vote_threshold: (mode == Mode::Public).then(|| threshold_or_default(threshold)),
+        tag_vote_threshold: (mode == Mode::Public)
+            .then(|| threshold_or_default(row.tag_vote_threshold)),
+        default_blacklist: Some(row.default_blacklist.unwrap_or_default()),
+        home: Some(HomeSettings {
+            enabled: row.home_enabled.unwrap_or(false),
+            title: row.home_title,
+            subtitle: row.home_subtitle,
+            query: row.home_query.unwrap_or_default(),
+            posts: row
+                .home_posts
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(DEFAULT_HOME_POSTS),
+        }),
         changes: Vec::new(),
     })
+}
+
+/// The blacklist new accounts start with and guests get.
+pub async fn default_blacklist(db: impl PgExecutor<'_>) -> AppResult<Vec<String>> {
+    let stored: Option<Option<Vec<String>>> =
+        sqlx::query_scalar("SELECT default_blacklist FROM server_settings")
+            .fetch_optional(db)
+            .await?;
+    Ok(stored.flatten().unwrap_or_default())
+}
+
+/// Saves the default blacklist (already cleaned); empty is none.
+pub async fn save_default_blacklist(db: impl PgExecutor<'_>, entries: &[String]) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO server_settings (id, default_blacklist) VALUES (true, $1) \
+         ON CONFLICT (id) DO UPDATE SET default_blacklist = $1, updated_at = now()",
+    )
+    .bind((!entries.is_empty()).then_some(entries))
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Saves the home page's settings (already cleaned). The defaults are
+/// stored as NULL.
+pub async fn save_home(db: impl PgExecutor<'_>, home: &HomeSettings) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO server_settings \
+             (id, home_enabled, home_title, home_subtitle, home_query, home_posts) \
+         VALUES (true, $1, $2, $3, $4, $5) \
+         ON CONFLICT (id) DO UPDATE SET home_enabled = $1, home_title = $2, \
+         home_subtitle = $3, home_query = $4, home_posts = $5, updated_at = now()",
+    )
+    .bind(home.enabled.then_some(true))
+    .bind(&home.title)
+    .bind(&home.subtitle)
+    .bind((!home.query.is_empty()).then_some(&home.query))
+    .bind((home.posts != DEFAULT_HOME_POSTS).then(|| i32::try_from(home.posts).unwrap_or(i32::MAX)))
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 fn threshold_or_default(stored: Option<i32>) -> u32 {

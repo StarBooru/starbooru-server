@@ -196,6 +196,8 @@ pub struct Settled {
     pub kind: ScoreKind,
     /// Stored on this start, the first one with modes.
     pub first: bool,
+    /// The forum got its default categories on this start.
+    pub forum_seeded: bool,
     /// For the log: variables that weren't applied, or no longer are.
     pub warnings: Vec<String>,
 }
@@ -268,10 +270,10 @@ pub async fn settle(
     if first {
         settings::save_mode(&mut *tx, mode).await?;
         settings::save_score_kind(&mut *tx, kind).await?;
-        if stored_mode.is_none() && mode == Mode::Public {
-            crate::routes::seed_forum(&mut tx).await?;
-        }
     }
+    // Also a server that was public before the forum came, on its first
+    // start since.
+    let forum_seeded = mode == Mode::Public && crate::routes::seed_forum_once(&mut tx).await?;
     tx.commit().await?;
     let env_mode = env_mode.filter(|_| !warned.0);
     let env_kind = env_kind.filter(|_| !warned.1);
@@ -280,6 +282,7 @@ pub async fn settle(
         mode,
         kind,
         first,
+        forum_seeded,
         warnings,
     })
 }
@@ -380,6 +383,7 @@ pub async fn switch(state: &AppState, to: Mode, backup: bool) -> AppResult<ModeS
         // Public instances count likes; stored so, the private one that may
         // come later starts from likes too.
         settings::save_score_kind(&mut *tx, ScoreKind::Likes).await?;
+        // Whatever it had before: a forum with no categories is no use.
         crate::routes::seed_forum(&mut tx).await?;
     }
     settings::save_mode(&mut *tx, to).await?;

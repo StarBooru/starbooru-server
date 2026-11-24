@@ -187,6 +187,9 @@ pub struct ServerInfo {
     /// People without an account may browse (public instances).
     #[serde(default)]
     pub guests: bool,
+    /// The home page is on (`GET /home`).
+    #[serde(default)]
+    pub home: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -345,6 +348,11 @@ pub struct Post {
     /// On a public instance: tags voted off it, which edits leave off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub voted_off: Vec<String>,
+    /// Only in the single-post response: the entries of the reader's
+    /// blacklist the post matches (a tag of its own or one above it in the
+    /// tree, or `rating:<rating>`), so an app can cover it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blacklisted: Vec<String>,
 }
 
 /// One of a post's tags, as the viewer groups it.
@@ -835,6 +843,7 @@ mod tests {
         assert_eq!(info.mode, crate::Mode::Private);
         assert_eq!(info.score_kind, crate::ScoreKind::Likes);
         assert!(!info.guests);
+        assert!(!info.home);
     }
 
     #[test]
@@ -849,6 +858,7 @@ mod tests {
         });
         let post: Post = serde_json::from_value(old.clone()).unwrap();
         assert!(post.uploader.is_none() && post.tag_votes.is_empty() && post.voted_off.is_empty());
+        assert!(post.blacklisted.is_empty());
         assert_eq!(serde_json::to_value(&post).unwrap(), old);
     }
 

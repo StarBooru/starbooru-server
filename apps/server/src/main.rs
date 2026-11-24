@@ -109,6 +109,9 @@ async fn run() -> Result<bool, StartupError> {
                     settled.kind.as_str()
                 );
             }
+            if settled.forum_seeded {
+                info!("the forum got its default categories");
+            }
             for warning in &settled.warnings {
                 warn!("{warning}");
             }

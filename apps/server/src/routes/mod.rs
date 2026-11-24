@@ -5,11 +5,13 @@ mod ai;
 mod auth;
 mod autotag;
 mod backups;
+mod blacklist;
 mod duplicates;
 mod edit;
 mod explore;
 mod figures;
 mod forum;
+mod home;
 mod imports;
 mod keys;
 mod library;
@@ -54,7 +56,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, warn};
 
 pub(crate) use figures::replace as replace_figures;
-pub(crate) use forum::seed as seed_forum;
+pub(crate) use forum::{seed as seed_forum, seed_once as seed_forum_once};
+pub(crate) use home::HomeCache;
 pub(crate) use posts::set_tags as set_post_tags;
 
 use crate::error::{AppError, AppResult};
@@ -79,6 +82,8 @@ pub fn router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_AVATAR_BYTES)),
         )
         .route("/users/{name}", get(profiles::get))
+        .route("/auth/blacklist", get(blacklist::get).put(blacklist::put))
+        .route("/home", get(home::home))
         .route("/auth/password", put(auth::change_password))
         .route("/auth/oidc/begin", post(oidc::begin))
         .route("/auth/oidc/begin-link", post(oidc::begin_link))
@@ -346,6 +351,7 @@ async fn info(State(state): State<AppState>) -> AppResult<Json<ServerInfo>> {
         mode: settings.mode,
         score_kind: settings.score_kind,
         guests: settings.mode.guests(),
+        home: settings.home.is_some_and(|h| h.enabled),
     }))
 }
 

@@ -33,6 +33,7 @@ use starbooru_core::{
     NewThread, Profile, ProfileUpdate, TagRemovalPage, TagVoteRequest, ThreadPage, ThreadUpdate,
     ThreadView,
 };
+use starbooru_core::{Blacklist, Home};
 use starbooru_core::{Mode, ModePreview, ModeSwitch, ModeSwitched, ScoreKind, ScorePreview};
 use std::time::Duration;
 use thiserror::Error;
@@ -122,6 +123,8 @@ pub struct Client {
     http: reqwest::Client,
     base: Url,
     token: Option<String>,
+    /// A guest's own blacklist, entries separated by spaces.
+    exclude: Option<String>,
 }
 
 /// Native builds name themselves generically (app, version and OS) so the
@@ -167,12 +170,31 @@ impl Client {
             http: http_client()?,
             base,
             token: None,
+            exclude: None,
         })
     }
 
     pub fn with_token(mut self, token: Option<String>) -> Self {
         self.token = token;
         self
+    }
+
+    /// For a guest of a public server: the device's own blacklist, sent
+    /// with the reads of posts as `exclude` (at most
+    /// `blacklist::MAX_EXCLUDE` entries). `None` leaves the server's
+    /// default; an empty list hides nothing. Signed in, the account's own
+    /// list applies and this isn't sent.
+    pub fn with_guest_blacklist(mut self, entries: Option<&[String]>) -> Self {
+        self.exclude = entries.map(|e| e.join(" "));
+        self
+    }
+
+    /// Adds the guest's blacklist to a read of posts.
+    fn excluding(&self, req: RequestBuilder) -> RequestBuilder {
+        match (&self.token, &self.exclude) {
+            (None, Some(exclude)) => req.query(&[("exclude", exclude)]),
+            _ => req,
+        }
     }
 
     pub fn token(&self) -> Option<&str> {
@@ -602,11 +624,14 @@ impl Client {
         if let Some(seed) = seed {
             req = req.query(&[("seed", seed)]);
         }
-        Self::send(req).await
+        Self::send(self.excluding(req)).await
     }
 
+    /// One post. One the reader's blacklist matches still comes, with the
+    /// entries it matches in `blacklisted`.
     pub async fn post(&self, id: i64) -> Result<Post> {
-        Self::send(self.request(Method::GET, &format!("/posts/{id}"))?).await
+        let req = self.request(Method::GET, &format!("/posts/{id}"))?;
+        Self::send(self.excluding(req)).await
     }
 
     /// The posts before and after `id` in the results of search `query`,
@@ -618,7 +643,7 @@ impl Client {
         if let Some(seed) = seed {
             req = req.query(&[("seed", seed)]);
         }
-        Self::send(req).await
+        Self::send(self.excluding(req)).await
     }
 
     /// Up to `limit` posts like `id`, most alike first.
@@ -626,7 +651,29 @@ impl Client {
         let req = self
             .request(Method::GET, &format!("/posts/{id}/related"))?
             .query(&[("limit", limit)]);
-        Self::send(req).await
+        Self::send(self.excluding(req)).await
+    }
+
+    /// The account's blacklist; for a guest, the server's default.
+    pub async fn blacklist(&self) -> Result<Blacklist> {
+        Self::send(self.request(Method::GET, "/auth/blacklist")?).await
+    }
+
+    /// Replaces the account's blacklist: tags, and ratings as
+    /// `rating:explicit`. The answer has the names as kept, aliases
+    /// resolved.
+    pub async fn set_blacklist(&self, entries: &[String]) -> Result<Blacklist> {
+        let body = Blacklist {
+            entries: entries.to_vec(),
+        };
+        self.json(Method::PUT, "/auth/blacklist", &body).await
+    }
+
+    /// The home page: its title and line, and its background unless it is
+    /// off or this is a private server and nobody is signed in.
+    pub async fn home(&self) -> Result<Home> {
+        let req = self.request(Method::GET, "/home")?;
+        Self::send(self.excluding(req)).await
     }
 
     pub async fn update_post(&self, id: i64, update: &PostUpdate) -> Result<Post> {
@@ -859,7 +906,7 @@ impl Client {
         let req = self
             .request(Method::GET, "/explore")?
             .query(&[("days", days.to_string()), ("q", query.to_owned())]);
-        Self::send(req).await
+        Self::send(self.excluding(req)).await
     }
 
     /// Groups of posts that look alike, within `distance` bits.
@@ -1419,6 +1466,7 @@ mod tests {
             mode: Mode::Public,
             score_kind: ScoreKind::Likes,
             guests: true,
+            home: false,
         })
         .unwrap();
         format!(
@@ -1592,6 +1640,80 @@ mod tests {
         let request = server.await.unwrap();
         assert!(request.starts_with("POST /api/v1/forum/threads/2/posts "));
         assert!(request.ends_with(r#"{"body":"hi"}"#));
+    }
+
+    #[tokio::test]
+    async fn a_guest_sends_their_blacklist_and_an_account_doesnt() {
+        let page = r#"{"posts":[],"page":1,"limit":60,"has_more":false}"#;
+        let list = ["cat".to_owned(), "rating:explicit".to_owned()];
+        let (url, server) = recorded(page).await;
+        Client::new(&url)
+            .unwrap()
+            .with_guest_blacklist(Some(&list))
+            .search_posts("sky", None, 1, 60)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with(
+                "GET /api/v1/posts?q=sky&page=1&limit=60&exclude=cat+rating%3Aexplicit "
+            ),
+            "{request}"
+        );
+
+        // An empty list is sent too: it hides nothing.
+        let (url, server) = recorded(r#"{"prev":null,"next":3}"#).await;
+        Client::new(&url)
+            .unwrap()
+            .with_guest_blacklist(Some(&[]))
+            .neighbors(1, "", None)
+            .await
+            .unwrap();
+        assert!(
+            server
+                .await
+                .unwrap()
+                .starts_with("GET /api/v1/posts/1/neighbors?q=&exclude= ")
+        );
+
+        let (url, server) = recorded(page).await;
+        Client::new(&url)
+            .unwrap()
+            .with_guest_blacklist(Some(&list))
+            .with_token(Some("sb_x".into()))
+            .search_posts("", None, 1, 60)
+            .await
+            .unwrap();
+        assert!(!server.await.unwrap().contains("exclude"));
+
+        let home = r#"{"enabled":true,"title":"S","subtitle":null,"posts":[{"id":4,
+            "thumb_url":"/media/thumb/a.jpg","sample_url":null,"width":8,"height":6}]}"#;
+        let (url, server) = recorded(home).await;
+        let got = Client::new(&url)
+            .unwrap()
+            .with_guest_blacklist(Some(&list))
+            .home()
+            .await
+            .unwrap();
+        assert_eq!((got.posts[0].id, got.posts[0].width), (4, 8));
+        assert!(
+            server
+                .await
+                .unwrap()
+                .starts_with("GET /api/v1/home?exclude=cat+rating%3Aexplicit ")
+        );
+
+        let (url, server) = recorded(r#"{"entries":["cat"]}"#).await;
+        let got = Client::new(&url)
+            .unwrap()
+            .with_token(Some("sb_x".into()))
+            .set_blacklist(&["Kitty".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(got.entries, ["cat"]);
+        let request = server.await.unwrap();
+        assert!(request.starts_with("PUT /api/v1/auth/blacklist "));
+        assert!(request.ends_with(r#"{"entries":["Kitty"]}"#), "{request}");
     }
 
     #[tokio::test]

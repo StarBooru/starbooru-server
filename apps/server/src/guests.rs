@@ -2,7 +2,7 @@
 //! how often. On a private instance nothing here applies, and every endpoint
 //! but the open ones answers 401 without a token, as always.
 
-use axum::extract::{FromRequestParts, MatchedPath, Request, State};
+use axum::extract::{FromRequestParts, MatchedPath, OptionalFromRequestParts, Request, State};
 use axum::http::Method;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
@@ -34,6 +34,10 @@ pub const GUEST_READS: &[(&str, u32)] = &[
     ("/forum", 1),
     ("/forum/threads", 1),
     ("/forum/threads/{id}", 1),
+    // The admin's default blacklist, for an app to start a guest's from.
+    ("/auth/blacklist", 1),
+    // Cached; it also answers without an account on a private instance.
+    ("/home", 1),
 ];
 
 /// What one client address may ask for without an account in a window.
@@ -140,6 +144,24 @@ impl FromRequestParts<AppState> for Viewer {
     }
 }
 
+/// `Option<Viewer>`, for what also answers someone without an account on a
+/// private instance: `None` for them. A token that is sent but wrong is
+/// still a 401.
+impl OptionalFromRequestParts<AppState> for Viewer {
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> AppResult<Option<Self>> {
+        if parts.headers.contains_key(AUTHORIZATION)
+            || parts.extensions.get::<GuestPass>().is_some()
+        {
+            return <Self as FromRequestParts<AppState>>::from_request_parts(parts, state)
+                .await
+                .map(Some);
+        }
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::{Method, StatusCode};
@@ -183,6 +205,7 @@ mod tests {
             "/api/v1/tags/blue_sky".to_owned(),
             "/api/v1/tag-corrections?q=blue_skz".to_owned(),
             "/api/v1/explore".to_owned(),
+            "/api/v1/auth/blacklist".to_owned(),
         ];
         let closed = [
             (Method::GET, "/api/v1/auth/me".to_owned()),
@@ -197,6 +220,7 @@ mod tests {
             (Method::PATCH, "/api/v1/tags/blue_sky".to_owned()),
             (Method::DELETE, format!("/api/v1/posts/{post}")),
             (Method::POST, "/api/v1/posts/bulk".to_owned()),
+            (Method::PUT, "/api/v1/auth/blacklist".to_owned()),
         ];
 
         // Private: a token for everything, as before.

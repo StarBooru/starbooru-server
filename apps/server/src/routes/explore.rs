@@ -11,6 +11,7 @@ use starbooru_core::{
     DEFAULT_EXPLORE_DAYS, Explore, MAX_EXPLORE_DAYS, Mode, Post, TagTrend, parse_query,
 };
 
+use super::blacklist::hidden_for;
 use super::posts::{
     PostRow, correct_typos, end_page, push_filters, select_page, tag_filter, to_post,
 };
@@ -33,6 +34,8 @@ pub struct ExploreParams {
     days: Option<u32>,
     #[serde(default)]
     q: String,
+    /// A guest's own blacklist.
+    exclude: Option<String>,
 }
 
 pub async fn explore(
@@ -50,11 +53,13 @@ pub async fn explore(
     let user_id = viewer.id();
     let mut query = parse_query(&params.q)?;
     query.deleted = false;
+    let hidden = hidden_for(&state, &viewer, params.exclude.as_deref()).await?;
     let (query, corrected) = correct_typos(&state, query).await?;
     let now = Utc::now();
     let since = now - Duration::days(i64::from(days));
 
-    let Some(filter) = tag_filter(&state, &query).await? else {
+    // The blacklist applies to every section, the popular tags included.
+    let Some(filter) = tag_filter(&state, &query, &hidden).await? else {
         // A required tag does not exist, so nothing matches.
         return Ok(Json(Explore {
             days,

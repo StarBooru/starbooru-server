@@ -10,11 +10,13 @@ pub mod ai_catalog;
 mod ai_files;
 pub mod ai_worker;
 pub mod autotag;
+pub mod blacklist;
 pub mod color;
 pub mod edit;
 pub mod figure;
 pub mod filter;
 pub mod forum;
+pub mod home;
 pub mod keys;
 pub mod library;
 pub mod local_ai;
@@ -50,6 +52,7 @@ pub use ai::{
 };
 pub use ai_catalog::{AiMode, AiPreset, AiTool};
 pub use autotag::{META_TAGS, META_VERSION, MediaFacts, meta_tags, meta_tags_since};
+pub use blacklist::{Blacklist, BlacklistError};
 pub use edit::{Crop, EditError, EditKind, MAX_STRAIGHTEN, MediaEdit, Trim, edit_kind};
 pub use figure::{
     COSPLAY_TAG, Figure, FigureError, FigureKind, FiguresUpdate, MAX_FIGURE_TAGS, MAX_FIGURES,
@@ -59,6 +62,7 @@ pub use forum::{
     CategoryUpdate, ForumCategory, ForumError, ForumPost, ForumPostBody, ForumThread, NewCategory,
     NewThread, PostMention, ThreadPage, ThreadUpdate, ThreadView, post_mentions,
 };
+pub use home::{Home, HomeError, HomePost, HomeSettings};
 pub use keys::clean_api_key;
 pub use library::{
     LibraryCheck, LibraryError, LibraryFailure, LibraryImport, LibraryPhase, LibraryRetry,
@@ -79,7 +83,8 @@ pub use profile::{
     clean_display_name,
 };
 pub use query::{
-    FigureTerm, Order, SearchQuery, SortKey, parse_query, with_color, with_exact, with_order,
+    FigureTerm, Order, SearchQuery, SortKey, names_order, parse_query, with_color, with_exact,
+    with_order,
 };
 pub use remote::{
     BooruAccount, BooruApi, BooruSite, Limits, MAX_BOORU_ACCOUNTS, MAX_REMOTE_SEARCHES,

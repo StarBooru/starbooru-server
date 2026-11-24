@@ -44,8 +44,8 @@ The owner's answers (2026-11-23): in public mode, people without an account can 
 - [x] Public mode: browsing without an account, read-only, and Explore's Trending and Popular tags
 - [x] Share links set up to suit each mode: share links in private mode, a post's own address in public mode
 - [ ] The guests' rate limit shared between replicas (it's per process, in memory, like the sign-in limits)
-- [ ] A tag blacklist for each account
-- [ ] A home page setting: on or off, and how it's customised. Its background shows the most popular posts rated safe
+- [x] A tag blacklist for each account
+- [x] A home page setting: on or off, and how it's customised. Its background shows the most popular posts rated safe
 
 ## Next: people
 

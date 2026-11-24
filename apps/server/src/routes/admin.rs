@@ -146,6 +146,13 @@ pub async fn put_settings(
     let wanted = if has_kind { clean.score_kind } else { kind };
     super::modes::check_kind(mode, wanted)?;
     settings::save(&mut *tx, &state.config, &clean).await?;
+    if let Some(entries) = &clean.default_blacklist {
+        let entries = super::blacklist::resolve_aliases(&mut *tx, entries).await?;
+        settings::save_default_blacklist(&mut *tx, &entries).await?;
+    }
+    if let Some(home) = &clean.home {
+        settings::save_home(&mut *tx, home).await?;
+    }
     let mut changes = Vec::new();
     if wanted != kind {
         settings::save_score_kind(&mut *tx, wanted).await?;
@@ -407,7 +414,10 @@ mod tests {
                 "trash_days": 0,
                 "auto_meta_tags": false,
                 "mode": "private",
-                "score_kind": "likes"
+                "score_kind": "likes",
+                "default_blacklist": [],
+                "home": { "enabled": false, "title": null, "subtitle": null, "query": "",
+                          "posts": 36 }
             })
         );
         let put = |token: &str, body: serde_json::Value| {

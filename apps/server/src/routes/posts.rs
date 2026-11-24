@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::Json;
 use axum::body::Bytes;
@@ -10,7 +10,7 @@ use serde::Deserialize;
 use sqlx::{FromRow, Postgres, QueryBuilder, Transaction};
 use starbooru_core::color::{COLOR_REACHES, EXCLUDE_REACH, cells_near, stored_hex};
 use starbooru_core::filter::SizeField;
-use starbooru_core::query::{FigureTerm, SearchQuery, SortKey};
+use starbooru_core::query::{FigureTerm, Order, SearchQuery, SortKey};
 use starbooru_core::tag::{MAX_TAGS_PER_POST, normalize_tags};
 use starbooru_core::{
     BulkEdit, BulkResult, DEFAULT_PAGE_LIMIT, DEFAULT_RELATED_LIMIT, ImportRequest, MAX_BULK_POSTS,
@@ -20,6 +20,7 @@ use starbooru_core::{
 };
 use tracing::warn;
 
+use super::blacklist::{Hidden, hidden_for};
 use crate::auth::AuthUser;
 use crate::error::{AppError, AppResult};
 use crate::guests::Viewer;
@@ -216,6 +217,7 @@ pub(super) fn to_post(state: &AppState, row: PostRow) -> Post {
         uploader,
         tag_votes,
         voted_off: row.voted_off,
+        blacklisted: Vec::new(),
     }
 }
 
@@ -270,6 +272,45 @@ pub(super) struct TagFilter {
     colors: Vec<Vec<i16>>,
     /// `-color:` terms: it has none of these.
     no_colors: Vec<i16>,
+    /// Ratings the reader's blacklist leaves out, as stored.
+    no_ratings: Vec<i16>,
+}
+
+impl TagFilter {
+    /// Leaves out what the reader's blacklist hides, as `-tag` terms would,
+    /// except what the search names itself: its tags, with the tags under
+    /// them, and its ratings. The recycle bin shows everything it holds.
+    pub(super) fn hide(&mut self, query: &SearchQuery, hidden: &Hidden) {
+        if query.deleted || hidden.is_empty() {
+            return;
+        }
+        let asked: HashSet<i64> = self
+            .all
+            .iter()
+            .chain(self.any.iter().flatten())
+            .copied()
+            .collect();
+        self.leave_out(
+            hidden.tags_except(&asked),
+            hidden.ratings_except(&query.ratings),
+        );
+    }
+
+    /// Leaves out everything the blacklist hides, for a search the reader
+    /// didn't type: the home page's.
+    pub(super) fn hide_all(&mut self, hidden: &Hidden) {
+        self.leave_out(
+            hidden.tags_except(&HashSet::new()),
+            hidden.ratings_except(&[]),
+        );
+    }
+
+    fn leave_out(&mut self, tags: Vec<i64>, ratings: Vec<i16>) {
+        self.none.extend(tags);
+        self.none.sort_unstable();
+        self.none.dedup();
+        self.no_ratings.extend(ratings);
+    }
 }
 
 /// A figure term, resolved: the kind, and for each tag the tag and its tree.
@@ -327,11 +368,12 @@ pub(super) async fn correct_typos(
     Ok((query, corrected))
 }
 
-/// Resolves a search's tags; `None` when a searched tag doesn't exist, so
-/// nothing can match.
+/// Resolves a search's tags, and leaves out what `hidden` lists; `None`
+/// when a searched tag doesn't exist, so nothing can match.
 pub(super) async fn tag_filter(
     state: &AppState,
     query: &SearchQuery,
+    hidden: &Hidden,
 ) -> AppResult<Option<TagFilter>> {
     let (include, wanted) = tag_ids(state, &query.include).await?;
     if include.len() < wanted {
@@ -370,6 +412,8 @@ pub(super) async fn tag_filter(
         // a term with an unknown tag matches no one, so excludes nothing
         filter.no_figures.extend(figure_filter(state, term).await?);
     }
+    // Before the colours, so their reach is found among what is shown.
+    filter.hide(query, hidden);
     resolve_colors(state, query, &mut filter).await?;
     Ok(Some(filter))
 }
@@ -462,6 +506,31 @@ fn sort_expr(key: SortKey, seed: Option<i64>, kind: ScoreKind) -> Option<SortExp
     }
 }
 
+/// ` ORDER BY …` for a search: its sort, then the id. `order:random`
+/// without a seed sorts by `random()`.
+pub(super) fn push_order(
+    qb: &mut QueryBuilder<Postgres>,
+    order: Order,
+    seed: Option<i64>,
+    kind: ScoreKind,
+) {
+    if order.key == SortKey::Random && seed.is_none() {
+        qb.push(" ORDER BY random()");
+        return;
+    }
+    let dir = if order.descending { " DESC" } else { " ASC" };
+    qb.push(" ORDER BY ");
+    if let Some(column) = sort_expr(order.key, seed, kind) {
+        column.push(qb);
+        qb.push(dir);
+        if matches!(order.key, SortKey::Pixels | SortKey::LongSide) {
+            qb.push(" NULLS LAST");
+        }
+        qb.push(", ");
+    }
+    qb.push("p.id").push(dir);
+}
+
 /// A size term's column, in the term's unit. These match the indexes of
 /// migrations 0002 and 0024.
 fn size_column(field: SizeField) -> &'static str {
@@ -516,6 +585,11 @@ pub(super) fn push_filters(qb: &mut QueryBuilder<Postgres>, query: &SearchQuery,
     if !query.exclude_ratings.is_empty() {
         let r: Vec<i16> = query.exclude_ratings.iter().map(|r| r.to_db()).collect();
         qb.push(" AND NOT (p.rating = ANY(").push_bind(r).push("))");
+    }
+    if !tags.no_ratings.is_empty() {
+        qb.push(" AND NOT (p.rating = ANY(")
+            .push_bind(tags.no_ratings.clone())
+            .push("))");
     }
     if let Some(kind) = query.kind {
         qb.push(" AND p.kind = ").push_bind(kind.to_db());
@@ -588,9 +662,27 @@ pub struct SearchParams {
     limit: Option<u32>,
     /// Shuffles `order:random` the same way every time this is given.
     seed: Option<i64>,
+    /// A guest's own blacklist.
+    exclude: Option<String>,
 }
 
-/// `GET /posts?q=&page=&limit=&seed=`. Query language: `starbooru_core::query`.
+/// The reader's blacklist for a search, unless it browses the recycle bin,
+/// which shows everything.
+async fn hidden_from(
+    state: &AppState,
+    viewer: &Viewer,
+    query: &SearchQuery,
+    exclude: Option<&str>,
+) -> AppResult<Hidden> {
+    if query.deleted {
+        Ok(Hidden::default())
+    } else {
+        hidden_for(state, viewer, exclude).await
+    }
+}
+
+/// `GET /posts?q=&page=&limit=&seed=&exclude=`. Query language:
+/// `starbooru_core::query`.
 pub async fn search(
     State(state): State<AppState>,
     viewer: Viewer,
@@ -605,10 +697,11 @@ pub async fn search(
     if query.deleted {
         viewer.require_account()?;
     }
+    let hidden = hidden_from(&state, &viewer, &query, params.exclude.as_deref()).await?;
     let (mode, kind) = settings::scoring(&state.db).await?;
     let (query, corrected) = correct_typos(&state, query).await?;
 
-    let Some(tags) = tag_filter(&state, &query).await? else {
+    let Some(tags) = tag_filter(&state, &query, &hidden).await? else {
         // a required tag does not exist
         return Ok(Json(PostPage {
             posts: Vec::new(),
@@ -621,25 +714,7 @@ pub async fn search(
 
     let mut qb = select_page(viewer.id(), mode == Mode::Public);
     push_filters(&mut qb, &query, &tags);
-    if query.order.key == SortKey::Random && params.seed.is_none() {
-        qb.push(" ORDER BY random()");
-    } else {
-        let dir = if query.order.descending {
-            " DESC"
-        } else {
-            " ASC"
-        };
-        qb.push(" ORDER BY ");
-        if let Some(column) = sort_expr(query.order.key, params.seed, kind) {
-            column.push(&mut qb);
-            qb.push(dir);
-            if matches!(query.order.key, SortKey::Pixels | SortKey::LongSide) {
-                qb.push(" NULLS LAST");
-            }
-            qb.push(", ");
-        }
-        qb.push("p.id").push(dir);
-    }
+    push_order(&mut qb, query.order, params.seed, kind);
     let offset = i64::from(page - 1) * i64::from(limit);
     qb.push(" LIMIT ")
         .push_bind(i64::from(limit) + 1)
@@ -665,6 +740,8 @@ pub struct NeighborParams {
     q: String,
     /// The seed the search was shuffled with, for `order:random`.
     seed: Option<i64>,
+    /// A guest's own blacklist.
+    exclude: Option<String>,
 }
 
 /// The sort expression used to step from one post to the next. Unlike
@@ -706,9 +783,10 @@ pub async fn neighbors(
     if query.order.key == SortKey::Random && params.seed.is_none() {
         return Ok(Json(none));
     }
+    let hidden = hidden_from(&state, &viewer, &query, params.exclude.as_deref()).await?;
     let kind = settings::score_kind(&state).await?;
     let (query, _) = correct_typos(&state, query).await?;
-    let Some(tags) = tag_filter(&state, &query).await? else {
+    let Some(tags) = tag_filter(&state, &query, &hidden).await? else {
         return Ok(Json(none));
     };
     let column = step_column(query.order.key, query.order.descending, params.seed, kind);
@@ -758,6 +836,22 @@ pub async fn neighbors(
 #[derive(Deserialize)]
 pub struct RelatedParams {
     limit: Option<u32>,
+    /// A guest's own blacklist.
+    exclude: Option<String>,
+}
+
+/// Leaves out posts with any of `tags` or `ratings`, for a query on `p`.
+fn push_hidden(qb: &mut QueryBuilder<Postgres>, tags: &[i64], ratings: &[i16]) {
+    if !tags.is_empty() {
+        qb.push(" AND NOT (p.tag_ids && ")
+            .push_bind(tags.to_vec())
+            .push(")");
+    }
+    if !ratings.is_empty() {
+        qb.push(" AND NOT (p.rating = ANY(")
+            .push_bind(ratings.to_vec())
+            .push("))");
+    }
 }
 
 /// Related posts are found through the post's rarest tags: this many, each
@@ -836,6 +930,10 @@ pub async fn related(
     if weighted.is_empty() && reach.is_empty() {
         return Ok(Json(RelatedPosts::default()));
     }
+    // Left out as candidates, so the list stays full.
+    let hidden = hidden_for(&state, &viewer, params.exclude.as_deref()).await?;
+    let hidden_tags = hidden.tags_except(&HashSet::new());
+    let hidden_ratings = hidden.ratings_except(&[]);
 
     let (ids, weights): (Vec<i64>, Vec<f64>) = weighted.iter().copied().unzip();
     let mut qb = QueryBuilder::<Postgres>::new("WITH w(id, w) AS (SELECT * FROM unnest(");
@@ -848,9 +946,11 @@ pub async fn related(
             " UNION (SELECT p.id FROM posts p WHERE p.deleted_at IS NULL AND p.tag_ids @> ARRAY[",
         )
         .push_bind(tag)
-        .push("]::bigint[] ORDER BY p.id DESC LIMIT ")
-        .push_bind(RELATED_PER_TAG)
-        .push(")");
+        .push("]::bigint[]");
+        push_hidden(&mut qb, &hidden_tags, &hidden_ratings);
+        qb.push(" ORDER BY p.id DESC LIMIT ")
+            .push_bind(RELATED_PER_TAG)
+            .push(")");
     }
     for (chunk, values) in reach.into_iter().enumerate() {
         let column = match chunk {
@@ -863,9 +963,9 @@ pub async fn related(
             .push_bind(values)
             .push("::bigint[]) v CROSS JOIN LATERAL (SELECT p.id FROM posts p WHERE p.deleted_at IS NULL AND ")
             .push(column)
-            .push(" = v LIMIT ")
-            .push_bind(RELATED_PER_CHUNK)
-            .push(") l)");
+            .push(" = v");
+        push_hidden(&mut qb, &hidden_tags, &hidden_ratings);
+        qb.push(" LIMIT ").push_bind(RELATED_PER_CHUNK).push(") l)");
     }
     qb.push(
         ") SELECT p.id FROM cand JOIN posts p ON p.id = cand.id \
@@ -923,15 +1023,32 @@ async fn live_posts(state: &AppState) -> AppResult<f64> {
     Ok(f64::from(i32::try_from(count).unwrap_or(i32::MAX)))
 }
 
+#[derive(Deserialize)]
+pub struct ExcludeParams {
+    /// A guest's own blacklist.
+    exclude: Option<String>,
+}
+
+/// `GET /posts/{id}`. A post the reader's blacklist matches still opens,
+/// saying which entries it matches.
 pub async fn get_one(
     State(state): State<AppState>,
     viewer: Viewer,
     Path(id): Path<i64>,
+    Query(params): Query<ExcludeParams>,
 ) -> AppResult<Json<Post>> {
-    let post = load_full(&state, viewer.id(), id).await?;
+    let mut post = load_full(&state, viewer.id(), id).await?;
     // Guests don't see the recycle bin.
     if post.deleted && viewer.is_guest() {
         return Err(AppError::NotFound);
+    }
+    let hidden = hidden_for(&state, &viewer, params.exclude.as_deref()).await?;
+    if !hidden.is_empty() {
+        let tags: Vec<i64> = sqlx::query_scalar("SELECT tag_ids FROM posts WHERE id = $1")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await?;
+        post.blacklisted = hidden.matched(&tags, post.rating);
     }
     Ok(Json(post))
 }

@@ -15,6 +15,7 @@ use crate::oidc::Oidc;
 use crate::remote::accounts::Vault;
 use crate::remote::pace::Pace;
 use crate::remote::relay::Relay;
+use crate::routes::HomeCache;
 use crate::storage::Storage;
 use crate::throttle::{Guards, Throttle};
 use crate::transfers::Transfers;
@@ -64,6 +65,8 @@ pub struct Inner {
     pub local_ai: LocalAi,
     /// New releases, and the update under way.
     pub updates: Updates,
+    /// The home page's background, kept a few minutes.
+    pub home: HomeCache,
     pub started_at: DateTime<Utc>,
 }
 
@@ -114,6 +117,7 @@ impl AppState {
             library_imports: tokio::sync::Notify::new(),
             local_ai,
             updates: Updates::new(),
+            home: HomeCache::default(),
             started_at: Utc::now(),
         }))
     }

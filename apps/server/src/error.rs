@@ -173,6 +173,12 @@ impl From<starbooru_core::ForumError> for AppError {
     }
 }
 
+impl From<starbooru_core::BlacklistError> for AppError {
+    fn from(e: starbooru_core::BlacklistError) -> Self {
+        AppError::BadRequest(e.to_string())
+    }
+}
+
 impl From<starbooru_core::query::QueryError> for AppError {
     fn from(e: starbooru_core::query::QueryError) -> Self {
         AppError::BadRequest(e.to_string())

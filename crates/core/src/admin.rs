@@ -6,6 +6,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::Role;
+use crate::blacklist::{BlacklistError, Entry, MAX_EXCLUDE, clean_blacklist};
+use crate::home::{HomeError, HomeSettings, clean_home};
 use crate::mode::{Change, Mode, ScoreKind};
 use crate::tag_vote::MAX_TAG_VOTE_THRESHOLD;
 
@@ -44,6 +46,15 @@ pub struct ServerSettings {
     /// stays as it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag_vote_threshold: Option<u32>,
+    /// The blacklist new accounts start with, and guests get until they
+    /// send their own (at most [`MAX_EXCLUDE`] entries). Always in a `GET`;
+    /// left out of a `PUT`, it stays as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_blacklist: Option<Vec<String>>,
+    /// The home page. Always in a `GET`; left out of a `PUT`, it stays as
+    /// it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<HomeSettings>,
     /// Only in the answer to a `PUT` that changed `score_kind`: the votes
     /// it converted and dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -70,6 +81,10 @@ pub enum SettingsError {
     BadBackupKeep,
     #[error("a tag comes off at a score of 0 (never) to -{MAX_TAG_VOTE_THRESHOLD}")]
     BadTagVoteThreshold,
+    #[error("the default blacklist: {0}")]
+    Blacklist(#[from] BlacklistError),
+    #[error(transparent)]
+    Home(#[from] HomeError),
 }
 
 /// Trims and checks settings before they are saved.
@@ -97,6 +112,16 @@ pub fn clean_settings(settings: &ServerSettings) -> Result<ServerSettings, Setti
     {
         return Err(SettingsError::BadTagVoteThreshold);
     }
+    let default_blacklist = match &settings.default_blacklist {
+        Some(entries) => Some(
+            clean_blacklist(entries, MAX_EXCLUDE)?
+                .iter()
+                .map(Entry::as_entry)
+                .collect(),
+        ),
+        None => None,
+    };
+    let home = settings.home.as_ref().map(clean_home).transpose()?;
     Ok(ServerSettings {
         name,
         allow_registration: settings.allow_registration,
@@ -105,6 +130,8 @@ pub fn clean_settings(settings: &ServerSettings) -> Result<ServerSettings, Setti
         mode: settings.mode,
         score_kind: settings.score_kind,
         tag_vote_threshold: settings.tag_vote_threshold,
+        default_blacklist,
+        home,
         changes: Vec::new(),
     })
 }
@@ -304,6 +331,8 @@ mod tests {
             mode: Mode::Private,
             score_kind: ScoreKind::Likes,
             tag_vote_threshold: None,
+            default_blacklist: None,
+            home: None,
             changes: Vec::new(),
         }
     }
@@ -318,11 +347,48 @@ mod tests {
         assert_eq!(old.mode, Mode::Private);
         assert_eq!(old.score_kind, ScoreKind::Likes);
         assert_eq!(old.tag_vote_threshold, None);
+        assert_eq!((old.default_blacklist, old.home), (None, None));
         assert!(old.auto_meta_tags);
         let out = serde_json::to_value(settings("x", 0)).unwrap();
         assert_eq!(out["mode"], "private");
         assert!(out.get("changes").is_none());
         assert!(out.get("tag_vote_threshold").is_none());
+        assert!(out.get("default_blacklist").is_none() && out.get("home").is_none());
+    }
+
+    #[test]
+    fn cleans_the_default_blacklist_and_the_home_page() {
+        let with = |list: &[&str], home: Option<HomeSettings>| ServerSettings {
+            default_blacklist: Some(list.iter().map(|s| (*s).to_owned()).collect()),
+            home,
+            ..settings("x", 0)
+        };
+        let clean = clean_settings(&with(&["Cat", "rating:e", "cat"], None)).unwrap();
+        assert_eq!(
+            clean.default_blacklist,
+            Some(vec!["cat".to_owned(), "rating:explicit".to_owned()])
+        );
+        let many: Vec<String> = (0..=MAX_EXCLUDE).map(|i| format!("t{i}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert!(matches!(
+            clean_settings(&with(&refs, None)),
+            Err(SettingsError::Blacklist(BlacklistError::TooMany(_)))
+        ));
+        let home = HomeSettings {
+            enabled: true,
+            title: Some(" Hi ".into()),
+            ..HomeSettings::default()
+        };
+        let clean = clean_settings(&with(&[], Some(home))).unwrap();
+        assert_eq!(clean.home.unwrap().title.as_deref(), Some("Hi"));
+        let bad = HomeSettings {
+            posts: 1,
+            ..HomeSettings::default()
+        };
+        assert_eq!(
+            clean_settings(&with(&[], Some(bad))),
+            Err(SettingsError::Home(HomeError::BadCount))
+        );
     }
 
     #[test]

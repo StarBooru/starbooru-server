@@ -106,7 +106,8 @@ pub async fn register(
     }
     let role = if has_users { Role::User } else { Role::Admin };
     let row: UserRow = sqlx::query_as(
-        "INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3) \
+        "INSERT INTO users (username, password_hash, role, blacklist) \
+         VALUES ($1, $2, $3, COALESCE((SELECT default_blacklist FROM server_settings), '{}')) \
          RETURNING id, username, role, created_at",
     )
     .bind(&username)

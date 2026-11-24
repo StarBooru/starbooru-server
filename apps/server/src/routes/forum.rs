@@ -67,13 +67,16 @@ async fn begin_write<'a>(
 }
 
 /// The categories a forum starts with, when it has none. Run as the server
-/// goes public.
-pub async fn seed(tx: &mut Transaction<'_, Postgres>) -> AppResult<()> {
+/// goes public. Says whether it added them.
+pub async fn seed(tx: &mut Transaction<'_, Postgres>) -> AppResult<bool> {
+    sqlx::query("UPDATE server_settings SET forum_seeded = true")
+        .execute(&mut **tx)
+        .await?;
     let any: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM forum_categories)")
         .fetch_one(&mut **tx)
         .await?;
     if any {
-        return Ok(());
+        return Ok(false);
     }
     for (position, (name, description)) in (0..).zip(DEFAULT_CATEGORIES) {
         sqlx::query(
@@ -85,7 +88,21 @@ pub async fn seed(tx: &mut Transaction<'_, Postgres>) -> AppResult<()> {
         .execute(&mut **tx)
         .await?;
     }
-    Ok(())
+    Ok(true)
+}
+
+/// [`seed`], unless the forum has had its categories before: run at each
+/// start of a public server, so one that went public before the forum
+/// existed gets them, and one whose admin deleted them all doesn't get
+/// them back.
+pub async fn seed_once(tx: &mut Transaction<'_, Postgres>) -> AppResult<bool> {
+    let seeded: Option<bool> = sqlx::query_scalar("SELECT forum_seeded FROM server_settings")
+        .fetch_optional(&mut **tx)
+        .await?;
+    if seeded == Some(true) {
+        return Ok(false);
+    }
+    seed(tx).await
 }
 
 /// What an account must wait for before it posts again.
@@ -856,6 +873,86 @@ mod api {
             .execute(app.db())
             .await
             .unwrap();
+    }
+
+    async fn categories(app: &TestApp) -> Vec<String> {
+        sqlx::query_scalar("SELECT name FROM forum_categories ORDER BY position")
+            .fetch_all(app.db())
+            .await
+            .unwrap()
+    }
+
+    async fn seeded(app: &TestApp) -> bool {
+        sqlx::query_scalar("SELECT forum_seeded FROM server_settings")
+            .fetch_one(app.db())
+            .await
+            .unwrap()
+    }
+
+    /// A server already public on 0.3.0 had no categories after the
+    /// upgrade: the next start gives it the three, once.
+    #[tokio::test]
+    async fn an_upgraded_public_server_gets_its_categories_once() {
+        use crate::modes::settle;
+        let Some(app) = testing::app().await else {
+            return;
+        };
+        // Public before the forum: stored so, with nothing seeded.
+        crate::settings::save_mode(app.db(), starbooru_core::Mode::Public)
+            .await
+            .unwrap();
+        assert!(categories(&app).await.is_empty());
+        assert!(!seeded(&app).await);
+
+        let s = settle(app.db(), None, None).await.unwrap();
+        assert!(s.forum_seeded && !s.first);
+        assert_eq!(categories(&app).await, ["General", "Requests", "Site"]);
+        assert!(seeded(&app).await);
+        let s = settle(app.db(), None, None).await.unwrap();
+        assert!(!s.forum_seeded);
+        assert_eq!(categories(&app).await.len(), 3);
+
+        // An admin who deletes them all on purpose doesn't get them back.
+        sqlx::query("DELETE FROM forum_categories")
+            .execute(app.db())
+            .await
+            .unwrap();
+        let s = settle(app.db(), None, None).await.unwrap();
+        assert!(!s.forum_seeded);
+        assert!(categories(&app).await.is_empty());
+
+        // The migration tells the two apart on servers from before the flag:
+        // this one had categories, so it counts as seeded.
+        let migration = include_str!("../../migrations/0041_forum_seeded.sql");
+        sqlx::query("ALTER TABLE server_settings DROP COLUMN forum_seeded")
+            .execute(app.db())
+            .await
+            .unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(migration))
+            .execute(app.db())
+            .await
+            .unwrap();
+        assert!(seeded(&app).await);
+        settle(app.db(), None, None).await.unwrap();
+        assert!(categories(&app).await.is_empty());
+        app.finish().await;
+    }
+
+    /// A private server isn't seeded at start; going public seeds it.
+    #[tokio::test]
+    async fn a_private_server_gets_categories_when_it_goes_public() {
+        use crate::modes::settle;
+        let Some(app) = testing::app().await else {
+            return;
+        };
+        let admin = app.register("admin").await;
+        let s = settle(app.db(), None, None).await.unwrap();
+        assert!(!s.forum_seeded);
+        assert!(categories(&app).await.is_empty() && !seeded(&app).await);
+        app.switch(&admin, "public").await;
+        assert_eq!(categories(&app).await.len(), 3);
+        assert!(seeded(&app).await);
+        app.finish().await;
     }
 
     #[tokio::test]

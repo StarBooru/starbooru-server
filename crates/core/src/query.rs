@@ -155,6 +155,14 @@ pub fn with_color(query: &str, value: Option<&str>) -> String {
     terms.join(" ")
 }
 
+/// Whether a query string has an `order:` (or `sort:`) term of its own.
+pub fn names_order(query: &str) -> bool {
+    terms(query).iter().any(|t| {
+        let lower = t.to_ascii_lowercase();
+        lower.starts_with("order:") || lower.starts_with("sort:")
+    })
+}
+
 /// Turns off correcting unknown tags for a query string, keeping every term
 /// as typed. It goes first, as an unclosed `{` runs to the end of the query.
 pub fn with_exact(query: &str) -> String {
@@ -571,6 +579,16 @@ mod tests {
                 assert_eq!(Order::parse(order.as_value()), Some(order));
             }
         }
+    }
+
+    #[test]
+    fn tells_a_query_with_an_order() {
+        assert!(names_order("cat order:new"));
+        assert!(names_order("SORT:score"));
+        assert!(!names_order("cat -order:new"));
+        assert!(!names_order(r#"text:"order:now" cat"#));
+        assert!(!names_order("{girl order:x}"));
+        assert!(!names_order(""));
     }
 
     #[test]

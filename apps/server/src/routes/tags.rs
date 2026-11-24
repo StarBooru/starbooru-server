@@ -24,7 +24,7 @@ const MAX_TAG_PAGE: u32 = 10_000;
 /// Serialises alias and implication changes, which rewrite many posts.
 const TAG_GRAPH_LOCK: i64 = 7276;
 /// Parent chains are followed this far at most.
-const MAX_DEPTH: i32 = 32;
+pub(super) const MAX_DEPTH: i32 = 32;
 /// Unknown names looked up for a correction in one request.
 const MAX_CORRECTIONS: usize = 8;
 /// Names checked in one `GET /tag-corrections`.
