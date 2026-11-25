@@ -459,6 +459,61 @@ mod tests {
         app.finish().await;
     }
 
+    /// Regression: people whose franchise and count tags took a post past
+    /// its limit failed the whole save, and the AI's tags went with them.
+    #[tokio::test]
+    async fn people_that_do_not_fit_leave_the_tags() {
+        let Some(app) = testing::app().await else {
+            return;
+        };
+        let admin = app.register("admin").await;
+        let many: Vec<String> = (0..500).map(|i| format!("t{i}")).collect();
+        let id = app.upload_png(&admin, 3, &many.join(" ")).await;
+        let r = app
+            .call(
+                Method::POST,
+                "/api/v1/tags/hatsune_miku/implications",
+                Some(&admin),
+                Some(json!({ "implies": "vocaloid" })),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        let r = app
+            .call(
+                Method::PATCH,
+                "/api/v1/tags/vocaloid",
+                Some(&admin),
+                Some(json!({ "category": "copyright" })),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        let count = || async {
+            let n: i32 = sqlx::query_scalar("SELECT cardinality(tag_ids) FROM posts WHERE id = $1")
+                .bind(id)
+                .fetch_one(app.db())
+                .await
+                .unwrap();
+            usize::try_from(n).unwrap()
+        };
+        // 509 tags and one cosplay fit the first count; with `vocaloid`
+        // filled in, `cosplay`, `1girl` and `solo` they are 514.
+        let have = count().await;
+        let parsed = starbooru_core::ai::ParsedSuggestions {
+            tags: (have..509).map(|i| (format!("new{i}"), None)).collect(),
+            rating: None,
+            figures: vec![starbooru_core::Figure {
+                cosplay: Some("hatsune_miku".into()),
+                ..starbooru_core::Figure::default()
+            }],
+        };
+        crate::ai::add_tags(&app.state, id, &parsed).await.unwrap();
+        assert_eq!(count().await, 509);
+        let post = app.get(&format!("/api/v1/posts/{id}"), &admin).await.json();
+        assert!(tag_names(&post).contains("new508"), "{post}");
+        assert_eq!(post["figures"], Value::Null);
+        app.finish().await;
+    }
+
     #[tokio::test]
     async fn provider_errors_are_clean_and_keys_stay_secret() {
         let url = provider(ANSWER).await;
@@ -768,7 +823,12 @@ while IFS= read -r line; do
     *'"op":"translate"'*) echo '{"reply":"translated","texts":["CIAO"]}' ;;
     *'"op":"detect"'*) echo '{"reply":"boxes","boxes":[{"x":0,"y":0,"w":1,"h":1}]}' ;;
     *'"op":"read"'*) echo '{"reply":"texts","texts":["こんにちは"]}' ;;
-    *'"op":"faces"'*) echo '{"reply":"faces","faces":[{"face":{"x":600,"y":100,"w":200,"h":300},"score":0.9},{"face":{"x":100,"y":100,"w":200,"h":300},"score":0.8}]}' ;;
+    *'"op":"faces"'*)
+      if [ -e "$STARBOORU_AI_MODELS/damaged-faces" ]; then
+        echo '{"reply":"error","message":"a model file is damaged"}'
+        continue
+      fi
+      echo '{"reply":"faces","faces":[{"face":{"x":600,"y":100,"w":200,"h":300},"score":0.9},{"face":{"x":100,"y":100,"w":200,"h":300},"score":0.8}]}' ;;
     *'"op":"people"'*) echo "{\"reply\":\"people\",\"people\":[$PERSON,$PERSON2]}" ;;
     *) echo '{"reply":"error","message":"unknown request"}' ;;
   esac
@@ -1315,6 +1375,149 @@ PERSON2='{"face":{"x":100,"y":100,"w":200,"h":300},"score":0.8,"face_tags":[{"na
             .await
             .json();
         assert_eq!(post["figures"], Value::Null);
+        app.finish().await;
+    }
+
+    /// Regression: damaged face finders, which an AI provider's people
+    /// rely on, were never fetched again: every request failed the same way.
+    #[tokio::test]
+    async fn damaged_face_finders_are_fetched_again() {
+        let worker_dir = tempfile::tempdir().unwrap();
+        let worker = fake_worker(worker_dir.path());
+        let Some(app) = testing::app_with(|c| c.ai.worker = Some(worker)).await else {
+            return;
+        };
+        let ai = &app.state.local_ai;
+        let models = app.state.config.data_dir.join("ai/models");
+        std::fs::create_dir_all(&models).unwrap();
+        crate::local_ai::sweep(&app.state, false).await;
+        assert!(ai.runtime().ready);
+        crate::local_ai::mark_face_finders_installed(ai);
+        // The stand-in worker doesn't look at the picture.
+        let jpeg = testing::png(30, 20, 1);
+        let faces = crate::local_ai::faces(&app.state, &jpeg).await;
+        assert_eq!(faces.map(|f| f.len()), Some(2));
+
+        std::fs::write(models.join("damaged-faces"), b"").unwrap();
+        assert_eq!(crate::local_ai::faces(&app.state, &jpeg).await, None);
+        // The files that fail their hash (all of them, here) are gone, for
+        // the sweep to fetch again.
+        assert!(!crate::local_ai::face_finders_installed(ai));
+        app.finish().await;
+    }
+
+    /// Regression: finding people on request took no turn, so a burst of
+    /// requests decoded and read many pictures at once, each from its
+    /// original.
+    #[tokio::test]
+    async fn finding_people_takes_its_turn_and_reads_the_sample() {
+        use std::os::unix::fs::PermissionsExt;
+        let worker_dir = tempfile::tempdir().unwrap();
+        let worker = fake_worker(worker_dir.path());
+        let Some(app) = testing::app_with(|c| c.ai.worker = Some(worker)).await else {
+            return;
+        };
+        std::fs::create_dir_all(app.state.config.data_dir.join("ai/models")).unwrap();
+        let admin = app.register("admin").await;
+        crate::local_ai::sweep(&app.state, false).await;
+        crate::local_ai::mark_all_installed(
+            &app.state.local_ai,
+            starbooru_core::ai_catalog::model("people-swinv2").unwrap(),
+        );
+        let r = app
+            .call(
+                Method::PUT,
+                "/api/v1/admin/ai/tools/people",
+                Some(&admin),
+                Some(json!({ "mode": "local", "preset": "balanced", "model": "" })),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        // Big enough for a sample, which holds every pixel the models see.
+        let r = app
+            .upload(
+                &admin,
+                &testing::noise_png(800, 600, 5),
+                &[("autotag", "false")],
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        let id = r.json()["id"].as_i64().unwrap();
+        let path = format!("/api/v1/posts/{id}/find-people");
+
+        // While another picture has the turn, a request waits for it...
+        let held = app.state.people.acquire().await.unwrap();
+        let waiting = app.call(Method::POST, &path, Some(&admin), None);
+        let early = tokio::time::timeout(std::time::Duration::from_millis(1500), waiting).await;
+        assert!(
+            early.is_err(),
+            "it didn't wait: {:?}",
+            early.map(|r| r.json())
+        );
+        // ...and says the tool is busy when it waits too long.
+        let setup = crate::settings::ai(&app.state).await.unwrap();
+        let tool = setup.tool(starbooru_core::AiTool::People);
+        let route = crate::ai::route(&app.state, &tool).await.unwrap();
+        let short = std::time::Duration::from_millis(100);
+        let busy = crate::people_ai::suggest_within(&app.state, &route, id, short).await;
+        assert!(
+            matches!(
+                &busy,
+                Err(crate::error::AppError::Conflict {
+                    code: "ai_busy",
+                    ..
+                })
+            ),
+            "{:?}",
+            busy.map(|found| found.model)
+        );
+        drop(held);
+
+        // The original isn't read when the sample will do.
+        let sha = r.json()["sha256"].as_str().unwrap().to_owned();
+        let original = app.state.storage.original_path(&sha, "png").unwrap();
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads it anyway, which proves nothing but breaks nothing.
+        let r = app.call(Method::POST, &path, Some(&admin), None).await;
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        assert_eq!(r.json()["figures"].as_array().map(Vec::len), Some(2));
+        app.finish().await;
+    }
+
+    /// Regression: a person with a long list of tags and a franchise filled
+    /// in went over the limit, and finding people answered 500.
+    #[tokio::test]
+    async fn a_person_with_many_tags_is_found_without_a_franchise() {
+        let many: Vec<String> = (0..80).map(|i| format!("t{i}")).collect();
+        let answer = json!({ "figures": [
+            { "face": [10, 20, 300, 400], "kind": "boy", "character": "shirou_(fate)",
+              "other": many },
+        ]})
+        .to_string();
+        let url = text_provider_any(Box::leak(answer.into_boxed_str())).await;
+        let Some(app) = testing::app_with(|c| {
+            c.ai.url = url;
+            c.ai.model = "llava".into();
+            c.ai.people = Some(AiMode::Api);
+        })
+        .await
+        else {
+            return;
+        };
+        let admin = app.register("admin").await;
+        let r = app
+            .upload(&admin, &testing::png(30, 20, 42), &[("autotag", "false")])
+            .await;
+        let id = r.json()["id"].as_i64().unwrap();
+        let path = format!("/api/v1/posts/{id}/find-people");
+        let r = app.call(Method::POST, &path, Some(&admin), None).await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        let person = &r.json()["figures"][0];
+        assert_eq!(person["character"], "shirou_(fate)");
+        assert_eq!(person["franchise"], Value::Null);
+        let tags = person["tags"]["other"].as_array().map(Vec::len);
+        assert_eq!(tags, Some(starbooru_core::MAX_FIGURE_TAGS - 1));
         app.finish().await;
     }
 

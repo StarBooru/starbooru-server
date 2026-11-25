@@ -101,7 +101,7 @@ impl Tools {
     pub fn probe(&self, path: &Path, is_video: bool) -> Probed {
         let mut out = self.metadata(path).unwrap_or_default();
         let at = match (is_video, out.duration_ms) {
-            (true, Some(ms)) => (ms / 10).min(5_000),
+            (true, Some(ms)) => starbooru_core::still_at_ms(ms),
             _ => 0,
         };
         out.frame = self.frame(path, at, frame_size(out.width, out.height));

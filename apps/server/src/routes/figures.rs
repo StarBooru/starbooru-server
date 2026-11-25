@@ -121,18 +121,26 @@ pub(super) async fn for_answer(state: &AppState, post_id: i64) -> AppResult<Vec<
         .collect())
 }
 
-/// Takes tags off a post's figures that the post no longer has.
+/// Takes tags off a post's figures that the post no longer has. The
+/// characters of the figures that lost one, the removed ones included, get
+/// their franchise and faces worked out again.
 pub(super) async fn prune(
     tx: &mut Transaction<'_, Postgres>,
     post_id: i64,
     tag_ids: &[i64],
 ) -> AppResult<()> {
+    // The UPDATE still sees the deleted rows: they share one snapshot.
     sqlx::query(
-        "DELETE FROM figure_tags ft USING figures f \
-         WHERE ft.figure_id = f.id AND f.post_id = $1 AND NOT (ft.tag_id = ANY($2))",
+        "WITH gone AS (DELETE FROM figure_tags ft USING figures f \
+             WHERE ft.figure_id = f.id AND f.post_id = $1 AND NOT (ft.tag_id = ANY($2)) \
+             RETURNING ft.figure_id) \
+         UPDATE tags SET franchise_checked_at = NULL \
+         WHERE franchise_checked_at IS NOT NULL AND id IN (SELECT ft.tag_id FROM figure_tags ft \
+             WHERE ft.slot = $3 AND ft.figure_id IN (SELECT figure_id FROM gone))",
     )
     .bind(post_id)
     .bind(tag_ids)
+    .bind(CHARACTER_SLOT)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -860,6 +868,59 @@ mod tests {
         app.finish().await;
     }
 
+    /// What `franchise: null` means, as `api.md` says: fill one in for a
+    /// person new to the post, clear it for one already there, and an app
+    /// that leaves the key out keeps what the person had.
+    #[tokio::test]
+    async fn null_fills_a_new_person_in_and_clears_one_already_there() {
+        let Some(app) = testing::app().await else {
+            return;
+        };
+        let t = app.register("admin").await;
+        let id = app.upload_png(&t, 1, "").await;
+        let r = app
+            .call(
+                Method::POST,
+                "/api/v1/tags/saber/implications",
+                Some(&t),
+                Some(json!({"implies": "fate_series"})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        let r = app
+            .call(
+                Method::PATCH,
+                "/api/v1/tags/fate_series",
+                Some(&t),
+                Some(json!({"category": "copyright"})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        let saber = |franchise: Option<Value>| {
+            let mut figure = json!({"kind": "girl", "character": "saber", "face": null});
+            if let Some(franchise) = franchise {
+                figure["franchise"] = franchise;
+            }
+            json!([figure])
+        };
+        // New here: filled in, though the key came with null.
+        let r = put_figures(&app, &t, id, saber(Some(Value::Null))).await;
+        assert_eq!(r.json()["figures"][0]["franchise"], "fate_series");
+        // Already here: null clears it, and saving again keeps it off.
+        let r = put_figures(&app, &t, id, saber(Some(Value::Null))).await;
+        assert_eq!(r.json()["figures"][0]["franchise"], Value::Null);
+        let r = put_figures(&app, &t, id, saber(Some(Value::Null))).await;
+        assert_eq!(r.json()["figures"][0]["franchise"], Value::Null);
+        // An older app leaves the key out: what the person had stays.
+        let r = put_figures(&app, &t, id, saber(None)).await;
+        assert_eq!(r.json()["figures"][0]["franchise"], Value::Null);
+        let r = put_figures(&app, &t, id, saber(Some(json!("type_moon")))).await;
+        assert_eq!(r.json()["figures"][0]["franchise"], "type_moon");
+        let r = put_figures(&app, &t, id, saber(None)).await;
+        assert_eq!(r.json()["figures"][0]["franchise"], "type_moon");
+        app.finish().await;
+    }
+
     #[tokio::test]
     async fn faces_follow_an_edit_and_a_purge() {
         let Some(app) = testing::app().await else {
@@ -962,6 +1023,53 @@ mod tests {
         assert_eq!(crate::faces::forget_missing(&app.state).await.unwrap(), 2);
         assert_eq!(crate::faces::make_due(&app.state).await.unwrap(), 2);
         assert!(app.state.storage.has_face(&first));
+        app.finish().await;
+    }
+
+    /// Regression: an original the server may not read failed the whole
+    /// round, which then started again from the same post, so no later post
+    /// ever got its crops.
+    #[tokio::test]
+    async fn an_unreadable_picture_fails_only_its_own_faces() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(app) = testing::app().await else {
+            return;
+        };
+        let t = app.register("admin").await;
+        let first = upload_sized(&app, &t, 200, 100, 7).await;
+        let second = upload_sized(&app, &t, 200, 100, 8).await;
+        for id in [first, second] {
+            let face = json!({"x": 100, "y": 200, "w": 250, "h": 500});
+            let r = put_figures(&app, &t, id, json!([{"kind": "girl", "face": face}])).await;
+            assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        }
+        let (sha, ext): (Vec<u8>, String) =
+            sqlx::query_as("SELECT sha256, ext FROM posts WHERE id = $1")
+                .bind(first)
+                .fetch_one(app.db())
+                .await
+                .unwrap();
+        let original = app
+            .state
+            .storage
+            .original_path(&hex::encode(sha), &ext)
+            .unwrap();
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads it anyway: nothing to test then.
+        if std::fs::read(&original).is_ok() {
+            return app.finish().await;
+        }
+        let made = crate::faces::make_due(&app.state).await;
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(made.unwrap(), 1);
+        assert_eq!(crops(&app, first).await, [None]);
+        assert!(crops(&app, second).await[0].is_some());
+        let failed: bool = sqlx::query_scalar("SELECT face_failed FROM figures WHERE post_id = $1")
+            .bind(first)
+            .fetch_one(app.db())
+            .await
+            .unwrap();
+        assert!(failed);
         app.finish().await;
     }
 

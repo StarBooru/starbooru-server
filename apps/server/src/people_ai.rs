@@ -7,15 +7,15 @@
 //! Never log pictures or what was found in them.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use image::DynamicImage;
 use image::imageops::FilterType;
-use starbooru_core::figure::{Figure, MAX_FIGURES, clean_figures};
+use starbooru_core::figure::{Figure, MAX_FIGURES, clean_each};
 use starbooru_core::people_ai::{self, FoundPeople};
 use starbooru_core::{AiMode, AiTool, FaceBox, MediaKind, TagCategory};
-use tokio::sync::Semaphore;
+use tokio::sync::SemaphorePermit;
 use tracing::{info, warn};
 
 use crate::ai::{self, Route};
@@ -27,8 +27,9 @@ use crate::storage::{self, FilterKind};
 /// Longest side of the picture the models see: faces in a group photo
 /// stay large enough to find.
 const PICTURE_SIZE: u32 = 1536;
-/// One picture at a time on upload: each runs the tagger a few times.
-static SLOTS: Semaphore = Semaphore::const_new(1);
+/// Longest a request waits behind other pictures for its turn
+/// (`AppState::people`).
+const TURN_WAIT: Duration = Duration::from_secs(60);
 /// How deep the tag tree is looked up.
 const MAX_DEPTH: i32 = 32;
 
@@ -39,21 +40,39 @@ struct Picture {
     image: DynamicImage,
 }
 
+/// sha256, ext, kind, has_sample, width, height.
+type PictureRow = (Vec<u8>, String, i16, Option<bool>, Option<i32>, Option<i32>);
+
 async fn picture(state: &AppState, post_id: i64) -> AppResult<Picture> {
-    let row: Option<(Vec<u8>, String, i16)> =
-        sqlx::query_as("SELECT sha256, ext, kind FROM posts WHERE id = $1 AND deleted_at IS NULL")
-            .bind(post_id)
-            .fetch_optional(&state.db)
-            .await?;
-    let (sha, ext, kind) = row.ok_or(AppError::NotFound)?;
+    let row: Option<PictureRow> = sqlx::query_as(
+        "SELECT sha256, ext, kind, has_sample, width, height FROM posts \
+         WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(post_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let (sha, ext, kind, has_sample, width, height) = row.ok_or(AppError::NotFound)?;
     let kind = MediaKind::from_db(kind).unwrap_or(MediaKind::Image);
+    let long_side = width
+        .max(height)
+        .and_then(|side| u32::try_from(side).ok())
+        .unwrap_or(u32::MAX);
     let st = state.clone();
     tokio::task::spawn_blocking(move || {
-        // The frame a video's thumbnail comes from, as the crops are cut from.
-        let still = st.storage.still(&hex::encode(sha), &ext, kind)?;
-        let img = still.ok_or_else(|| {
-            AppError::BadRequest("this post has no picture to find people in".into())
-        })?;
+        let sha = hex::encode(sha);
+        // A big picture's sample, when it holds as many pixels as the models
+        // see: much less to decode than the original. Else the frame a
+        // video's thumbnail comes from, as the crops are cut from.
+        let sample = (has_sample == Some(true))
+            .then(|| st.storage.sample(&sha))
+            .flatten()
+            .filter(|s| s.width().max(s.height()) >= PICTURE_SIZE.min(long_side));
+        let img = match sample {
+            Some(sample) => sample,
+            None => st.storage.still(&sha, &ext, kind)?.ok_or_else(|| {
+                AppError::BadRequest("this post has no picture to find people in".into())
+            })?,
+        };
         let image = if img.width().max(img.height()) > PICTURE_SIZE {
             img.resize(PICTURE_SIZE, PICTURE_SIZE, FilterType::CatmullRom)
         } else {
@@ -235,8 +254,7 @@ async fn find(state: &AppState, route: &Route, post_id: i64) -> AppResult<Found>
     fill_franchises(state, &mut figures).await?;
     // Read left to right, as people are named in a caption.
     figures.sort_by_key(|f| f.face.map_or(u16::MAX, |b| b.x));
-    figures.truncate(MAX_FIGURES);
-    let figures = clean_figures(figures).map_err(AppError::internal)?;
+    let figures = clean_each(figures);
     Ok(Found {
         figures,
         model,
@@ -244,14 +262,42 @@ async fn find(state: &AppState, route: &Route, post_id: i64) -> AppResult<Found>
     })
 }
 
+/// Waits at most `wait` for the people tool's turn: one picture at a time,
+/// uploads and requests alike, as each decodes a picture and runs the
+/// tagger a few times or asks a paid provider.
+async fn turn(state: &AppState, wait: Duration) -> AppResult<SemaphorePermit<'_>> {
+    match tokio::time::timeout(wait, state.people.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(AppError::Internal("finding people is shutting down".into())),
+        Err(_) => Err(AppError::Conflict {
+            code: "ai_busy",
+            message: "the people tool is busy with other pictures; try again in a minute".into(),
+        }),
+    }
+}
+
 /// `POST /posts/{id}/find-people`: the people in a post's picture, each
 /// with a preview of the crop saving it would keep. Nothing is saved.
 pub async fn suggest(state: &AppState, route: &Route, post_id: i64) -> AppResult<FoundPeople> {
+    suggest_within(state, route, post_id, TURN_WAIT).await
+}
+
+/// [`suggest`], waiting at most `wait` for its turn.
+pub(crate) async fn suggest_within(
+    state: &AppState,
+    route: &Route,
+    post_id: i64,
+    wait: Duration,
+) -> AppResult<FoundPeople> {
+    let found = {
+        let _turn = turn(state, wait).await?;
+        find(state, route, post_id).await?
+    };
     let Found {
         mut figures,
         model,
         picture,
-    } = find(state, route, post_id).await?;
+    } = found;
     let boxes: Vec<Option<FaceBox>> = figures.iter().map(|f| f.face).collect();
     let crops = tokio::task::spawn_blocking(move || {
         boxes
@@ -292,7 +338,8 @@ pub async fn find_for_new_post(state: &AppState, post_id: i64) -> AppResult<bool
         return Ok(false);
     }
     let route = ai::route(state, &tool).await?;
-    let _slot = SLOTS
+    let _turn = state
+        .people
         .acquire()
         .await
         .map_err(|_| AppError::Internal("finding people is shutting down".into()))?;

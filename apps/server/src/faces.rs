@@ -136,16 +136,25 @@ async fn crop_post(
     let kind = MediaKind::from_db(kind).unwrap_or(MediaKind::Image);
     let (st, name) = (state.clone(), sha_hex.to_owned());
     let boxes = faces.clone();
-    let crops = tokio::task::spawn_blocking(move || -> AppResult<Vec<(i64, Option<Vec<u8>>)>> {
-        let Some(img) = st.storage.still(&name, &ext, kind)? else {
-            return Ok(boxes.into_iter().map(|(id, _)| (id, None)).collect());
+    let crops = tokio::task::spawn_blocking(move || {
+        // A picture that can't be read, even for want of permission, fails
+        // this post's faces only: the next posts still get theirs.
+        let img = st.storage.still(&name, &ext, kind).unwrap_or_else(|e| {
+            warn!("post {post_id}: its picture can't be read for face crops: {e}");
+            None
+        });
+        let Some(img) = img else {
+            return boxes
+                .into_iter()
+                .map(|(id, _)| (id, None))
+                .collect::<Vec<_>>();
         };
-        Ok(boxes
+        boxes
             .into_iter()
             .map(|(id, face)| (id, face.and_then(|f| cut(&img, f).ok())))
-            .collect())
+            .collect()
     })
-    .await??;
+    .await?;
 
     let mut made = 0u64;
     let mut failed = Vec::new();

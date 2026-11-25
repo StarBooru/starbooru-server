@@ -274,6 +274,9 @@ pub(super) struct TagFilter {
     no_colors: Vec<i16>,
     /// Ratings the reader's blacklist leaves out, as stored.
     no_ratings: Vec<i16>,
+    /// The tags the reader's blacklist leaves out of this search (`none`
+    /// has them with the search's own exclusions).
+    pub(super) hidden: Vec<i64>,
 }
 
 impl TagFilter {
@@ -306,9 +309,12 @@ impl TagFilter {
     }
 
     fn leave_out(&mut self, tags: Vec<i64>, ratings: Vec<i16>) {
-        self.none.extend(tags);
+        self.none.extend(tags.iter().copied());
         self.none.sort_unstable();
         self.none.dedup();
+        self.hidden.extend(tags);
+        self.hidden.sort_unstable();
+        self.hidden.dedup();
         self.no_ratings.extend(ratings);
     }
 }

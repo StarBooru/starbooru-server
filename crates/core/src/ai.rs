@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ai_catalog::{AiMode, AiPreset, AiTool};
 use crate::ai_worker::FoundTag;
-use crate::figure::{Figure, FigureKind, MAX_FIGURES, Slot, clean_figures};
+use crate::figure::{Figure, FigureKind, MAX_FIGURES, Slot, clean_each};
 use crate::local_ai::Hardware;
 use crate::model::{Rating, TagCategory};
 use crate::tag::normalize_tag;
@@ -461,8 +461,13 @@ pub(crate) fn model_figure(item: &serde_json::Value) -> Option<Figure> {
             .take(crate::figure::MAX_FIGURE_TAGS);
         figure.tags.entry(slot).or_default().extend(names);
     }
-    // Over the tag limit: keep a fair share of each slot.
-    while figure.tags.values().map(Vec::len).sum::<usize>() > crate::figure::MAX_FIGURE_TAGS {
+    // Over the tag limit, which counts the names too: keep a fair share of
+    // each slot.
+    let named = usize::from(figure.character.is_some())
+        + usize::from(figure.cosplay.is_some())
+        + usize::from(figure.franchise.is_some());
+    let room = crate::figure::MAX_FIGURE_TAGS.saturating_sub(named);
+    while figure.tags.values().map(Vec::len).sum::<usize>() > room {
         let Some(longest) = figure.tags.values_mut().max_by_key(|v| v.len()) else {
             break;
         };
@@ -482,7 +487,7 @@ fn model_figures(value: &serde_json::Value) -> Vec<Figure> {
         .filter_map(model_figure)
         .collect();
     // Every name is already valid, so this only drops duplicates and empties.
-    clean_figures(out).unwrap_or_default()
+    clean_each(out)
 }
 
 /// Reads a model's answer leniently. Accepts the JSON shape the prompt asks
@@ -726,6 +731,16 @@ mod tests {
         ));
         let tags: usize = p.figures[0].tags.values().map(Vec::len).sum();
         assert!(tags <= crate::figure::MAX_FIGURE_TAGS && tags > 0);
+        // Regression: the names count too, and a named person over the
+        // limit took every other person with them.
+        let p = parse_suggestions(&format!(
+            r#"{{"figures":[{{"kind":"girl","character":"saber","franchise":"fate",
+                "hair":[{0}]}},{{"kind":"boy"}}]}}"#,
+            many.join(",")
+        ));
+        assert_eq!(p.figures.len(), 2);
+        assert_eq!(p.figures[0].character.as_deref(), Some("saber"));
+        assert_eq!(p.figures[0].tag_count(), crate::figure::MAX_FIGURE_TAGS);
     }
 
     #[test]

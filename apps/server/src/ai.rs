@@ -391,9 +391,21 @@ async fn save_new_figures(
     if has_figures || !fits {
         return Ok(None);
     }
-    Ok(Some(
-        crate::routes::replace_figures(tx, post_id, figures.to_vec(), true).await?,
-    ))
+    // The franchises filled in and the count tags can still take the post
+    // over its limit: then the people go, back to this point, and the tags
+    // stay.
+    let mut point = sqlx::Acquire::begin(&mut *tx).await?;
+    match crate::routes::replace_figures(&mut point, post_id, figures.to_vec(), true).await {
+        Ok(saved) => {
+            point.commit().await?;
+            Ok(Some(saved))
+        }
+        Err(AppError::BadRequest(_)) => {
+            point.rollback().await?;
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Saves found people on a post that has none yet, through the normal

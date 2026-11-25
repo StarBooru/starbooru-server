@@ -31,6 +31,7 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
@@ -69,41 +70,61 @@ struct WebApp {
     dir: PathBuf,
     files: ServeDir,
     page: RwLock<Page>,
+    /// Held while a request prepares a new page, so the others answer with
+    /// the old one meanwhile instead of each preparing it too.
+    preparing: tokio::sync::Mutex<()>,
 }
 
-/// `index.html` with the preloads added, and when the file was written.
+/// What `index.html` was when its page was prepared. Its content counts:
+/// a new file can have the old one's time and size (`cp -p`, `rsync -t`,
+/// tarballs built to be reproducible).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    modified: Option<SystemTime>,
+    len: u64,
+    hash: [u8; 32],
+}
+
+/// `index.html` with the preloads added.
 #[derive(Clone)]
 struct Page {
-    modified: Option<SystemTime>,
+    stamp: Stamp,
     html: Arc<str>,
 }
 
+/// `index.html` as it is now, with its stamp; `None` when it is gone, too
+/// large or can't be read.
+fn read_index(dir: &Path) -> Option<(Stamp, Vec<u8>)> {
+    let path = dir.join("index.html");
+    let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    let bytes = read_capped(&path, MAX_PAGE_BYTES)?;
+    let stamp = Stamp {
+        modified,
+        len: bytes.len() as u64,
+        hash: Sha256::digest(&bytes).into(),
+    };
+    Some((stamp, bytes))
+}
+
 impl Page {
-    fn read(dir: &Path) -> Option<Page> {
-        let path = dir.join("index.html");
-        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        let page =
-            read_capped(&path, MAX_PAGE_BYTES).and_then(|bytes| String::from_utf8(bytes).ok())?;
+    fn prepare(dir: &Path, stamp: Stamp, bytes: Vec<u8>) -> Option<Page> {
+        let page = String::from_utf8(bytes).ok()?;
         Some(Page {
-            modified,
+            stamp,
             html: with_preloads(&page, dir).into(),
         })
+    }
+
+    fn read(dir: &Path) -> Option<Page> {
+        let (stamp, bytes) = read_index(dir)?;
+        Self::prepare(dir, stamp, bytes)
     }
 }
 
 /// The service that answers every path the API doesn't. `None` when the
 /// directory has no `index.html`.
 pub fn service(dir: &Path) -> Option<Router> {
-    let page = Page::read(dir)?;
-    let app = Arc::new(WebApp {
-        dir: dir.to_path_buf(),
-        // The page comes from `page`, so a directory is just not found.
-        files: ServeDir::new(dir)
-            .precompressed_br()
-            .precompressed_gzip()
-            .append_index_html_on_directories(false),
-        page: RwLock::new(page),
-    });
+    let app = Arc::new(WebApp::open(dir)?);
     Some(
         Router::new()
             .fallback(move |req: Request| {
@@ -115,6 +136,19 @@ pub fn service(dir: &Path) -> Option<Router> {
 }
 
 impl WebApp {
+    fn open(dir: &Path) -> Option<Self> {
+        Some(Self {
+            dir: dir.to_path_buf(),
+            // The page comes from `page`, so a directory is just not found.
+            files: ServeDir::new(dir)
+                .precompressed_br()
+                .precompressed_gzip()
+                .append_index_html_on_directories(false),
+            page: RwLock::new(Page::read(dir)?),
+            preparing: tokio::sync::Mutex::new(()),
+        })
+    }
+
     async fn serve(&self, req: Request) -> Response {
         let path = req.uri().path().to_owned();
         let reads = matches!(*req.method(), Method::GET | Method::HEAD);
@@ -144,24 +178,38 @@ impl WebApp {
         response
     }
 
+    fn kept(&self) -> Page {
+        self.page
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// The page as it was prepared, again when `index.html` has changed: a
     /// bundle unpacked over the old one needs no restart.
     async fn current(&self) -> Arc<str> {
-        let kept = self
-            .page
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let modified = tokio::fs::metadata(self.dir.join("index.html"))
-            .await
-            .and_then(|m| m.modified())
-            .ok();
-        if modified.is_none() || modified == kept.modified {
+        let kept = self.kept();
+        let dir = self.dir.clone();
+        // Gone or too large: the page it had still works better than none.
+        let Ok(Some((stamp, bytes))) = tokio::task::spawn_blocking(move || read_index(&dir)).await
+        else {
+            return kept.html;
+        };
+        if stamp == kept.stamp {
             return kept.html;
         }
+        let Ok(_preparing) = self.preparing.try_lock() else {
+            return kept.html;
+        };
+        // Another request may have prepared it while this one read the file.
+        let latest = self.kept();
+        if latest.stamp == stamp {
+            return latest.html;
+        }
         let dir = self.dir.clone();
-        // Half-written or gone: the page it had still works better than none.
-        let Ok(Some(fresh)) = tokio::task::spawn_blocking(move || Page::read(&dir)).await else {
+        // Half-written: tried again on the next request.
+        let prepared = tokio::task::spawn_blocking(move || Page::prepare(&dir, stamp, bytes));
+        let Ok(Some(fresh)) = prepared.await else {
             return kept.html;
         };
         let html = fresh.html.clone();
@@ -660,6 +708,53 @@ mod tests {
                 .unwrap()
                 .contains("<title>Next</title>")
         );
+    }
+
+    /// Regression: a new page with the old one's time and size, as `cp -p`
+    /// or a reproducible tarball leaves it, was never seen.
+    #[tokio::test]
+    async fn a_new_page_with_the_old_time_and_size_is_seen() {
+        let dir = bundle();
+        let app = service(dir.path()).unwrap();
+        let index = dir.path().join("index.html");
+        let old = std::fs::read_to_string(&index).unwrap();
+        let written = std::fs::metadata(&index).unwrap().modified().unwrap();
+        let (_, body) = get(&app, "/", None).await;
+        assert!(
+            String::from_utf8(body)
+                .unwrap()
+                .contains("<title>StarBooru</title>")
+        );
+        let new = old.replace("<title>StarBooru</title>", "<title>NextBooru</title>");
+        assert_eq!(new.len(), old.len());
+        std::fs::write(&index, &new).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&index)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+        let (_, body) = get(&app, "/post/12", None).await;
+        assert!(
+            String::from_utf8(body)
+                .unwrap()
+                .contains("<title>NextBooru</title>")
+        );
+    }
+
+    /// Regression: after a change every request at the same time prepared
+    /// the page again; now one does, and the others answer with the old one.
+    #[tokio::test]
+    async fn one_request_prepares_a_new_page() {
+        let dir = bundle();
+        let app = WebApp::open(dir.path()).unwrap();
+        let index = dir.path().join("index.html");
+        std::fs::write(&index, "<html><head><title>Next</title></head></html>").unwrap();
+        let preparing = app.preparing.try_lock().unwrap();
+        assert!(app.current().await.contains("<title>StarBooru</title>"));
+        drop(preparing);
+        assert!(app.current().await.contains("<title>Next</title>"));
+        assert!(app.current().await.contains("<title>Next</title>"));
     }
 
     #[tokio::test]

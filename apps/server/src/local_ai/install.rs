@@ -34,23 +34,34 @@ const RUNTIME_PACKAGE_SIZE: u64 = 159_626_394;
 struct RuntimePin {
     os: &'static str,
     arch: &'static str,
-    /// The library's path in the package.
-    member: &'static str,
-    library_sha256: &'static str,
+    library: Member,
+}
+
+/// A file in a package: its path there, and what it unpacks to.
+struct Member {
+    path: &'static str,
+    sha256: &'static str,
+    size: u64,
 }
 
 const RUNTIMES: &[RuntimePin] = &[
     RuntimePin {
         os: "linux",
         arch: "x86_64",
-        member: "runtimes/linux-x64/native/libonnxruntime.so",
-        library_sha256: "a96f132e5eb5ca04e23a7d2fc1078fb95aa591e8d71d0f237702ece3a1e0f4ea",
+        library: Member {
+            path: "runtimes/linux-x64/native/libonnxruntime.so",
+            sha256: "a96f132e5eb5ca04e23a7d2fc1078fb95aa591e8d71d0f237702ece3a1e0f4ea",
+            size: 29_345_384,
+        },
     },
     RuntimePin {
         os: "linux",
         arch: "aarch64",
-        member: "runtimes/linux-arm64/native/libonnxruntime.so",
-        library_sha256: "7e17c55d675be73f67a218dbecb55522395f61dafb3da03ebc7ade56a4c2f813",
+        library: Member {
+            path: "runtimes/linux-arm64/native/libonnxruntime.so",
+            sha256: "7e17c55d675be73f67a218dbecb55522395f61dafb3da03ebc7ade56a4c2f813",
+            size: 25_266_408,
+        },
     },
 ];
 
@@ -72,7 +83,7 @@ pub async fn install_runtime(library: &Path) -> Result<(), String> {
         ));
     };
     let current = sha256_of(library.to_path_buf()).await;
-    if current.is_ok_and(|hash| hash == pin.library_sha256) {
+    if current.is_ok_and(|hash| hash == pin.library.sha256) {
         return Ok(());
     }
     let package = Package {
@@ -82,7 +93,7 @@ pub async fn install_runtime(library: &Path) -> Result<(), String> {
         sha256: RUNTIME_PACKAGE_SHA256.to_owned(),
         size: RUNTIME_PACKAGE_SIZE,
     };
-    fetch_runtime(&package, pin.member, pin.library_sha256, library)
+    fetch_runtime(&package, &pin.library, library)
         .await
         .map_err(|e| {
             warn!("downloading the AI runtime failed: {e}");
@@ -98,16 +109,11 @@ struct Package {
     size: u64,
 }
 
-/// Puts `member` of the package at `library`, checked against
-/// `library_sha256`. Only the library's bytes are fetched when the server
-/// sends ranges (12 MB of a 160 MB package); otherwise the whole package,
-/// checked against its own hash.
-async fn fetch_runtime(
-    package: &Package,
-    member: &str,
-    library_sha256: &str,
-    library: &Path,
-) -> AppResult<()> {
+/// Puts `member` of the package at `library`, checked against its size and
+/// hash. Only the library's bytes are fetched when the server sends ranges
+/// (12 MB of a 160 MB package); otherwise the whole package, checked
+/// against its own hash.
+async fn fetch_runtime(package: &Package, member: &Member, library: &Path) -> AppResult<()> {
     let dir = library
         .parent()
         .ok_or_else(|| AppError::Internal("the AI runtime has no folder".into()))?;
@@ -122,7 +128,7 @@ async fn fetch_runtime(
             false
         }
     };
-    let ranged = ranged && sha256_of(unpacked.clone()).await? == library_sha256;
+    let ranged = ranged && sha256_of(unpacked.clone()).await? == member.sha256;
     if !ranged {
         let archive = dir.join("package.zip");
         let part = dir.join("package.zip.part");
@@ -135,13 +141,18 @@ async fn fetch_runtime(
             |_| {},
         )
         .await?;
-        let (from, to, name) = (archive.clone(), unpacked.clone(), member.to_owned());
-        let found = tokio::task::spawn_blocking(move || unzip_file(&from, &name, &to))
+        let (from, to, name, size) = (
+            archive.clone(),
+            unpacked.clone(),
+            member.path.to_owned(),
+            member.size,
+        );
+        let found = tokio::task::spawn_blocking(move || unzip_file(&from, &name, size, &to))
             .await
             .map_err(AppError::internal)?
             .map_err(|e| write_error(&e));
         let _ = tokio::fs::remove_file(&archive).await;
-        if !found? || sha256_of(unpacked.clone()).await? != library_sha256 {
+        if !found? || sha256_of(unpacked.clone()).await? != member.sha256 {
             let _ = tokio::fs::remove_file(&unpacked).await;
             return Err(AppError::Upstream(
                 "the AI runtime is not the expected one".into(),
@@ -211,15 +222,26 @@ fn zip_entry(directory: &[u8], member: &str) -> Option<(u16, u64, u64)> {
     None
 }
 
-/// Writes a ZIP member's packed bytes out, stored or deflated. Whether it
-/// knew the compression.
-fn unpack(method: u16, data: impl Read, dest: &Path) -> std::io::Result<bool> {
+/// Writes a ZIP member's packed bytes out, stored or deflated, and at most
+/// `size` of them: the packed bytes of a ranged read aren't checked before
+/// they are unpacked, and a few could inflate to fill the disk. Whether it
+/// knew the compression and the member kept to its size.
+fn unpack(method: u16, data: impl Read, size: u64, dest: &Path) -> std::io::Result<bool> {
+    let cap = size.saturating_add(1);
     let mut out = std::fs::File::create(dest)?;
-    match method {
-        0 => std::io::copy(&mut { data }, &mut out)?,
-        8 => std::io::copy(&mut flate2::read::DeflateDecoder::new(data), &mut out)?,
+    let written = match method {
+        0 => std::io::copy(&mut data.take(cap), &mut out)?,
+        8 => std::io::copy(
+            &mut flate2::read::DeflateDecoder::new(data).take(cap),
+            &mut out,
+        )?,
         _ => return Ok(false),
     };
+    if written > size {
+        drop(out);
+        let _ = std::fs::remove_file(dest);
+        return Ok(false);
+    }
     Ok(true)
 }
 
@@ -250,7 +272,8 @@ async fn range(url: &str, from: u64, to: u64) -> AppResult<Option<Vec<u8>>> {
 
 /// Copies one file out of a ZIP on a server that sends ranges to `dest`,
 /// fetching only its directory and that file. Whether it could.
-async fn fetch_member(package: &Package, member: &str, dest: &Path) -> AppResult<bool> {
+async fn fetch_member(package: &Package, member: &Member, dest: &Path) -> AppResult<bool> {
+    let (full_size, member) = (member.size, member.path);
     let url = package.url.as_str();
     let tail_start = package.size.saturating_sub(ZIP_TAIL);
     let Some(tail) = range(url, tail_start, package.size).await? else {
@@ -278,15 +301,16 @@ async fn fetch_member(package: &Package, member: &str, dest: &Path) -> AppResult
         return Ok(false);
     };
     let dest = dest.to_path_buf();
-    tokio::task::spawn_blocking(move || unpack(method, data.as_slice(), &dest))
+    tokio::task::spawn_blocking(move || unpack(method, data.as_slice(), full_size, &dest))
         .await
         .map_err(AppError::internal)?
         .map_err(|e| write_error(&e))
 }
 
 /// Copies one file out of a ZIP (a NuGet package) to `dest`, stored or
-/// deflated. Whether it was there.
-fn unzip_file(archive: &Path, member: &str, dest: &Path) -> std::io::Result<bool> {
+/// deflated, at most `full_size` bytes of it. Whether it was there, at
+/// most that size.
+fn unzip_file(archive: &Path, member: &str, full_size: u64, dest: &Path) -> std::io::Result<bool> {
     use std::io::{Seek, SeekFrom};
     let mut file = std::fs::File::open(archive)?;
     let len = file.metadata()?.len();
@@ -311,7 +335,7 @@ fn unzip_file(archive: &Path, member: &str, dest: &Path) -> std::io::Result<bool
         return Ok(false);
     };
     file.seek(SeekFrom::Start(start))?;
-    unpack(method, file.take(packed), dest)
+    unpack(method, file.take(packed), full_size, dest)
 }
 
 pub fn component_dir(models: &Path, component: &Component) -> PathBuf {
@@ -750,11 +774,41 @@ mod tests {
         )
         .unwrap();
         let member = "runtimes/linux-x64/native/libonnxruntime.so";
-        assert!(unzip_file(&archive, member, &dest).unwrap());
+        let size = library.len() as u64;
+        assert!(unzip_file(&archive, member, size, &dest).unwrap());
         assert_eq!(std::fs::read(&dest).unwrap(), library);
-        assert!(unzip_file(&archive, "stored.txt", &dest).unwrap());
+        assert!(unzip_file(&archive, "stored.txt", 5, &dest).unwrap());
         assert_eq!(std::fs::read(&dest).unwrap(), b"as is");
-        assert!(!unzip_file(&archive, "missing", &dest).unwrap());
+        assert!(!unzip_file(&archive, "missing", 5, &dest).unwrap());
+    }
+
+    /// Regression: a member was inflated without a limit, so a few packed
+    /// bytes from a ranged read could fill the disk before its hash failed.
+    #[test]
+    fn a_member_larger_than_pinned_is_cut_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("lib");
+        let huge = vec![0u8; 4 << 20];
+        let mut packed = flate2::write::DeflateEncoder::new(Vec::new(), Default::default());
+        std::io::Write::write_all(&mut packed, &huge).unwrap();
+        let packed = packed.finish().unwrap();
+        assert!(packed.len() < 10_000);
+        assert!(!unpack(8, packed.as_slice(), 1_000, &dest).unwrap());
+        assert!(!dest.exists());
+        assert!(!unpack(0, huge.as_slice(), 1_000, &dest).unwrap());
+        assert!(!dest.exists());
+        // The pinned size itself is fine.
+        assert!(unpack(8, packed.as_slice(), huge.len() as u64, &dest).unwrap());
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), huge.len() as u64);
+    }
+
+    /// A pin for `contents` at `path`, as the real ones are.
+    fn pin(path: &'static str, contents: &[u8]) -> Member {
+        Member {
+            path,
+            sha256: Box::leak(digest(contents).into_boxed_str()),
+            size: contents.len() as u64,
+        }
     }
 
     /// Serves `body` at `/p`, answering ranges when `ranges` is set, and
@@ -815,7 +869,7 @@ mod tests {
                 sha256: digest(&package),
                 size: package.len() as u64,
             };
-            fetch_runtime(&pinned, member, &digest(&library), &dest)
+            fetch_runtime(&pinned, &pin(member, &library), &dest)
                 .await
                 .unwrap();
             assert_eq!(std::fs::read(&dest).unwrap(), library);
@@ -832,8 +886,18 @@ mod tests {
                 .collect();
             assert_eq!(left, ["lib.so"]);
             // A library that isn't the pinned one is refused, either way.
-            let wrong = fetch_runtime(&pinned, member, &digest(b"other"), &dest).await;
+            let wrong = fetch_runtime(&pinned, &pin(member, b"other"), &dest).await;
             assert!(wrong.is_err());
+            // So is one larger than its pin, and none of it is left.
+            let short = Member {
+                size: library.len() as u64 - 1,
+                ..pin(member, &library)
+            };
+            assert!(fetch_runtime(&pinned, &short, &dest).await.is_err());
+            let left = std::fs::read_dir(dir.path().join("runtime"))
+                .unwrap()
+                .count();
+            assert_eq!(left, 1);
         }
     }
 
@@ -846,14 +910,14 @@ mod tests {
             let mut bad = good.clone();
             bad.truncate(cut);
             std::fs::write(&archive, &bad).unwrap();
-            let _ = unzip_file(&archive, "a", &dest);
+            let _ = unzip_file(&archive, "a", 8, &dest);
         }
         // Offsets pointing anywhere.
         for flip in 0..good.len() {
             let mut bad = good.clone();
             bad[flip] ^= 0xff;
             std::fs::write(&archive, &bad).unwrap();
-            let _ = unzip_file(&archive, "a", &dest);
+            let _ = unzip_file(&archive, "a", 8, &dest);
         }
     }
 
@@ -871,6 +935,10 @@ mod tests {
             .iter()
             .find(|r| r.arch == std::env::consts::ARCH)
             .unwrap();
-        assert_eq!(sha256_of(library).await.unwrap(), pin.library_sha256);
+        assert_eq!(
+            sha256_of(library.clone()).await.unwrap(),
+            pin.library.sha256
+        );
+        assert_eq!(std::fs::metadata(&library).unwrap().len(), pin.library.size);
     }
 }

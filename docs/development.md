@@ -24,7 +24,7 @@ Migrations run at startup. The first account you register becomes admin.
 
 To serve a web app's bundle from the server, set `STARBOORU_WEB_DIR` to its folder. `cargo run -p starbooru-server -- precompress <dir>` writes `.br` and `.gz` copies beside its files. It's optional: without them the server compresses each file as it sends it.
 
-Local AI needs the worker: `cargo build -p starbooru-ai-worker` (`target/debug/` is next to the server). The server downloads the pinned ONNX Runtime into `<data>/ai/runtime/` by itself on Linux x86-64 and ARM64. It comes from Microsoft's NuGet package, as in the `Dockerfile`: the server reads just the library out of it with range requests (about 12 MB) and checks the library's SHA-256, or downloads the whole package (160 MB) and checks that when ranges don't work. Elsewhere, point `STARBOORU_ORT_LIB` at a `libonnxruntime` 1.31.
+Local AI needs the worker: `cargo build -p starbooru-ai-worker` (`target/debug/` is next to the server). The server downloads the pinned ONNX Runtime into `<data>/ai/runtime/` by itself on Linux x86-64 and ARM64. It comes from Microsoft's NuGet package, as in the `Dockerfile`: the server reads just the library out of it with range requests (about 12 MB), unpacks no more than its pinned size and checks its SHA-256, or downloads the whole package (160 MB) and checks that when ranges don't work. Elsewhere, point `STARBOORU_ORT_LIB` at a `libonnxruntime` 1.31.
 
 ## Tests and lints
 

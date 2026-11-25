@@ -13,6 +13,15 @@ use crate::model::MediaKind;
 /// Shortest clip a trim may leave.
 pub const MIN_TRIM_MS: i64 = 100;
 
+/// Furthest into a video its still frame is taken.
+pub const STILL_MAX_MS: i64 = 5_000;
+
+/// Where a video's still frame is, the one its thumbnail and the crops of
+/// its faces come from: a tenth of the way in, at most [`STILL_MAX_MS`].
+pub fn still_at_ms(duration_ms: i64) -> i64 {
+    (duration_ms / 10).clamp(0, STILL_MAX_MS)
+}
+
 /// The furthest an image can be straightened either way, in tenths of a
 /// degree: 45°. Past that a quarter turn the other way is closer.
 pub const MAX_STRAIGHTEN: i16 = 450;
@@ -136,10 +145,25 @@ impl MediaEdit {
         turn.cos() + (w / h).max(h / w) * turn.sin()
     }
 
+    /// Whether a video's still frame, where its faces were found, shows the
+    /// same moment after this edit: always for a picture, and after a trim
+    /// only when it keeps the start and the shorter clip takes its frame
+    /// at the same time (both are at least 50 s long).
+    pub fn keeps_still(&self, duration_ms: Option<i64>) -> bool {
+        let Some(trim) = self.trim else {
+            return true;
+        };
+        duration_ms.is_some_and(|whole| {
+            trim.start_ms == 0 && still_at_ms(trim.end_ms) == still_at_ms(whole)
+        })
+    }
+
     /// Where a face box on a `width` × `height` picture (as shown) lands on
     /// the edited picture: turned, flipped, straightened and cropped with
     /// it, and cut to the new edges. `None` when its middle falls outside.
-    /// A straightened box is the upright box around the turned one.
+    /// A straightened box is the upright box around the turned one. A trim
+    /// leaves it where it is, but may change the frame it is on: see
+    /// [`MediaEdit::keeps_still`].
     pub fn move_face(&self, width: u32, height: u32, face: FaceBox) -> Option<FaceBox> {
         let (rotate, flip_h, flip_v) = self.orientation();
         if (rotate, flip_h, flip_v) == (0, false, false)
@@ -551,6 +575,34 @@ mod tests {
                 assert!(edit.move_face(0, 0, face).is_none_or(FaceBox::is_valid));
             }
         }
+    }
+
+    /// Regression: a trim kept the faces, though the frame they were found
+    /// on had moved to another moment.
+    #[test]
+    fn a_trim_keeps_the_faces_only_on_the_same_frame() {
+        let trim = |start_ms, end_ms| MediaEdit {
+            trim: Some(Trim { start_ms, end_ms }),
+            ..MediaEdit::default()
+        };
+        assert_eq!(still_at_ms(4_000), 400);
+        assert_eq!(still_at_ms(600_000), STILL_MAX_MS);
+        assert_eq!(still_at_ms(-5), 0);
+        // Both 50 s or more and from the start: the frame stays at 5 s.
+        assert!(trim(0, 50_000).keeps_still(Some(120_000)));
+        assert!(trim(0, 90_000).keeps_still(Some(100_000)));
+        // Shorter, or cut at the start: another moment.
+        assert!(!trim(0, 49_990).keeps_still(Some(120_000)));
+        assert!(!trim(0, 3_000).keeps_still(Some(4_000)));
+        assert!(!trim(1_000, 90_000).keeps_still(Some(100_000)));
+        assert!(!trim(0, 50_000).keeps_still(None));
+        // A picture's edit has no frame to move.
+        assert!(MediaEdit::default().keeps_still(None));
+        let turned = MediaEdit {
+            rotate: 90,
+            ..MediaEdit::default()
+        };
+        assert!(turned.keeps_still(None));
     }
 
     #[test]

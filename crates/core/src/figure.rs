@@ -234,7 +234,7 @@ impl Figure {
             .collect()
     }
 
-    fn tag_count(&self) -> usize {
+    pub(crate) fn tag_count(&self) -> usize {
         usize::from(self.character.is_some())
             + usize::from(self.cosplay.is_some())
             + usize::from(self.franchise.is_some())
@@ -272,7 +272,8 @@ impl Sent {
     };
 
     /// What each figure of a [`FiguresUpdate`] body sent, in order. A key
-    /// with `null` counts as sent: it clears the field.
+    /// with `null` counts as sent: it clears the field. The server still
+    /// fills in the franchise of a person new to the post.
     pub fn read(body: &serde_json::Value) -> Vec<Sent> {
         body.get("figures")
             .and_then(|f| f.as_array())
@@ -459,6 +460,18 @@ pub fn clean_figures(figures: Vec<Figure>) -> Result<Vec<Figure>, FigureError> {
     Ok(out)
 }
 
+/// [`clean_figures`] one figure at a time, for figures an AI found: one
+/// that can't be saved is left out, not the others with it. At most
+/// [`MAX_FIGURES`].
+pub fn clean_each(figures: Vec<Figure>) -> Vec<Figure> {
+    figures
+        .into_iter()
+        .take(MAX_FIGURES)
+        .filter_map(|figure| clean_figures(vec![figure]).ok())
+        .flatten()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +604,27 @@ mod tests {
             ..Figure::default()
         };
         assert!(matches!(clean_figures(vec![bad]), Err(FigureError::Tag(_))));
+    }
+
+    #[test]
+    fn one_bad_figure_leaves_the_others() {
+        let many: Vec<String> = (0..=MAX_FIGURE_TAGS).map(|i| format!("t{i}")).collect();
+        let full = Figure {
+            tags: BTreeMap::from([(Slot::Other, many)]),
+            ..Figure::default()
+        };
+        let boy = Figure {
+            kind: FigureKind::Boy,
+            character: Some("Link".into()),
+            ..Figure::default()
+        };
+        let kept = clean_each(vec![full, boy, Figure::default()]);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].character.as_deref(), Some("link"));
+        assert_eq!(
+            clean_each(vec![Figure::default(); MAX_FIGURES + 1]).len(),
+            MAX_FIGURES
+        );
     }
 
     #[test]

@@ -376,17 +376,43 @@ fn removable(
     parts
 }
 
+/// What a request to the worker loads: a model's files, or only the face
+/// finders.
+#[derive(Clone, Copy)]
+struct Loads {
+    id: &'static str,
+    name: &'static str,
+    components: &'static [&'static str],
+}
+
+impl From<&'static CatalogModel> for Loads {
+    fn from(model: &'static CatalogModel) -> Self {
+        Self {
+            id: model.id,
+            name: model.name,
+            components: model.components,
+        }
+    }
+}
+
+/// The face finders alone, for an AI provider to describe what they find.
+const FACE_FINDER_FILES: Loads = Loads {
+    id: "face-finders",
+    name: "The face finder",
+    components: FACE_FINDERS,
+};
+
 /// Asks the worker for a model's work. Damaged files are repaired, so the same
 /// error doesn't come back on every request.
 async fn ask(
     ai: &LocalAi,
-    model: &'static CatalogModel,
+    loads: impl Into<Loads>,
     request: &WorkerRequest,
     timeout: Duration,
 ) -> AppResult<WorkerReply> {
     match ai.worker.request(request, timeout).await {
         Err(AppError::Upstream(message)) if message == DAMAGED_MODEL => {
-            Err(repair(ai, model).await)
+            Err(repair(ai, loads.into()).await)
         }
         other => other,
     }
@@ -394,16 +420,16 @@ async fn ask(
 
 /// A model didn't load: removes the files that fail their hash and wakes the
 /// sweep to fetch them. What the caller gets to hear.
-async fn repair(ai: &LocalAi, model: &'static CatalogModel) -> AppError {
-    let uses_opus = model.components.iter().any(|c| c.starts_with("opus-"));
+async fn repair(ai: &LocalAi, loads: Loads) -> AppError {
+    let uses_opus = loads.components.iter().any(|c| c.starts_with("opus-"));
     let parts = COMPONENTS
         .iter()
-        .filter(|c| model.components.contains(&c.id) || (uses_opus && c.id.starts_with("opus-")));
+        .filter(|c| loads.components.contains(&c.id) || (uses_opus && c.id.starts_with("opus-")));
     let mut repairing = false;
     for part in parts {
         if !install::is_installed(&ai.models, part) {
             // Another request got here first.
-            repairing |= model.components.contains(&part.id);
+            repairing |= loads.components.contains(&part.id);
             continue;
         }
         match install::remove_damaged(&ai.models, part).await {
@@ -415,13 +441,13 @@ async fn repair(ai: &LocalAi, model: &'static CatalogModel) -> AppError {
         return AppError::Upstream("the model doesn't load".into());
     }
     warn!(
-        model = model.id,
+        model = loads.id,
         "an AI model was damaged, downloading it again"
     );
     ai.wake();
     AppError::Conflict {
         code: "ai_unavailable",
-        message: format!("{} was damaged and is downloading again", model.name),
+        message: format!("{} was damaged and is downloading again", loads.name),
     }
 }
 
@@ -804,7 +830,8 @@ pub async fn faces(state: &AppState, jpeg: &[u8]) -> Option<Vec<FoundFace>> {
         gpu: false,
         jpeg: encoded(jpeg),
     };
-    match ai.worker.request(&request, ANSWER_TIMEOUT).await {
+    // Through `ask`, so damaged files are fetched again in API mode too.
+    match ask(ai, FACE_FINDER_FILES, &request, ANSWER_TIMEOUT).await {
         Ok(WorkerReply::Faces { faces }) => Some(faces),
         Ok(_) => None,
         Err(e) => {
@@ -1080,6 +1107,18 @@ pub(crate) fn mark_all_installed(ai: &LocalAi, model: &CatalogModel) {
     for part in model.parts() {
         install::mark_installed(&ai.models, part);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn mark_face_finders_installed(ai: &LocalAi) {
+    for part in face_finders() {
+        install::mark_installed(&ai.models, part);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn face_finders_installed(ai: &LocalAi) -> bool {
+    face_finders().all(|c| install::is_installed(&ai.models, c))
 }
 
 #[cfg(test)]

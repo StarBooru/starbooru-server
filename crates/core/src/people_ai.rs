@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ai_worker::{FoundPerson, FoundTag};
 use crate::figure::{
-    FACE_SCALE, FaceBox, Figure, FigureKind, MAX_FIGURES, Slot, clean_figures, cosplay_name,
+    FACE_SCALE, FaceBox, Figure, FigureKind, MAX_FIGURE_TAGS, MAX_FIGURES, Slot, clean_each,
+    cosplay_name,
 };
 use crate::model::TagCategory;
 use crate::tag::normalize_tag;
@@ -658,8 +659,8 @@ pub fn franchise_hint(character: &str) -> Option<String> {
 /// saved; `PUT /posts/{id}/figures` saves what the user keeps.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FoundPeople {
-    /// One figure per person found, largest face first, each with its face
-    /// box. Its `face_url` is a `data:image/jpeg;base64,…` URL of the crop
+    /// One figure per person found, left to right, each with its face box.
+    /// Its `face_url` is a `data:image/jpeg;base64,…` URL of the crop
     /// saving it would keep, as nothing is stored yet.
     pub figures: Vec<Figure>,
     /// The model that found them.
@@ -756,7 +757,7 @@ pub fn parse_people(answer: &str, faces: &[FaceBox]) -> Vec<Figure> {
             break;
         }
     }
-    clean_figures(out).unwrap_or_default()
+    clean_each(out)
 }
 
 /// The franchise for each character the people found are, by name: what
@@ -770,6 +771,10 @@ pub fn franchises(
     series: &HashMap<String, String>,
 ) {
     for figure in figures.iter_mut().filter(|f| f.franchise.is_none()) {
+        // A figure with no room left for a tag goes without one.
+        if figure.tag_count() >= MAX_FIGURE_TAGS {
+            continue;
+        }
         let Some(who) = figure.cosplay.clone().or_else(|| figure.character.clone()) else {
             continue;
         };
@@ -1318,5 +1323,49 @@ mod tests {
         let figures = parse_people(answer, &[]);
         assert_eq!(figures.len(), 1);
         assert_eq!(figures[0].face, Some(face(100, 200, 50, 60)));
+    }
+
+    /// Regression: a person with a full list of tags and a name went over
+    /// the limit, and every person of the answer was dropped with them.
+    #[test]
+    fn a_long_answer_keeps_its_people_under_the_limit() {
+        let many: Vec<String> = (0..MAX_FIGURE_TAGS + 10).map(|i| format!("t{i}")).collect();
+        let answer = serde_json::json!({ "figures": [
+            { "box": 1, "kind": "girl", "character": "saber_(fate)", "cosplay": "rin",
+              "franchise": "fate", "other": many },
+            { "box": 2, "kind": "boy", "hair": ["short_hair"] },
+        ]})
+        .to_string();
+        let faces = [face(0, 0, 100, 100), face(500, 0, 100, 100)];
+        let figures = parse_people(&answer, &faces);
+        assert_eq!(figures.len(), 2, "{figures:?}");
+        let full = &figures[0];
+        assert_eq!(full.character.as_deref(), Some("saber_(fate)"));
+        assert_eq!(full.franchise.as_deref(), Some("fate"));
+        assert_eq!(full.tag_count(), MAX_FIGURE_TAGS);
+        assert_eq!(figures[1].tags[&Slot::Hair], ["short_hair"]);
+    }
+
+    /// Regression: a franchise filled in on a full person took them over
+    /// the limit, and finding people failed.
+    #[test]
+    fn a_full_person_gets_no_franchise() {
+        let full = Figure {
+            character: Some("lumine_(genshin_impact)".into()),
+            tags: BTreeMap::from([(
+                Slot::Other,
+                (1..MAX_FIGURE_TAGS).map(|i| format!("t{i}")).collect(),
+            )]),
+            ..Figure::default()
+        };
+        let room = Figure {
+            tags: BTreeMap::from([(Slot::Other, vec!["smile".to_owned()])]),
+            ..full.clone()
+        };
+        let mut figures = vec![full, room];
+        franchises(&mut figures, &HashMap::new(), &HashMap::new());
+        assert_eq!(figures[0].franchise, None);
+        assert_eq!(figures[1].franchise.as_deref(), Some("genshin_impact"));
+        assert_eq!(clean_each(figures).len(), 2);
     }
 }

@@ -117,12 +117,15 @@ pub async fn edit(
     .await?;
     let mut figures = super::figures::load(&state.db, id).await?;
     if !figures.is_empty() {
-        // Faces move with the picture; one cut off loses its box.
+        // Faces move with the picture; one cut off loses its box, and so
+        // does every face of a trim whose frame is another moment.
         let side = |v: Option<i32>| v.and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
         let (width, height) = (side(post.width), side(post.height));
+        let same_frame = req.keeps_still(post.duration_ms);
         for figure in &mut figures {
             figure.face = figure
                 .face
+                .filter(|_| same_frame)
                 .and_then(|face| req.move_face(width, height, face));
         }
         let mut tx = state.db.begin().await?;
@@ -282,6 +285,58 @@ mod tests {
         assert!(cut["thumb_url"].is_string());
         let original = app.get(&format!("/api/v1/posts/{id}"), &t).await.json();
         assert_eq!(original["deleted"], true);
+        app.finish().await;
+    }
+
+    /// Regression: a trim kept the people's face boxes, though the frame
+    /// their faces were cut from is another moment of the trimmed clip.
+    #[tokio::test]
+    async fn a_trim_keeps_faces_only_on_the_same_frame() {
+        let Some(tools) = crate::probe::tests::tools() else {
+            return;
+        };
+        let Some(app) = testing::app_with(|c| c.tools = Some(tools)).await else {
+            return;
+        };
+        let t = app.register("admin").await;
+        let src = tempfile::tempdir().unwrap();
+        let Some(clip) = crate::probe::tests::generate(
+            src.path(),
+            "long.webm",
+            "testsrc=duration=60:size=32x24:rate=2",
+            &["-c:v", "libvpx-vp9", "-g", "2", "-deadline", "realtime"],
+        ) else {
+            return app.finish().await;
+        };
+        let id = app.upload(&t, &clip, &[("tags", "clip")]).await.json()["id"]
+            .as_i64()
+            .unwrap();
+        let face = json!({ "x": 100, "y": 200, "w": 300, "h": 400 });
+        let r = app
+            .call(
+                Method::PUT,
+                &format!("/api/v1/posts/{id}/figures"),
+                Some(&t),
+                Some(json!({ "figures": [{ "kind": "girl", "face": face }] })),
+            )
+            .await;
+        assert_eq!(r.status, 200, "{:?}", r.json());
+        let path = format!("/api/v1/posts/{id}/edit");
+        let trim = |start_ms: i64, end_ms: i64| {
+            let body = json!({ "trim": { "start_ms": start_ms, "end_ms": end_ms } });
+            app.call(Method::POST, &path, Some(&t), Some(body))
+        };
+        // From the start and still 50 s long: the frame stays at 5 s.
+        let r = trim(0, 55_000).await;
+        assert_eq!(r.status, 200, "{:?}", r.json());
+        assert_eq!(r.json()["figures"][0]["face"], face);
+        // Shorter, or cut at the start: the person stays, the face goes.
+        for (start, end) in [(0, 20_000), (2_000, 58_000)] {
+            let r = trim(start, end).await;
+            assert_eq!(r.status, 200, "{:?}", r.json());
+            assert_eq!(r.json()["figures"][0]["kind"], "girl");
+            assert_eq!(r.json()["figures"][0]["face"], serde_json::Value::Null);
+        }
         app.finish().await;
     }
 }

@@ -71,6 +71,9 @@ pub struct Inner {
     pub faces: tokio::sync::Notify,
     /// Woken when characters' franchises may have changed.
     pub franchises: tokio::sync::Notify,
+    /// The people tool's turn: one picture at a time, on upload and on
+    /// request.
+    pub people: tokio::sync::Semaphore,
     pub started_at: DateTime<Utc>,
 }
 
@@ -124,6 +127,7 @@ impl AppState {
             home: HomeCache::default(),
             faces: tokio::sync::Notify::new(),
             franchises: tokio::sync::Notify::new(),
+            people: tokio::sync::Semaphore::new(1),
             started_at: Utc::now(),
         }))
     }

@@ -498,6 +498,18 @@ impl Storage {
         }))
     }
 
+    /// A post's sample, decoded: upright, as it was made from the upright
+    /// original. `None` when it is gone or can't be read. Call from a
+    /// blocking thread.
+    pub fn sample(&self, sha_hex: &str) -> Option<DynamicImage> {
+        let path = self.path_for_file(
+            Variant::Sample,
+            &Self::file_name(Variant::Sample, sha_hex, ""),
+        )?;
+        let bytes = std::fs::read(path).ok()?;
+        decode(&bytes).ok()
+    }
+
     /// The date a stored original carries; `None` when it has none, is gone
     /// or can't be read as media. Only disk errors fail. Videos need the
     /// tools. Call from a blocking thread.

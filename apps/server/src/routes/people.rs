@@ -207,64 +207,97 @@ pub(crate) async fn franchises_by_name(
 pub async fn fill_due(state: &AppState) -> AppResult<u64> {
     let mut done = 0u64;
     loop {
-        // Worked out again after a day.
-        let ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM tags WHERE category = $1 AND post_count > 0 \
-             AND (franchise_checked_at IS NULL \
-                  OR franchise_checked_at < now() - interval '1 day') \
-             ORDER BY franchise_checked_at NULLS FIRST, post_count DESC, id LIMIT $2",
-        )
-        .bind(character())
-        .bind(FILL_BATCH)
-        .fetch_all(&state.db)
-        .await?;
+        let ids = claim_due(state).await?;
         if ids.is_empty() {
             return Ok(done);
         }
         let mut conn = state.db.acquire().await?;
         let found = resolve(&mut conn, &ids).await?;
-        // 0 for none: tag ids start at 1.
-        let franchises: Vec<i64> = ids
-            .iter()
-            .map(|id| found.get(id).copied().unwrap_or(0))
-            .collect();
-        // The best-liked live posts' faces, the best few of each rating.
-        sqlx::query(
-            "UPDATE tags t SET franchise_id = NULLIF(u.f, 0), franchise_checked_at = now(), \
-             face_figures = ARRAY( \
-                 SELECT x.id FROM ( \
-                     SELECT f.id, p.score, p.id AS post, row_number() OVER ( \
-                         PARTITION BY p.rating ORDER BY p.score DESC, p.id DESC) AS n \
-                     FROM figure_tags ft JOIN figures f ON f.id = ft.figure_id \
-                     JOIN posts p ON p.id = f.post_id \
-                     WHERE ft.tag_id = t.id AND ft.slot = $3 AND f.face_sha IS NOT NULL \
-                       AND p.deleted_at IS NULL) x \
-                 WHERE x.n <= $4 ORDER BY x.score DESC, x.post DESC) \
-             FROM unnest($1::bigint[], $2::bigint[]) AS u(id, f) WHERE t.id = u.id",
-        )
-        .bind(&ids)
-        .bind(&franchises)
-        .bind(CHARACTER_SLOT)
-        .bind(FACES_PER_RATING)
-        .execute(&mut *conn)
-        .await?;
+        store(&mut conn, &ids, &found).await?;
         done = done.saturating_add(ids.len() as u64);
     }
 }
 
-/// Has the franchise and faces of the tags `ids`, and of the characters
-/// that have one of them as theirs, worked out again soon: their category,
-/// tree or implications changed.
-pub(super) async fn recheck(state: &AppState, ids: &[i64]) -> AppResult<()> {
+/// Marks a batch of the characters due as being worked out, and returns
+/// them. Anything that has them worked out again meanwhile sets the mark
+/// back to NULL (`recheck`, saving figures, a new crop), which `store`
+/// then leaves alone, so the change isn't lost to a result from before it.
+/// A mark left by a crash is due like any other.
+async fn claim_due(state: &AppState) -> AppResult<Vec<i64>> {
+    Ok(sqlx::query_scalar(
+        "UPDATE tags SET franchise_checked_at = '-infinity' WHERE id IN ( \
+             SELECT id FROM tags WHERE category = $1 AND post_count > 0 \
+             AND (franchise_checked_at IS NULL \
+                  OR franchise_checked_at < now() - interval '1 day') \
+             ORDER BY franchise_checked_at NULLS FIRST, post_count DESC, id LIMIT $2) \
+         RETURNING id",
+    )
+    .bind(character())
+    .bind(FILL_BATCH)
+    .fetch_all(&state.db)
+    .await?)
+}
+
+/// Keeps what `resolve` found for the claimed characters `ids`, with the
+/// faces to show for each, unless one was asked for again since its claim.
+async fn store(conn: &mut PgConnection, ids: &[i64], found: &HashMap<i64, i64>) -> AppResult<()> {
+    // 0 for none: tag ids start at 1.
+    let franchises: Vec<i64> = ids
+        .iter()
+        .map(|id| found.get(id).copied().unwrap_or(0))
+        .collect();
+    // The best-liked live posts' faces, the best few of each rating.
     sqlx::query(
-        "UPDATE tags SET franchise_checked_at = NULL \
-         WHERE (id = ANY($1) OR franchise_id = ANY($1)) AND franchise_checked_at IS NOT NULL",
+        "UPDATE tags t SET franchise_id = NULLIF(u.f, 0), franchise_checked_at = now(), \
+         face_figures = ARRAY( \
+             SELECT x.id FROM ( \
+                 SELECT f.id, p.score, p.id AS post, row_number() OVER ( \
+                     PARTITION BY p.rating ORDER BY p.score DESC, p.id DESC) AS n \
+                 FROM figure_tags ft JOIN figures f ON f.id = ft.figure_id \
+                 JOIN posts p ON p.id = f.post_id \
+                 WHERE ft.tag_id = t.id AND ft.slot = $3 AND f.face_sha IS NOT NULL \
+                   AND p.deleted_at IS NULL) x \
+             WHERE x.n <= $4 ORDER BY x.score DESC, x.post DESC) \
+         FROM unnest($1::bigint[], $2::bigint[]) AS u(id, f) \
+         WHERE t.id = u.id AND t.franchise_checked_at = '-infinity'",
     )
     .bind(ids)
-    .execute(&state.db)
+    .bind(&franchises)
+    .bind(CHARACTER_SLOT)
+    .bind(FACES_PER_RATING)
+    .execute(&mut *conn)
     .await?;
-    state.franchises.notify_one();
     Ok(())
+}
+
+/// Has the franchise and faces of the tags `ids` worked out again soon, with
+/// those of every character whose franchise they may decide: the ones that
+/// have one of them as theirs, imply one of them, or sit below one in the
+/// tree. Their category, tree or implications changed, which has already
+/// been saved: a failure here is logged, and the daily check catches up.
+pub(super) async fn recheck(state: &AppState, ids: &[i64]) {
+    // UNION, not UNION ALL: a tag reached two ways is followed once.
+    let cleared = sqlx::query(
+        "WITH RECURSIVE implying(id, depth) AS ( \
+             SELECT id, 0 FROM unnest($1::bigint[]) AS s(id) \
+             UNION SELECT i.tag_id, implying.depth + 1 FROM tag_implications i \
+             JOIN implying ON i.implied_id = implying.id WHERE implying.depth < $2 \
+         ), below(id, depth) AS ( \
+             SELECT id, 0 FROM unnest($1::bigint[]) AS s(id) \
+             UNION SELECT t.id, below.depth + 1 FROM tags t \
+             JOIN below ON t.parent_id = below.id WHERE below.depth < $2 \
+         ) UPDATE tags SET franchise_checked_at = NULL \
+         WHERE franchise_checked_at IS NOT NULL AND (franchise_id = ANY($1) \
+             OR id IN (SELECT id FROM implying) OR id IN (SELECT id FROM below))",
+    )
+    .bind(ids)
+    .bind(MAX_DEPTH)
+    .execute(&state.db)
+    .await;
+    if let Err(e) = cleared {
+        warn!("characters' franchises weren't marked to work out again: {e}");
+    }
+    state.franchises.notify_one();
 }
 
 /// The background task that keeps characters' franchises worked out:
@@ -440,7 +473,8 @@ async fn pictures(
 }
 
 /// The face of each of the characters `ids` that has one kept on a post the
-/// reader may see: the first of its `face_figures` that is.
+/// reader may see: the first of its `face_figures` that is, and that still
+/// names the character.
 async fn faces(state: &AppState, ids: &[i64], unseen: &Unseen) -> AppResult<HashMap<i64, Picture>> {
     let mut out = HashMap::new();
     if ids.is_empty() {
@@ -451,8 +485,10 @@ async fn faces(state: &AppState, ids: &[i64], unseen: &Unseen) -> AppResult<Hash
          SELECT encode(f.face_sha, 'hex') AS face \
          FROM unnest(c.face_figures) WITH ORDINALITY AS k(id, n) \
          JOIN figures f ON f.id = k.id JOIN posts p ON p.id = f.post_id \
-         WHERE f.face_sha IS NOT NULL",
+         WHERE f.face_sha IS NOT NULL AND EXISTS (SELECT 1 FROM figure_tags ft \
+             WHERE ft.figure_id = f.id AND ft.tag_id = c.id AND ft.slot = ",
     );
+    qb.push_bind(CHARACTER_SLOT).push(")");
     unseen.push_visible(&mut qb);
     qb.push(" ORDER BY k.n LIMIT 1) x WHERE c.id = ANY(")
         .push_bind(ids.to_vec())
@@ -571,16 +607,23 @@ async fn found_people(
         .collect())
 }
 
-/// ` WHERE` a character, and not one the search asks for itself.
+/// ` WHERE` a character, not one the search asks for itself, and not one
+/// the reader's blacklist hides (by name or by franchise) unless the
+/// search names it, as the lists without a search do.
 fn push_characters(qb: &mut QueryBuilder<Postgres>, filter: &TagFilter) {
     qb.push(
         " FROM m CROSS JOIN LATERAL unnest(m.tag_ids) AS u(id) \
          JOIN tags t ON t.id = u.id AND t.category = ",
     )
     .push_bind(character());
-    if !filter.include.is_empty() {
-        qb.push(" WHERE NOT (u.id = ANY(")
-            .push_bind(filter.include.clone())
+    qb.push(" WHERE NOT (u.id = ANY(")
+        .push_bind(filter.include.clone())
+        .push("))");
+    if !filter.hidden.is_empty() {
+        qb.push(" AND NOT (u.id = ANY(")
+            .push_bind(filter.hidden.clone())
+            .push(")) AND NOT (COALESCE(t.franchise_id, 0) = ANY(")
+            .push_bind(filter.hidden.clone())
             .push("))");
     }
 }
@@ -850,6 +893,13 @@ mod tests {
             .collect()
     }
 
+    /// The first person `/people` finds for `q`.
+    async fn person(app: &TestApp, t: &str, q: &str) -> Value {
+        let r = app.get(&format!("/api/v1/people?q={q}"), t).await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        r.json()["people"][0].clone()
+    }
+
     async fn patch_tag(app: &TestApp, t: &str, name: &str, body: Value) {
         let r = app
             .call(
@@ -1041,6 +1091,192 @@ mod tests {
         let r = app.get("/api/v1/people?q=saber", &t).await.json();
         assert_eq!(r["people"][0]["face_url"], Value::Null);
         assert!(r["people"][0]["thumb_url"].is_string());
+        app.finish().await;
+    }
+
+    /// Regression: a character taken off a post kept showing the face of
+    /// the figure that no longer named them, for up to a day.
+    #[tokio::test]
+    async fn a_face_goes_with_the_name_taken_off() {
+        let Some(app) = testing::app().await else {
+            return;
+        };
+        let t = app.register("admin").await;
+        let posts = seed(&app, &t).await;
+        assert!(person(&app, &t, "saber").await["face_url"].is_string());
+        let r = app
+            .call(
+                Method::PATCH,
+                &format!("/api/v1/posts/{}", posts[2]),
+                Some(&t),
+                Some(json!({"tags": ["sky"]})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        assert_eq!(r.json()["figures"][0].get("character"), None);
+        let saber = person(&app, &t, "saber").await;
+        assert_eq!(saber["posts"], 2);
+        assert_eq!(saber["face_url"], Value::Null);
+        assert!(saber["thumb_url"].is_string());
+        // And it is worked out again soon.
+        let checked: bool = sqlx::query_scalar(
+            "SELECT franchise_checked_at IS NOT NULL FROM tags WHERE name = 'saber'",
+        )
+        .fetch_one(app.db())
+        .await
+        .unwrap();
+        assert!(!checked);
+        assert_eq!(super::fill_due(&app.state).await.unwrap(), 1);
+        assert_eq!(person(&app, &t, "saber").await["face_url"], Value::Null);
+        app.finish().await;
+    }
+
+    /// Regression: a change to a tag a character implies, or to one above
+    /// it in the tree, left the character's franchise as it was for a day.
+    #[tokio::test]
+    async fn a_franchise_follows_changes_further_away() {
+        let Some(app) = testing::app().await else {
+            return;
+        };
+        let t = app.register("admin").await;
+        app.upload_png(&t, 1, "miku rin").await;
+        for name in ["miku", "rin"] {
+            patch_tag(&app, &t, name, json!({"category": "character"})).await;
+        }
+        for (tag, implies) in [("miku", "vocal_synth"), ("vocal_synth", "crypton")] {
+            let r = app
+                .call(
+                    Method::POST,
+                    &format!("/api/v1/tags/{tag}/implications"),
+                    Some(&t),
+                    Some(json!({"implies": implies})),
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        }
+        patch_tag(&app, &t, "rin", json!({"parent": "tohsaka_family"})).await;
+        patch_tag(&app, &t, "fate_series", json!({"category": "copyright"})).await;
+        assert_eq!(super::fill_due(&app.state).await.unwrap(), 2);
+        assert_eq!(person(&app, &t, "miku").await["franchise"], Value::Null);
+
+        // Two implications away.
+        patch_tag(&app, &t, "crypton", json!({"category": "copyright"})).await;
+        assert_eq!(super::fill_due(&app.state).await.unwrap(), 1);
+        assert_eq!(person(&app, &t, "miku").await["franchise"], "crypton");
+        // A tag above her moved under a copyright.
+        patch_tag(&app, &t, "tohsaka_family", json!({"parent": "fate_series"})).await;
+        assert_eq!(super::fill_due(&app.state).await.unwrap(), 1);
+        assert_eq!(person(&app, &t, "rin").await["franchise"], "fate_series");
+        app.finish().await;
+    }
+
+    /// Regression: with a search, Explore still showed the people of a
+    /// blacklisted franchise.
+    #[tokio::test]
+    async fn a_search_hides_the_people_the_blacklist_does() {
+        let Some(app) = testing::app().await else {
+            return;
+        };
+        let t = app.register("admin").await;
+        seed(&app, &t).await;
+        let r = app
+            .call(
+                Method::PUT,
+                "/api/v1/auth/blacklist",
+                Some(&t),
+                Some(json!({"entries": ["fate_series"]})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK);
+        // Saber's second post has no `fate_series`, but she is of it.
+        let e = app.get("/api/v1/explore?q=-miku", &t).await.json();
+        assert_eq!(names(&e["people"]), Vec::<String>::new());
+        let r = app
+            .call(
+                Method::PUT,
+                "/api/v1/auth/blacklist",
+                Some(&t),
+                Some(json!({"entries": ["saber"]})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK);
+        let e = app.get("/api/v1/explore?q=fate_series", &t).await.json();
+        assert_eq!(names(&e["people"]), ["rin"]);
+        // What the search names stays, as its posts do.
+        let r = app
+            .call(
+                Method::PUT,
+                "/api/v1/auth/blacklist",
+                Some(&t),
+                Some(json!({"entries": ["fate_series"]})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK);
+        let e = app.get("/api/v1/explore?q=fate_series", &t).await.json();
+        assert_eq!(names(&e["people"]), ["saber", "rin"]);
+        app.finish().await;
+    }
+
+    /// Regression: a change that came while a round was working a
+    /// character out lost to that round's older result, for a day.
+    #[tokio::test]
+    async fn a_change_during_a_round_is_not_lost() {
+        let Some(app) = testing::app().await else {
+            return;
+        };
+        let t = app.register("admin").await;
+        app.upload_png(&t, 1, "miku").await;
+        patch_tag(&app, &t, "miku", json!({"category": "character"})).await;
+        patch_tag(&app, &t, "vocaloid", json!({"category": "copyright"})).await;
+        assert_eq!(super::fill_due(&app.state).await.unwrap(), 1);
+        sqlx::query("UPDATE tags SET franchise_checked_at = NULL WHERE name = 'miku'")
+            .execute(app.db())
+            .await
+            .unwrap();
+
+        // A round takes her, and works out that she has no franchise...
+        let ids = super::claim_due(&app.state).await.unwrap();
+        assert_eq!(ids.len(), 1);
+        let mut conn = app.state.db.acquire().await.unwrap();
+        let found = super::resolve(&mut conn, &ids).await.unwrap();
+        assert!(found.is_empty());
+        // ...while she is given one.
+        let r = app
+            .call(
+                Method::POST,
+                "/api/v1/tags/miku/implications",
+                Some(&t),
+                Some(json!({"implies": "vocaloid"})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        super::store(&mut conn, &ids, &found).await.unwrap();
+        drop(conn);
+        assert_eq!(super::fill_due(&app.state).await.unwrap(), 1);
+        assert_eq!(person(&app, &t, "miku").await["franchise"], "vocaloid");
+        app.finish().await;
+    }
+
+    /// Regression: when marking the characters failed, a tag edit that
+    /// was already saved answered 500.
+    #[tokio::test]
+    async fn a_saved_tag_edit_stays_saved_when_marking_fails() {
+        let Some(app) = testing::app().await else {
+            return;
+        };
+        let t = app.register("admin").await;
+        app.upload_png(&t, 1, "vocaloid").await;
+        for statement in [
+            "CREATE FUNCTION refuse() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'refused'; END $$",
+            "CREATE TRIGGER refuse BEFORE UPDATE OF franchise_checked_at ON tags \
+             FOR EACH STATEMENT EXECUTE FUNCTION refuse()",
+        ] {
+            sqlx::query(statement).execute(app.db()).await.unwrap();
+        }
+        patch_tag(&app, &t, "vocaloid", json!({"category": "copyright"})).await;
+        let r = app.get("/api/v1/tags/vocaloid", &t).await.json();
+        assert_eq!(r["tag"]["category"], "copyright");
         app.finish().await;
     }
 
