@@ -1,6 +1,6 @@
 # Roadmap
 
-_Status as of 2026-11-24. Scope comes from `docs/checklist.md`, and the "Next" sections from the owner's lists of 2026-11-23. They come in this order: updates, private and public instances, people. Releases are no longer betas: the next is v0.2.0, and Cargo's version follows them._
+_Status as of 2026-11-25. Scope comes from `docs/checklist.md`, and the "Next" sections from the owner's lists of 2026-11-23. They come in this order: updates, private and public instances, people. Releases are no longer betas: the next is v0.2.0, and Cargo's version follows them._
 
 The server left the [StarBooru](https://github.com/StarBooru/StarBooru) repository at `v0.1.0-beta.6`, with every feature it had then. That repository is archived, and its `docs/roadmap.md` has the status of each checklist item at the split, apps included.
 
@@ -49,11 +49,11 @@ The owner's answers (2026-11-23): in public mode, people without an account can 
 
 ## Next: people
 
-A figure has a kind, a character, a cosplay flag and tag slots for clothing and looks. It has no franchise and no place in the picture, and no AI finds faces. starbooru-web's `docs/roadmap.md` (section 5) has the app's side.
+A figure has a kind, a character, a franchise, a cosplay flag, tag slots for clothing and looks, and a face box with a kept crop. An AI tool finds the people in a picture. starbooru-web's `docs/roadmap.md` (section 5) has the app's side.
 
-- [ ] An AI tool that finds faces on upload, anime ones included, keeps a crop of each, and fills in the figure: name, franchise, cosplay or not, clothing and looks
-- [ ] A franchise on each figure, from the `copyright` tag category, so people group by franchise
-- [ ] People in Explore, and popular characters in public mode
+- [x] An AI tool that finds faces on upload, anime ones included, keeps a crop of each, and fills in the figure: name, franchise, cosplay or not, clothing and looks
+- [x] A franchise on each figure, from the `copyright` tag category, so people group by franchise
+- [x] People in Explore, and popular characters in public mode
 
 ## Apps
 

@@ -23,8 +23,8 @@ RUN mkdir -p /out/ai \
 
 # The web app, a release of starbooru-web pinned by version and hash, checked against
 # its SHA256SUMS too, and compressed once here rather than on every request.
-ARG WEB_VERSION=0.26.0
-ARG WEB_SHA256=b688650a182544bbcd359627c35ca927acf405d33ac18960d52f3ee447330248
+ARG WEB_VERSION=0.28.0
+ARG WEB_SHA256=026c486f48a5d4a2d42429c90cce30a9446ce0964cf88185cc73af46227746f5
 RUN set -eux; \
     base="https://github.com/StarBooru/starbooru-web/releases/download/v$WEB_VERSION"; \
     file="starbooru-web-$WEB_VERSION.tar.gz"; \
