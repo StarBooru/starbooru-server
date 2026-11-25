@@ -9,6 +9,7 @@ mod bench;
 mod config;
 mod edit;
 mod error;
+mod faces;
 mod fetch;
 mod guests;
 mod local_ai;
@@ -129,6 +130,8 @@ async fn run() -> Result<bool, StartupError> {
     tokio::spawn(local_ai::run(state.clone()));
     tokio::spawn(update::run_checks(state.clone()));
     tokio::spawn(update::run_auto(state.clone()));
+    tokio::spawn(faces::run(state.clone()));
+    tokio::spawn(routes::run_franchises(state.clone()));
     let backfill = state.clone();
     tokio::spawn(async move {
         match avatars::sweep(&backfill).await {

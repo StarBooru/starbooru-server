@@ -1,6 +1,7 @@
 //! `GET /explore`: trending posts and tags over a window of days, posts added
-//! on this date in earlier years, and random picks. A search query narrows
-//! every section; its order and `status:` are ignored.
+//! on this date in earlier years, random picks, the collection's people and
+//! the popular characters. A search query narrows every section; its order
+//! and `status:` are ignored.
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -25,6 +26,11 @@ const TRENDING_LIMIT: i64 = 24;
 const TAGS_LIMIT: i64 = 20;
 const ON_THIS_DAY_LIMIT: i64 = 12;
 const RANDOM_LIMIT: i64 = 12;
+const PEOPLE_LIMIT: i64 = 20;
+/// With a search, people are counted on this many of its newest posts.
+const PEOPLE_SCAN: i64 = 5_000;
+/// Popular characters are counted on this many of the most upvoted posts.
+const POPULAR_SCAN: i64 = 1_000;
 /// Random picks are drawn from about this many posts: a sample of the
 /// table's pages, so a big collection is not sorted whole.
 const RANDOM_SAMPLE: f32 = 5_000.0;
@@ -164,14 +170,42 @@ pub async fn explore(
         }
     };
 
-    let (trending, tags, on_this_day, random) =
-        tokio::try_join!(trending, tags, on_this_day, random)?;
+    // Without a search, everyone with their posts counted in the tags; with
+    // one, those on its newest posts.
+    let searched = !params.q.trim().is_empty();
+    let people = async {
+        if searched {
+            super::people::among(&state, &query, &filter, &hidden, PEOPLE_SCAN, PEOPLE_LIMIT).await
+        } else {
+            super::people::top(&state, &hidden, PEOPLE_LIMIT).await
+        }
+    };
+    let popular_characters = async {
+        if popular {
+            let scan = POPULAR_SCAN;
+            super::people::popular(&state, &query, &filter, &hidden, since, scan, PEOPLE_LIMIT)
+                .await
+        } else {
+            Ok(Vec::new())
+        }
+    };
+
+    let (trending, tags, on_this_day, random, people, popular_characters) = tokio::try_join!(
+        trending,
+        tags,
+        on_this_day,
+        random,
+        people,
+        popular_characters
+    )?;
     Ok(Json(Explore {
         days,
         trending,
         tags,
         on_this_day,
         random,
+        people,
+        popular_characters,
         corrected,
     }))
 }

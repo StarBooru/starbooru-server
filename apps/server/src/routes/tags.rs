@@ -629,6 +629,7 @@ pub async fn update(
         }
     }
     tx.commit().await?;
+    super::people::recheck(&state, &[tag.0]).await?;
     Ok(Json(to_tag(find(&state.db, &tag.1).await?)))
 }
 
@@ -660,6 +661,7 @@ pub async fn add_alias(
     }
     alias_into(&mut tx, &target, &alias).await?;
     tx.commit().await?;
+    super::people::recheck(&state, &[target.0]).await?;
     let tag = find(&state.db, &target.1).await?;
     Ok(Json(detail_of(&state.db, tag).await?))
 }
@@ -760,6 +762,11 @@ async fn alias_into(
         .bind(target_id)
         .execute(&mut **tx)
         .await?;
+        sqlx::query("UPDATE tags SET franchise_id = $2 WHERE franchise_id = $1")
+            .bind(old_id)
+            .bind(target_id)
+            .execute(&mut **tx)
+            .await?;
         sqlx::query("DELETE FROM tags WHERE id = $1")
             .bind(old_id)
             .execute(&mut **tx)
@@ -932,6 +939,7 @@ pub async fn add_implication(
     .await?;
     apply_implications(&mut tx, tag.0).await?;
     tx.commit().await?;
+    super::people::recheck(&state, &[tag.0]).await?;
     let tag = find(&state.db, &tag.1).await?;
     Ok(Json(detail_of(&state.db, tag).await?))
 }
@@ -955,6 +963,7 @@ pub async fn remove_implication(
     if removed == 0 {
         return Err(AppError::NotFound);
     }
+    super::people::recheck(&state, &[tag.0]).await?;
     Ok(Json(detail_of(&state.db, tag).await?))
 }
 

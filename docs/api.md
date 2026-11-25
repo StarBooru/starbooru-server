@@ -207,7 +207,7 @@ A server is private (the default) or public. A private server is one person's or
 | Scores | likes and dislikes, or 0 to 5 stars | likes and dislikes |
 | Sharing | share links | a post's own address; `POST /shares` is 409 `share_by_address` |
 | Other boorus (`/remote/*`) | as set up | off: 403 `remote_off`, and it can't be turned on |
-| Explore's `trending` and `tags` | empty | worked out |
+| Explore's `trending`, `tags` and `popular_characters` | empty | worked out |
 | Library imports | anyone, under the URL import rules | administrators only |
 | Profiles | display names only, which nobody else sees | name, text, picture and stats, for everyone; posts say who uploaded them (see [Profiles](#profiles)) |
 | Forum | off: 403 `forum_off` | on (see [Forum](#forum)) |
@@ -279,14 +279,14 @@ On a public server a request without a token may read what a browser needs, and 
 |---|---|
 | GET | `/posts`, `/posts/{id}`, `/posts/{id}/neighbors`, `/posts/{id}/related` |
 | GET | `/tags`, `/tags/{name}`, `/tag-corrections` |
-| GET | `/explore` |
+| GET | `/explore`, `/people`, `/franchises` |
 | GET | `/users/{name}` |
 | GET | `/forum`, `/forum/threads`, `/forum/threads/{id}` |
 | GET | `/auth/blacklist` (the admin's default), `/home` |
 
 `/info`, sign-up and sign-in, and the signed `/media` URLs are open in both modes, and so is `/home`, which on a private server shows no posts without a token. Everything else answers 401 to a guest, as it does on a private server, where none of these opens without a token. A guest has no vote of their own (`my_vote` is 0) and doesn't see the recycle bin: `status:deleted` is 401 and a binned post 404. A token that is sent but wrong is still 401.
 
-Each client address (IPv6 by its /64, the last `X-Forwarded-For` entry with `STARBOORU_TRUST_PROXY`) may ask for 300 a minute without an account; `/explore` counts as 5. Past that the answer is 429 `rate_limited` with `Retry-After`. Signed-in requests don't count. Page sizes are the same as for accounts.
+Each client address (IPv6 by its /64, the last `X-Forwarded-For` entry with `STARBOORU_TRUST_PROXY`) may ask for 300 a minute without an account; `/explore` counts as 5 and `/people` as 2. Past that the answer is 429 `rate_limited` with `Retry-After`. Signed-in requests don't count. Page sizes are the same as for accounts.
 
 ### Scores
 
@@ -426,7 +426,7 @@ PUT /api/v1/posts/7/tags/cat/vote   {"value": -1}
 | POST | `/posts/{id}/translate` | `TranslateRequest {to}` | `Translation {text}`: the post's `ocr_text` translated by the AI provider into `to`, a BCP 47 code such as `en` or `pt-BR` (the clients send their UI language). Only the text is sent, not the image, and nothing is stored. At most 10,000 characters go each way. 400 for a bad code, when AI is off or when the post has no text; 404 for a missing or binned post; 424 `fetch_failed` as for suggestions, or for an empty answer. |
 | GET | `/posts/{id}/translations` | | `[PanelTranslation {lang, blocks: [TextBlock {x, y, w, h, text, translation}], model, created_at}]`: the kept translations drawn over the image, newest first. Box edges are on a 0–1000 scale of the image's width and height. 404 for a missing or binned post. |
 | POST | `/posts/{id}/translations` | `TranslateRequest {to}` | `PanelTranslation`: sends the still image (fit in 1536 px) to the translation model, which finds each piece of text, its box and its translation into `to`, for comic and manga pages. Kept per post and language, replacing an older one; an answer with no text (`blocks: []`) is returned but not kept. 400 for a bad code, when translation is off or for a video, GIF or unreadable format; 404 for a missing or binned post; 424 as for suggestions, or when the answer has no block list. |
-| PUT | `/posts/{id}/figures` | `FiguresUpdate {figures: [Figure]}` | `Post`: replaces the post's people and updates its tags to match. See [People](#people-in-a-post). 400 for more than 20 people, more than 64 tags on one, more tags than a post can hold (512) or an invalid tag; 404 for a missing post; 409 `deleted` for a post in the recycle bin. |
+| PUT | `/posts/{id}/figures` | `FiguresUpdate {figures: [Figure]}` | `Post`: replaces the post's people and updates its tags to match. See [People](#people-in-a-post). 400 for more than 20 people, more than 64 tags on one, more tags than a post can hold (512), an invalid tag or a face box outside the picture; 404 for a missing post; 409 `deleted` for a post in the recycle bin. |
 | PUT | `/posts/{id}/vote` | `{value: -1 \| 0 \| 1}`, or `{stars: 0–5}` under stars | `Post` with the new `score` and `my_vote` (and `stars`, `votes`, `my_stars` under stars; see [Scores](#scores)) |
 
 A `Post` carries `file_url`, `thumb_url` and `sample_url`. These are signed paths relative to the server, valid for at least 6 hours. Fetch them without the bearer token. `thumb_url` is null when no thumbnail exists. `sample_url` is a smaller JPEG copy of a big image, meant for viewing; it is null for most posts, and `file_url` stays the original to download. `duration_ms` is the length of a video, or null. `file_date` is the date in the file, or null: EXIF for images (its wall clock, marked UTC, because EXIF has no time zone) and the creation time for videos. `palette` lists the picture's main colours as `#rrggbb`, most common first; it is left out when there are none. `GET /posts/{id}` (and `POST /posts/{id}/ocr`) also carry `ocr_text`, the text found in a still image by OCR, lines separated by `\n`; it is left out when there is none, when the image is not read yet, and in lists. On a public server a post also carries `uploader`, `tag_votes` and `voted_off`, in lists too (see [Profiles](#profiles) and [Tag votes](#tag-votes)); a private server leaves them out, so its posts read as before.
@@ -446,13 +446,30 @@ For a file bigger than `UPLOAD_CHUNK_SIZE` (2 MiB). One `POST /posts` of a big f
 
 ### People in a post
 
-A `Figure` is one person (or creature) in the picture: `{kind, character?, cosplay?, tags}`. `kind` is `girl`, `boy` or `other`. `character` is who they are, a tag that becomes a character tag. `cosplay` is the character they are dressed as, without the suffix: the post gets `name_(cosplay)` (placed under `cosplay` in the tree when it has no parent) and `cosplay`. `tags` maps slots to tag lists. The slots are `head`, `body`, `bottom`, `shoes` and `wear` (other clothing) for clothing, and `shape`, `eyes`, `skin`, `hair`, `pose` and `other` for the body.
+A `Figure` is one person (or creature) in the picture: `{kind, character?, cosplay?, franchise, tags, face, face_url?}`. `kind` is `girl`, `boy` or `other`. `character` is who they are, a tag that becomes a character tag. `cosplay` is the character they are dressed as, without the suffix: the post gets `name_(cosplay)` (placed under `cosplay` in the tree when it has no parent) and `cosplay`. `franchise` is the series they come from (for a cosplay, the costume's), a tag that is made a copyright tag when it is new; a tag that exists keeps its category. `tags` maps slots to tag lists. The slots are `head`, `body`, `bottom`, `shoes` and `wear` (other clothing) for clothing, and `shape`, `eyes`, `skin`, `hair`, `pose` and `other` for the body.
 
-A figure's tags are on the post too. Saving figures adds their tags (aliases resolved, missing tags created, prefixes dropped) and removes the ones only the old figures gave. Taking a tag off the post with `PATCH /posts/{id}` or a bulk edit takes it off the figures too. While a post has figures, its count tags follow them: `1girl`…`5girls`, `6+girls` and `multiple_girls`, the same for `boy` and `other`, and `solo` for one figure. A count tag the figures don't call for is dropped, and the ones they do call for come back. A tag sits in one slot per figure: the first it is given. Count tags given in a slot are ignored. Automatic AI tagging of an upload also saves the people the model saw, when the post has none yet.
+`face` is where the face is: `{x, y, w, h}` from the picture's top-left corner, in thousandths of its width (`x`, `w`) and height (`y`, `h`), as panel translations' boxes are. It has to be inside the picture (`x + w` and `y + h` at most 1000) and not empty, or saving is 400. For a figure with a face the server keeps a crop of it: a 192 px square JPEG, the box's longer side plus a quarter on each side, cut from the original (from the frame the thumbnail comes from, for videos and the formats the server reads through ffmpeg). It is made in the background, usually within a second of saving; until then the figure has no `face_url`. `face_url` is the crop's signed URL, in every answer that has figures; it is ignored in a request. A figure that keeps the same box keeps its crop.
+
+`franchise` and `face` are always in answers, `null` when there is none. Apps written before them don't send them, so a figure without the keys keeps what the same person had: the old figure at the same place in the list when it has the same kind, character and cosplay, or else the first such one not matched yet. A figure that matches none has neither. Sending the key with `null` clears it. An app that knows the fields should always send them.
+
+When a figure names a character (or a cosplay) and gives no franchise, and that person wasn't on the post before, the server fills it in with the franchise the collection gives the character, worked out in this order: a copyright tag the character implies (closest first), the closest copyright tag above it in the tree, the franchise other posts' figures give it most, and the copyright tag on most of its 50 newest posts. A franchise taken off a figure stays off while that person is on the post.
+
+A figure's tags are on the post too. Saving figures adds their tags (aliases resolved, missing tags created, prefixes dropped) and removes the ones only the old figures gave. Taking a tag off the post with `PATCH /posts/{id}` or a bulk edit takes it off the figures too. While a post has figures, its count tags follow them: `1girl`…`5girls`, `6+girls` and `multiple_girls`, the same for `boy` and `other`, and `solo` for one figure. A count tag the figures don't call for is dropped, and the ones they do call for come back. A tag sits in one place per figure: the first it is given, the character, the cosplay and the franchise before the slots. Count tags given in a slot are ignored. Automatic AI tagging of an upload also saves the people the model saw, when the post has none yet.
+
+```json
+PUT /api/v1/posts/42/figures
+{ "figures": [ { "kind": "girl", "character": "saber", "franchise": "fate_(series)",
+                 "tags": { "hair": ["blonde_hair"] }, "face": { "x": 412, "y": 96, "w": 130, "h": 180 } } ] }
+
+GET /api/v1/posts/42   (a moment later)
+{ …, "figures": [ { "kind": "girl", "character": "saber", "franchise": "fate_(series)",
+                    "tags": { "hair": ["blonde_hair"] }, "face": { "x": 412, "y": 96, "w": 130, "h": 180 },
+                    "face_url": "/media/face/9f…e1.jpg?exp=…&sig=…" } ] }
+```
 
 ### Editing media
 
-`POST /posts/{id}/edit` never changes a file: originals are immutable, so the result is a new post with the original's people. Anyone who can see the post may edit it; `bin_original: true` also moves the original to the recycle bin and needs the rights to delete it (403 otherwise, checked before anything is made).
+`POST /posts/{id}/edit` never changes a file: originals are immutable, so the result is a new post with the original's people. Their face boxes move with the picture: turned, flipped, straightened (the upright box around the turned one) and cropped, cut to the new edges; a box whose middle falls outside the crop is dropped, and the person stays without it. Anyone who can see the post may edit it; `bin_original: true` also moves the original to the recycle bin and needs the rights to delete it (403 otherwise, checked before anything is made).
 
 - **Images** (JPEG, PNG, WebP, BMP, TIFF; not GIF, AVIF or JPEG XL): `rotate` is clockwise degrees (0, 90, 180, 270), then `flip_h`/`flip_v` mirror the turned image, then `straighten` turns it a little more, clockwise in tenths of a degree (−450 to 450, so ±45°), then `crop {x, y, width, height}` cuts a rectangle in pixels of that image. Straightening keeps the size and zooms in just enough that no empty corners show (`MediaEdit::straighten_scale`). A server older than `straighten` ignores the field and saves the picture unstraightened. The result keeps the format (JPEG at quality 92, WebP lossless) and drops metadata, with EXIF orientation applied.
 - **Videos**: only `trim {start_ms, end_ms}`, inside the video and at least 100 ms long. The server first copies the streams, which is lossless but starts at a keyframe; when that lands more than half a second early it re-encodes the cut (H.264/AAC, or VP9/Opus for WebM). Needs ffmpeg (`/info` → `video_editing`), otherwise 400.
@@ -530,11 +547,32 @@ Tags are resolved the same way everywhere: an alias in a post's tags or in a sea
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| GET | `/explore?days=&q=&exclude=` | | `Explore {days, trending, tags, on_this_day, random, corrected?}`. The reader's [blacklist](#blacklist) applies to every section: the posts it hides are left out, and `tags` doesn't count them. `days` is the window, 1 to 365 (default 7). `trending`: up to 24 posts with the most net upvotes cast or changed in the window (only those above zero). `tags`: up to 20 `TagTrend {tag, recent}`, the tags most used on posts added in the window, without the tags `q` requires. `on_this_day`: up to 12 posts added on today's month and day (UTC) in earlier years, newest first. `random`: 12 random posts. `q` uses the search syntax and narrows every section; its `order:` and `status:` are ignored, and `corrected` is as in `/posts`. 400 for a bad query. On a private server `trending` and `tags` are always empty: the apps don't show them there, and they are the two costliest queries. |
+| GET | `/explore?days=&q=&exclude=` | | `Explore {days, trending, tags, on_this_day, random, people, popular_characters, corrected?}`. The reader's [blacklist](#blacklist) applies to every section: the posts it hides are left out, and `tags` doesn't count them. `days` is the window, 1 to 365 (default 7). `trending`: up to 24 posts with the most net upvotes cast or changed in the window (only those above zero). `tags`: up to 20 `TagTrend {tag, recent}`, the tags most used on posts added in the window, without the tags `q` requires. `on_this_day`: up to 12 posts added on today's month and day (UTC) in earlier years, newest first. `random`: 12 random posts. `people`: up to 20 [`Person`](#people)s, the characters on the most live posts; with a `q`, those on the most of its 5,000 newest matches, without the characters it requires (`posts` counts those matches). `popular_characters`: up to 20 `Person`s, the characters on the 1,000 posts with the most net upvotes in the window that `q` finds, the most upvotes first, with `votes`, the net upvotes their posts got, and `posts`, how many of those posts they are on. `q` uses the search syntax and narrows every section; its `order:` and `status:` are ignored, and `corrected` is as in `/posts`. 400 for a bad query. On a private server `trending`, `tags` and `popular_characters` are always empty: the apps don't show them there, and they are the costliest queries. A server from before people leaves `people` and `popular_characters` out, and the client reads them as empty. |
+
+### People
+
+The people of the collection are its characters: tags in the `character` category on live posts, with figures or without, so a post imported with `saber` among its tags counts for Saber like one whose figure names her. A figure without a character isn't anyone here. A `Person` is `{name, posts, franchise, face_url, thumb_url, votes?}`: the character's tag, its live posts, its franchise (or null), and a picture to show, a `face_url` (the crop of their face on one of their best-liked posts) or else a `thumb_url` (the thumbnail of their newest post; in Explore with a search, or in `popular_characters`, of the posts it counted), both signed, from posts the reader may see; both null when there is none. The faces to choose from are worked out with the franchise, so a new face shows a few seconds after its crop is made. Their posts are a search for `name`.
+
+A character's franchise is worked out in the background and kept: the same rules as for [filling in a figure's](#people-in-a-post), again a day later, and soon after a figure names the character or the tag's category, implications or tree change. Until then `franchise` is null. The reader's blacklist hides the characters it names and those of a franchise it names; their counts are the tag's own.
+
+| Method | Path | Body | Returns |
+|---|---|---|---|
+| GET | `/people?q=&franchise=&order=&page=&limit=&exclude=` | | `PeoplePage {people, page, limit, has_more}`. `q` keeps the characters whose name holds it, written as a tag (`hatsune miku` finds `hatsune_miku`). `franchise` keeps a franchise's people (aliases followed); `franchise=` keeps those without one. `order` is `posts` (the default: most posts first), `name`, or `franchise`: grouped by franchise, the franchise with the most posts first and those without one last, most posts first within each. `limit` 1 to 100 (default 60). Takes `exclude` from a guest. 400 for another `order`. |
+| GET | `/franchises?q=&page=&limit=&exclude=` | | `FranchisePage {franchises: [Franchise {name, people, posts}], page, limit, has_more, without}`: the franchises with people, the most people first; `people` is how many of the reader's characters have it, `posts` the franchise tag's own count. `without` is how many have none. `q` as above, on the franchise's name. `limit` 1 to 200 (default 50). |
+
+```json
+GET /api/v1/people?order=franchise&limit=2
+{ "people": [
+    { "name": "saber", "posts": 31, "franchise": "fate_(series)",
+      "face_url": "/media/face/9f…e1.jpg?exp=…&sig=…", "thumb_url": null },
+    { "name": "tohsaka_rin", "posts": 12, "franchise": "fate_(series)",
+      "face_url": null, "thumb_url": "/media/thumb/c4…07.jpg?exp=…&sig=…" } ],
+  "page": 1, "limit": 2, "has_more": true }
+```
 
 ## Blacklist
 
-Each account keeps a list of tags and ratings whose posts it doesn't want to see, in both modes. The server leaves those posts out of `GET /posts` (colour searches and a tag's posts included), `/posts/{id}/neighbors`, `/posts/{id}/related`, every section of `/explore` and the [home page](#home-page), as if the search had a `-tag` or `-rating:` term for each entry. An entry hides the posts with its tag or a tag under it in the tree, so `footwear` hides `boots`, and an alias stands for its tag.
+Each account keeps a list of tags and ratings whose posts it doesn't want to see, in both modes. The server leaves those posts out of `GET /posts` (colour searches and a tag's posts included), `/posts/{id}/neighbors`, `/posts/{id}/related`, every section of `/explore`, the [people lists](#people) and the [home page](#home-page), as if the search had a `-tag` or `-rating:` term for each entry. An entry hides the posts with its tag or a tag under it in the tree, so `footwear` hides `boots`, and an alias stands for its tag.
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
@@ -546,7 +584,7 @@ Each account keeps a list of tags and ratings whose posts it doesn't want to see
 - The recycle bin (`status:deleted`) shows everything it holds, as emptying it purges all of it.
 - A post opened by id (`GET /posts/{id}`) still opens, with `blacklisted` listing the entries it matches, such as `["footwear", "rating:explicit"]`, so the app can cover it with "Hidden by your blacklist · Show". When the search it was opened from names the tag, the app may leave it uncovered.
 - New accounts start with the admin's default (`default_blacklist` in `PUT /admin/settings`, at most 100 entries, empty unless set). Changing it doesn't change existing accounts.
-- Guests have no list on the server. Their reads use the admin's default, which `GET /auth/blacklist` gives them, unless they send their own as `exclude`: entries separated by spaces (`exclude=cat+rating:explicit`), at most 100; `exclude=` hides nothing. An app keeps a guest's list on the device and sends it with `GET /posts`, `/posts/{id}`, `/posts/{id}/neighbors`, `/posts/{id}/related`, `/explore` and `/home` (`Client::with_guest_blacklist` does). A bad `exclude` is 400. Signed-in requests ignore it.
+- Guests have no list on the server. Their reads use the admin's default, which `GET /auth/blacklist` gives them, unless they send their own as `exclude`: entries separated by spaces (`exclude=cat+rating:explicit`), at most 100; `exclude=` hides nothing. An app keeps a guest's list on the device and sends it with `GET /posts`, `/posts/{id}`, `/posts/{id}/neighbors`, `/posts/{id}/related`, `/explore`, `/people`, `/franchises` and `/home` (`Client::with_guest_blacklist` does). A bad `exclude` is 400. Signed-in requests ignore it.
 
 ```json
 PUT /api/v1/auth/blacklist   {"entries": ["Kitty", "footwear", "rating:e"]}
@@ -688,7 +726,7 @@ The page to give out is `/s/{token}` on the server, which the web app serves (`s
 
 ```text
 GET /media/{original|thumb|sample}/{sha256}.{ext}?exp=<unix>&sig=<hex>
-GET /media/{avatar|avatar64}/{sha256}.jpg?exp=<unix>&sig=<hex>
+GET /media/{avatar|avatar64|face}/{sha256}.jpg?exp=<unix>&sig=<hex>
 ```
 
 Media URLs come from the API, so never build one by hand. Invalid or expired signatures get a 403. Range requests are supported. Responses are cacheable (`private, max-age=21600, immutable`).

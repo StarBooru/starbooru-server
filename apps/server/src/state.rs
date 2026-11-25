@@ -67,6 +67,10 @@ pub struct Inner {
     pub updates: Updates,
     /// The home page's background, kept a few minutes.
     pub home: HomeCache,
+    /// Woken when saved people have faces waiting for their crops.
+    pub faces: tokio::sync::Notify,
+    /// Woken when characters' franchises may have changed.
+    pub franchises: tokio::sync::Notify,
     pub started_at: DateTime<Utc>,
 }
 
@@ -118,6 +122,8 @@ impl AppState {
             local_ai,
             updates: Updates::new(),
             home: HomeCache::default(),
+            faces: tokio::sync::Notify::new(),
+            franchises: tokio::sync::Notify::new(),
             started_at: Utc::now(),
         }))
     }

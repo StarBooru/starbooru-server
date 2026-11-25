@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::figure::{FACE_SCALE, FaceBox};
 use crate::model::MediaKind;
 
 /// Shortest clip a trim may leave.
@@ -133,6 +134,77 @@ impl MediaEdit {
         // The frame's corners have to stay inside the turned picture: the
         // longer side over the shorter is what the sine pushes out the most.
         turn.cos() + (w / h).max(h / w) * turn.sin()
+    }
+
+    /// Where a face box on a `width` × `height` picture (as shown) lands on
+    /// the edited picture: turned, flipped, straightened and cropped with
+    /// it, and cut to the new edges. `None` when its middle falls outside.
+    /// A straightened box is the upright box around the turned one.
+    pub fn move_face(&self, width: u32, height: u32, face: FaceBox) -> Option<FaceBox> {
+        let (rotate, flip_h, flip_v) = self.orientation();
+        if (rotate, flip_h, flip_v) == (0, false, false)
+            && self.straighten == 0
+            && self.crop.is_none()
+        {
+            return Some(face);
+        }
+        let (width, height) = (width.max(1), height.max(1));
+        let (turned_w, turned_h) = self.turned_size(width, height);
+        let (w, h) = (f64::from(width), f64::from(height));
+        let (tw, th) = (f64::from(turned_w), f64::from(turned_h));
+        let scale = f64::from(FACE_SCALE);
+        let (left, top) = (f64::from(face.x) / scale * w, f64::from(face.y) / scale * h);
+        let (right, bottom) = (
+            f64::from(face.x.saturating_add(face.w)) / scale * w,
+            f64::from(face.y.saturating_add(face.h)) / scale * h,
+        );
+        let (sin, cos) = (f64::from(self.straighten) / 10.0).to_radians().sin_cos();
+        let grow = self.straighten_scale(turned_w, turned_h);
+        let moved = [(left, top), (right, top), (left, bottom), (right, bottom)].map(|(x, y)| {
+            let (x, y) = match rotate {
+                90 => (h - y, x),
+                180 => (w - x, h - y),
+                270 => (y, w - x),
+                _ => (x, y),
+            };
+            let x = if flip_h { tw - x } else { x };
+            let y = if flip_v { th - y } else { y };
+            // The inverse of what straightening reads each pixel from.
+            let (dx, dy) = (x - tw / 2.0, y - th / 2.0);
+            (
+                grow * (dx * cos - dy * sin) + tw / 2.0,
+                grow * (dx * sin + dy * cos) + th / 2.0,
+            )
+        });
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for (x, y) in moved {
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+        }
+        let (ox, oy, fw, fh) = match self.crop {
+            Some(c) => (
+                f64::from(c.x),
+                f64::from(c.y),
+                f64::from(c.width.max(1)),
+                f64::from(c.height.max(1)),
+            ),
+            None => (0.0, 0.0, tw, th),
+        };
+        let (x0, y0, x1, y1) = (x0 - ox, y0 - oy, x1 - ox, y1 - oy);
+        let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+        if !(0.0..fw).contains(&cx) || !(0.0..fh).contains(&cy) {
+            return None;
+        }
+        // Thousandths, cut to the frame and at least one wide.
+        let edge = |v: f64, len: f64| (v / len * scale).round().clamp(0.0, scale) as u16;
+        let (x, y) = (edge(x0, fw), edge(y0, fh));
+        let (x, y) = (x.min(FACE_SCALE - 1), y.min(FACE_SCALE - 1));
+        let moved = FaceBox {
+            x,
+            y,
+            w: edge(x1, fw).saturating_sub(x).max(1),
+            h: edge(y1, fh).saturating_sub(y).max(1),
+        };
+        moved.is_valid().then_some(moved)
     }
 
     /// Size after turning a `width` × `height` image.
@@ -374,6 +446,111 @@ mod tests {
         }
         // Zero sides don't divide by zero.
         assert!(tilt(100).straighten_scale(0, 0).is_finite());
+    }
+
+    #[test]
+    fn faces_move_with_the_picture() {
+        let at = |x, y, w, h| FaceBox { x, y, w, h };
+        // On a 400 × 200 picture: pixels 40–120 across, 20–80 down.
+        let face = at(100, 100, 200, 300);
+        let moved = |edit: MediaEdit| edit.move_face(400, 200, face);
+        let turned = |rotate, flip_h, flip_v| MediaEdit {
+            rotate,
+            flip_h,
+            flip_v,
+            ..MediaEdit::default()
+        };
+        assert_eq!(moved(MediaEdit::default()), Some(face));
+        // A quarter turn clockwise takes the top left to the top right.
+        assert_eq!(
+            moved(turned(90, false, false)),
+            Some(at(600, 100, 300, 200))
+        );
+        assert_eq!(
+            moved(turned(180, false, false)),
+            Some(at(700, 600, 200, 300))
+        );
+        assert_eq!(
+            moved(turned(270, false, false)),
+            Some(at(100, 700, 300, 200))
+        );
+        assert_eq!(moved(turned(0, true, false)), Some(at(700, 100, 200, 300)));
+        assert_eq!(moved(turned(0, false, true)), Some(at(100, 600, 200, 300)));
+        // Both flips are a half turn.
+        assert_eq!(
+            moved(turned(0, true, true)),
+            moved(turned(180, false, false))
+        );
+
+        let cropped = |x, y, width, height| MediaEdit {
+            crop: Some(Crop {
+                x,
+                y,
+                width,
+                height,
+            }),
+            ..MediaEdit::default()
+        };
+        assert_eq!(moved(cropped(0, 0, 200, 200)), Some(at(200, 100, 400, 300)));
+        // Cut to the new edges while its middle is inside, gone once it isn't.
+        assert_eq!(moved(cropped(60, 0, 340, 200)), Some(at(0, 100, 176, 300)));
+        assert_eq!(moved(cropped(100, 0, 300, 200)), None);
+        assert_eq!(moved(cropped(200, 0, 200, 200)), None);
+        // The crop is in pixels of the turned picture.
+        let both = MediaEdit {
+            rotate: 90,
+            crop: Some(Crop {
+                x: 100,
+                y: 0,
+                width: 100,
+                height: 200,
+            }),
+            ..MediaEdit::default()
+        };
+        assert_eq!(moved(both), Some(at(200, 200, 600, 400)));
+
+        // Straightened, a face in the middle stays there, a little larger; one
+        // right of the middle goes down as the picture turns clockwise.
+        let tilt = |straighten| MediaEdit {
+            straighten,
+            ..MediaEdit::default()
+        };
+        let middle = tilt(100)
+            .move_face(400, 200, at(450, 450, 100, 100))
+            .unwrap();
+        assert!(
+            (499..=501).contains(&(middle.x + middle.w / 2)),
+            "{middle:?}"
+        );
+        assert!(
+            (499..=501).contains(&(middle.y + middle.h / 2)),
+            "{middle:?}"
+        );
+        assert!(middle.w > 100 && middle.h > 100, "{middle:?}");
+        let right = tilt(100)
+            .move_face(400, 200, at(800, 450, 100, 100))
+            .unwrap();
+        assert!(right.y > 450, "{right:?}");
+        let right = tilt(-100)
+            .move_face(400, 200, at(800, 450, 100, 100))
+            .unwrap();
+        assert!(right.y < 450, "{right:?}");
+
+        // Trims leave a video's frame as it is; any box that comes out is valid.
+        let trim = MediaEdit {
+            trim: Some(Trim {
+                start_ms: 0,
+                end_ms: 10,
+            }),
+            ..MediaEdit::default()
+        };
+        assert_eq!(trim.move_face(640, 360, face), Some(face));
+        for edit in [turned(90, true, false), tilt(450), cropped(399, 199, 1, 1)] {
+            for face in [at(0, 0, 1000, 1000), at(999, 999, 1, 1), at(0, 0, 1, 1)] {
+                assert!(edit.move_face(400, 200, face).is_none_or(FaceBox::is_valid));
+                assert!(edit.move_face(0, 0, face).is_none_or(FaceBox::is_valid));
+            }
+        }
     }
 
     #[test]

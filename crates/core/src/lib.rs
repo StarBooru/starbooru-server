@@ -26,6 +26,7 @@ pub mod model;
 pub mod oidc;
 pub mod panels;
 pub mod password;
+pub mod people;
 pub mod profile;
 pub mod query;
 pub mod remote;
@@ -55,8 +56,9 @@ pub use autotag::{META_TAGS, META_VERSION, MediaFacts, meta_tags, meta_tags_sinc
 pub use blacklist::{Blacklist, BlacklistError};
 pub use edit::{Crop, EditError, EditKind, MAX_STRAIGHTEN, MediaEdit, Trim, edit_kind};
 pub use figure::{
-    COSPLAY_TAG, Figure, FigureError, FigureKind, FiguresUpdate, MAX_FIGURE_TAGS, MAX_FIGURES,
-    Slot, clean_figures, cosplay_name, cosplay_tag, count_tags, is_count_tag, required_tags,
+    COSPLAY_TAG, FACE_SCALE, FACE_SIZE, FaceBox, Figure, FigureError, FigureKind, FiguresUpdate,
+    MAX_FIGURE_TAGS, MAX_FIGURES, Sent, Slot, clean_figures, cosplay_name, cosplay_tag, count_tags,
+    is_count_tag, keep_unsent, required_tags,
 };
 pub use forum::{
     CategoryUpdate, ForumCategory, ForumError, ForumPost, ForumPostBody, ForumThread, NewCategory,
@@ -78,6 +80,7 @@ pub use model::*;
 pub use oidc::{Identity, OidcBegin, OidcError, OidcFinish, OidcStart, SignInMethods};
 pub use panels::{PanelTranslation, TextBlock, panel_prompt, parse_panel_blocks};
 pub use password::{password_is_weak, password_strength, strength_hue};
+pub use people::{Franchise, FranchisePage, PeopleOrder, PeoplePage, PeopleQuery, Person};
 pub use profile::{
     AvatarCrop, Profile, ProfileError, ProfileUpdate, UserCard, avatar_square, clean_about,
     clean_display_name,

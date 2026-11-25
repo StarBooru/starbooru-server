@@ -374,10 +374,15 @@ pub async fn add_tags(state: &AppState, post_id: i64, parsed: &ParsedSuggestions
     let figure_tags: usize = parsed.figures.iter().map(|f| f.tag_names().len()).sum();
     let fits =
         names.len() + figure_tags + parsed.figures.len() < starbooru_core::tag::MAX_TAGS_PER_POST;
-    if !has_figures && !parsed.figures.is_empty() && fits {
-        crate::routes::replace_figures(&mut tx, post_id, parsed.figures.clone()).await?;
-    }
+    let saved = if !has_figures && !parsed.figures.is_empty() && fits {
+        Some(crate::routes::replace_figures(&mut tx, post_id, parsed.figures.clone(), true).await?)
+    } else {
+        None
+    };
     tx.commit().await?;
+    if let Some(saved) = saved {
+        saved.settle(state).await;
+    }
     Ok(())
 }
 

@@ -6,8 +6,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use std::collections::BTreeMap;
-
 use crate::ai_catalog::{AiMode, AiPreset, AiTool};
 use crate::ai_worker::FoundTag;
 use crate::figure::{Figure, FigureKind, MAX_FIGURES, Slot, clean_figures};
@@ -408,7 +406,8 @@ fn model_figures(value: &serde_json::Value) -> Vec<Figure> {
                 .unwrap_or(FigureKind::Other),
             character: text("character"),
             cosplay: text("cosplay"),
-            tags: BTreeMap::new(),
+            franchise: text("franchise"),
+            ..Figure::default()
         };
         for (key, names) in object {
             let Some(names) = names.as_array() else {

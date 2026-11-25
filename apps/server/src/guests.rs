@@ -28,8 +28,11 @@ pub const GUEST_READS: &[(&str, u32)] = &[
     ("/tags", 1),
     ("/tags/{name}", 1),
     ("/tag-corrections", 1),
-    // Four sections, two of them the heaviest queries a guest can ask for.
+    // Six sections, three of them the heaviest queries a guest can ask for.
     ("/explore", 5),
+    // A picture for each person costs a few more lookups.
+    ("/people", 2),
+    ("/franchises", 1),
     ("/users/{name}", 1),
     ("/forum", 1),
     ("/forum/threads", 1),

@@ -117,8 +117,36 @@ async fn search_at_scale() {
     .execute(db)
     .await
     .unwrap();
+    // People: a fifth of the tags are characters and a fifth copyrights
+    // (`n % 5`). One post in 5 has a figure naming its first character,
+    // with a face box, and half of those a kept crop (only its name: no
+    // file is read here).
+    sqlx::query(
+        "INSERT INTO figures (post_id, position, kind, face_x, face_y, face_w, face_h, face_sha) \
+         SELECT id, 0, 0, 100, 100, 200, 200, \
+                CASE WHEN id % 10 = 1 THEN sha256(int8send(id)) END \
+         FROM posts WHERE id % 5 = 1",
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO figure_tags (figure_id, tag_id, slot, position) \
+         SELECT f.id, c.id, 0, 0 FROM figures f JOIN posts p ON p.id = f.post_id \
+         CROSS JOIN LATERAL (SELECT t.id FROM tags t \
+             WHERE t.id = ANY(p.tag_ids) AND t.category = 2 ORDER BY t.id LIMIT 1) c",
+    )
+    .execute(db)
+    .await
+    .unwrap();
     sqlx::query("VACUUM ANALYZE").execute(db).await.unwrap();
     println!("seeded {posts} posts in {:.1?}", seeding.elapsed());
+    let franchises = Instant::now();
+    let checked = crate::routes::fill_franchises(&app.state).await.unwrap();
+    println!(
+        "worked out the franchise of {checked} characters in {:.1?}",
+        franchises.elapsed()
+    );
 
     let mid = posts / 2;
     let calls = [
@@ -179,11 +207,29 @@ async fn search_at_scale() {
         "/api/v1/explore".into(),
         "/api/v1/explore?q=tag_1".into(),
         "/api/v1/explore?q=tag_4000".into(),
+        "/api/v1/explore?q=tag_2".into(),
+        "/api/v1/people".into(),
+        "/api/v1/people?order=name&page=10".into(),
+        "/api/v1/people?order=franchise".into(),
+        "/api/v1/people?q=tag_1".into(),
+        "/api/v1/people?franchise=tag_3".into(),
+        "/api/v1/people?franchise=".into(),
+        "/api/v1/franchises".into(),
         "/api/v1/admin/stats".into(),
+        // On a public server, with trending, popular tags and characters.
+        "public".into(),
+        "/api/v1/explore".into(),
+        "/api/v1/explore?q=tag_1".into(),
+        "/api/v1/explore?q=tag_4000".into(),
     ];
     let mut slow = Vec::new();
     println!("{:<52} {:>9} {:>9}", "call", "median", "max");
     for path in &calls {
+        if path == "public" {
+            app.switch(&token, "public").await;
+            println!("-- public");
+            continue;
+        }
         let mut times = Vec::with_capacity(RUNS);
         for run in 0..=RUNS {
             let start = Instant::now();

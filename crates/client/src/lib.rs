@@ -33,7 +33,7 @@ use starbooru_core::{
     NewThread, Profile, ProfileUpdate, TagRemovalPage, TagVoteRequest, ThreadPage, ThreadUpdate,
     ThreadView,
 };
-use starbooru_core::{Blacklist, Home};
+use starbooru_core::{Blacklist, FranchisePage, Home, PeoplePage, PeopleQuery};
 use starbooru_core::{Mode, ModePreview, ModeSwitch, ModeSwitched, ScoreKind, ScorePreview};
 use std::time::Duration;
 use thiserror::Error;
@@ -909,6 +909,32 @@ impl Client {
         Self::send(self.excluding(req)).await
     }
 
+    /// One page of the collection's people (its characters), each with their
+    /// posts, franchise and a face or thumbnail to show.
+    pub async fn people(&self, query: &PeopleQuery) -> Result<PeoplePage> {
+        let mut req = self.request(Method::GET, "/people")?.query(&[
+            ("q", query.q.clone()),
+            ("order", query.order.as_str().to_owned()),
+            ("page", query.page.to_string()),
+            ("limit", query.limit.to_string()),
+        ]);
+        if let Some(franchise) = &query.franchise {
+            req = req.query(&[("franchise", franchise)]);
+        }
+        Self::send(self.excluding(req)).await
+    }
+
+    /// One page of the franchises with people, the most people first,
+    /// narrowed to names holding `q`.
+    pub async fn franchises(&self, q: &str, page: u32, limit: u32) -> Result<FranchisePage> {
+        let req = self.request(Method::GET, "/franchises")?.query(&[
+            ("q", q.to_owned()),
+            ("page", page.to_string()),
+            ("limit", limit.to_string()),
+        ]);
+        Self::send(self.excluding(req)).await
+    }
+
     /// Groups of posts that look alike, within `distance` bits.
     pub async fn duplicates(&self, distance: u32, limit: u32) -> Result<Duplicates> {
         let req = self
@@ -1714,6 +1740,48 @@ mod tests {
         let request = server.await.unwrap();
         assert!(request.starts_with("PUT /api/v1/auth/blacklist "));
         assert!(request.ends_with(r#"{"entries":["Kitty"]}"#), "{request}");
+    }
+
+    #[tokio::test]
+    async fn asks_for_people_and_franchises() {
+        let page = r#"{"people":[{"name":"saber","posts":3,"franchise":"fate",
+            "face_url":"/media/face/a.jpg","thumb_url":null}],"page":2,"limit":10,"has_more":false}"#;
+        let (url, server) = recorded(page).await;
+        let list = ["cat".to_owned()];
+        let query = PeopleQuery {
+            q: "sab".into(),
+            franchise: Some(String::new()),
+            order: starbooru_core::PeopleOrder::Franchise,
+            page: 2,
+            limit: 10,
+        };
+        let got = Client::new(&url)
+            .unwrap()
+            .with_guest_blacklist(Some(&list))
+            .people(&query)
+            .await
+            .unwrap();
+        assert_eq!(got.people[0].franchise.as_deref(), Some("fate"));
+        assert_eq!(got.people[0].votes, None);
+        assert!(server.await.unwrap().starts_with(
+            "GET /api/v1/people?q=sab&order=franchise&page=2&limit=10&franchise=&exclude=cat "
+        ));
+
+        let page = r#"{"franchises":[{"name":"fate","people":2,"posts":4}],"page":1,
+            "limit":50,"has_more":false,"without":1}"#;
+        let (url, server) = recorded(page).await;
+        let got = Client::new(&url)
+            .unwrap()
+            .franchises("fa", 1, 50)
+            .await
+            .unwrap();
+        assert_eq!((got.franchises[0].people, got.without), (2, 1));
+        assert!(
+            server
+                .await
+                .unwrap()
+                .starts_with("GET /api/v1/franchises?q=fa&page=1&limit=50 ")
+        );
     }
 
     #[tokio::test]

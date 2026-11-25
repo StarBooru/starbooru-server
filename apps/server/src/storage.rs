@@ -6,6 +6,7 @@
 //! <data>/sample/ab/cd/<sha256>.jpg
 //! <data>/avatar/ab/cd/<sha256>.jpg     (profile pictures, 256 px)
 //! <data>/avatar64/ab/cd/<sha256>.jpg   (the same at 64 px)
+//! <data>/face/ab/cd/<sha256>.jpg       (crops of the faces of figures)
 //! ```
 
 use std::io::{Cursor, Read, Seek};
@@ -46,6 +47,7 @@ const SAMPLE_MAX_PERCENT: usize = 75;
 /// Refuse to decode images whose pixel buffers would exceed this.
 const MAX_DECODE_BYTES: u64 = 1 << 30;
 const AVATAR_EXT: &str = "jpg";
+const FACE_EXT: &str = "jpg";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Variant {
@@ -57,15 +59,18 @@ pub enum Variant {
     Avatar,
     /// The same at `AVATAR_SMALL_SIZE`.
     AvatarSmall,
+    /// A crop of a figure's face, `FACE_SIZE` square.
+    Face,
 }
 
 impl Variant {
-    pub const ALL: [Variant; 5] = [
+    pub const ALL: [Variant; 6] = [
         Variant::Original,
         Variant::Thumb,
         Variant::Sample,
         Variant::Avatar,
         Variant::AvatarSmall,
+        Variant::Face,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -75,6 +80,7 @@ impl Variant {
             Variant::Sample => "sample",
             Variant::Avatar => "avatar",
             Variant::AvatarSmall => "avatar64",
+            Variant::Face => "face",
         }
     }
 
@@ -212,6 +218,7 @@ impl Storage {
             Variant::Thumb => format!("{sha_hex}.{THUMB_EXT}"),
             Variant::Sample => format!("{sha_hex}.{SAMPLE_EXT}"),
             Variant::Avatar | Variant::AvatarSmall => format!("{sha_hex}.{AVATAR_EXT}"),
+            Variant::Face => format!("{sha_hex}.{FACE_EXT}"),
         }
     }
 
@@ -448,23 +455,7 @@ impl Storage {
     /// is gone or can't be read; only disk errors fail. Call from a blocking
     /// thread.
     pub fn remake_thumb(&self, sha_hex: &str, ext: &str, kind: MediaKind) -> AppResult<bool> {
-        let original = self
-            .original_path(sha_hex, ext)
-            .ok_or_else(|| AppError::internal("bad storage path"))?;
-        let decodable = FORMATS.iter().any(|(_, e, _, d)| *e == ext && *d);
-        let img = if decodable {
-            let bytes = match std::fs::read(&original) {
-                Ok(b) => b,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(e) => return Err(AppError::internal(e)),
-            };
-            decode(&bytes).ok()
-        } else {
-            self.tools.as_ref().and_then(|tools| {
-                let frame = tools.probe(&original, kind == MediaKind::Video).frame?;
-                decode(&frame).ok()
-            })
-        };
+        let img = self.still(sha_hex, ext, kind)?;
         let Some(jpeg) = img.and_then(|img| make_thumbnail(&img).ok()) else {
             return Ok(false);
         };
@@ -476,6 +467,35 @@ impl Storage {
             .ok_or_else(|| AppError::internal("bad storage path"))?;
         self.replace_atomic(&path, &jpeg)?;
         Ok(true)
+    }
+
+    /// The picture a stored original shows, upright: the image itself (a
+    /// GIF's first frame), or for what `image` can't read the frame
+    /// thumbnails come from, through ffmpeg. `None` when the original is
+    /// gone or can't be read; only disk errors fail. Call from a blocking
+    /// thread.
+    pub fn still(
+        &self,
+        sha_hex: &str,
+        ext: &str,
+        kind: MediaKind,
+    ) -> AppResult<Option<DynamicImage>> {
+        let original = self
+            .original_path(sha_hex, ext)
+            .ok_or_else(|| AppError::internal("bad storage path"))?;
+        let decodable = FORMATS.iter().any(|(_, e, _, d)| *e == ext && *d);
+        if decodable {
+            let bytes = match std::fs::read(&original) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(AppError::internal(e)),
+            };
+            return Ok(decode(&bytes).ok());
+        }
+        Ok(self.tools.as_ref().and_then(|tools| {
+            let frame = tools.probe(&original, kind == MediaKind::Video).frame?;
+            decode(&frame).ok()
+        }))
     }
 
     /// The date a stored original carries; `None` when it has none, is gone
@@ -589,8 +609,18 @@ impl Storage {
     /// The names (SHA-256 in hex) of the profile pictures on disk, either
     /// copy. Call from a blocking thread.
     pub fn avatar_names(&self) -> std::io::Result<Vec<String>> {
-        let mut names = Vec::new();
-        for variant in [Variant::Avatar, Variant::AvatarSmall] {
+        self.names(&[Variant::Avatar, Variant::AvatarSmall])
+    }
+
+    /// The names (SHA-256 in hex) of the face crops on disk. Call from a
+    /// blocking thread.
+    pub fn face_names(&self) -> std::io::Result<Vec<String>> {
+        self.names(&[Variant::Face])
+    }
+
+    fn names(&self, variants: &[Variant]) -> std::io::Result<Vec<String>> {
+        let mut names = std::collections::BTreeSet::new();
+        for variant in variants {
             let root = self.root.join(variant.as_str());
             for a in read_dirs(&root)? {
                 for b in read_dirs(&a)? {
@@ -599,17 +629,46 @@ impl Storage {
                         let Some(file) = path.file_name().and_then(|f| f.to_str()) else {
                             continue;
                         };
-                        if self.path_for_file(variant, file).as_ref() == Some(&path)
+                        if self.path_for_file(*variant, file).as_ref() == Some(&path)
                             && let Some((sha, _)) = file.split_once('.')
-                            && !names.iter().any(|n| n == sha)
                         {
-                            names.push(sha.to_owned());
+                            names.insert(sha.to_owned());
                         }
                     }
                 }
             }
         }
-        Ok(names)
+        Ok(names.into_iter().collect())
+    }
+
+    /// Stores a face crop under its name, unless it is there already. Call
+    /// from a blocking thread.
+    pub fn write_face(&self, sha_hex: &str, jpeg: &[u8]) -> AppResult<()> {
+        let path = self
+            .path_for_file(Variant::Face, &Self::file_name(Variant::Face, sha_hex, ""))
+            .ok_or_else(|| AppError::internal("bad storage path"))?;
+        self.write_atomic(&path, jpeg)?;
+        Ok(())
+    }
+
+    /// Whether a face crop is on disk. Call from a blocking thread.
+    pub fn has_face(&self, sha_hex: &str) -> bool {
+        self.path_for_file(Variant::Face, &Self::file_name(Variant::Face, sha_hex, ""))
+            .is_some_and(|p| p.is_file())
+    }
+
+    /// Deletes a face crop. A missing file is not an error.
+    pub fn remove_face(&self, sha_hex: &str) -> std::io::Result<()> {
+        let Some(path) =
+            self.path_for_file(Variant::Face, &Self::file_name(Variant::Face, sha_hex, ""))
+        else {
+            return Ok(());
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Deletes a post's original, thumbnail and sample. Missing files are

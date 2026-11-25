@@ -1058,7 +1058,7 @@ pub(super) async fn load_full(state: &AppState, user_id: i64, id: i64) -> AppRes
     let mut post = load(state, user_id, id).await?;
     post.ocr_text = ocr_text(state, id).await?;
     post.tag_details = super::tags::post_tags(&state.db, id).await?;
-    post.figures = super::figures::load(&state.db, id).await?;
+    post.figures = super::figures::for_answer(state, id).await?;
     Ok(post)
 }
 
@@ -2255,31 +2255,46 @@ pub enum Purge {
     OlderThanDays(u32),
 }
 
-/// Deletes recycle-bin posts and their files. Tag counts were already
-/// lowered when the posts were soft-deleted.
+/// Deletes recycle-bin posts and their files, the crops of their faces
+/// included. Tag counts were already lowered when the posts were
+/// soft-deleted.
 pub async fn purge_posts(state: &AppState, which: Purge) -> AppResult<u64> {
+    // The figures go with their posts, after the statement: they are still
+    // there for the crops' names.
     let query = match which {
         Purge::One(id) => sqlx::query_as(
-            "DELETE FROM posts WHERE deleted_at IS NOT NULL AND id = $1 RETURNING sha256, ext",
+            "WITH gone AS (DELETE FROM posts WHERE deleted_at IS NOT NULL AND id = $1 \
+             RETURNING id, sha256, ext) \
+             SELECT g.sha256, g.ext, ARRAY(SELECT f.face_sha FROM figures f \
+                 WHERE f.post_id = g.id AND f.face_sha IS NOT NULL) FROM gone g",
         )
         .bind(id),
         Purge::OlderThanDays(days) => sqlx::query_as(
-            "DELETE FROM posts WHERE deleted_at IS NOT NULL \
-             AND deleted_at <= now() - make_interval(days => $1) RETURNING sha256, ext",
+            "WITH gone AS (DELETE FROM posts WHERE deleted_at IS NOT NULL \
+             AND deleted_at <= now() - make_interval(days => $1) RETURNING id, sha256, ext) \
+             SELECT g.sha256, g.ext, ARRAY(SELECT f.face_sha FROM figures f \
+                 WHERE f.post_id = g.id AND f.face_sha IS NOT NULL) FROM gone g",
         )
         .bind(i32::try_from(days).unwrap_or(i32::MAX)),
     };
-    let rows: Vec<(Vec<u8>, String)> = query.fetch_all(&state.db).await?;
+    let rows: Vec<(Vec<u8>, String, Vec<Vec<u8>>)> = query.fetch_all(&state.db).await?;
     let count = rows.len() as u64;
+    let faces: Vec<Vec<u8>> = rows
+        .iter()
+        .flat_map(|(_, _, f)| f.iter().cloned())
+        .collect();
     let worker = state.clone();
     tokio::task::spawn_blocking(move || {
-        for (sha, ext) in rows {
+        for (sha, ext, _) in rows {
             if let Err(e) = worker.storage.remove(&hex::encode(sha), &ext) {
                 warn!("purged post left files behind: {e}");
             }
         }
     })
     .await?;
+    if let Err(e) = crate::faces::release(state, faces).await {
+        warn!("purged posts left face crops behind: {e}");
+    }
     Ok(count)
 }
 

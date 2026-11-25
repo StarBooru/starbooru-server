@@ -395,7 +395,8 @@ mod tests {
         );
         assert_eq!(
             body["figures"],
-            json!([{ "kind": "girl", "character": "miku", "tags": { "hair": ["twintails"] } }])
+            json!([{ "kind": "girl", "character": "miku", "franchise": null,
+                     "tags": { "hair": ["twintails"] }, "face": null }])
         );
 
         // Nothing changed on the post.
@@ -414,8 +415,8 @@ mod tests {
         // The figures too, through aliases, with their count tags.
         assert_eq!(
             post["figures"],
-            json!([{ "kind": "girl", "character": "hatsune_miku",
-                     "tags": { "hair": ["twintails"] } }])
+            json!([{ "kind": "girl", "character": "hatsune_miku", "franchise": null,
+                     "tags": { "hair": ["twintails"] }, "face": null }])
         );
         for want in ["twintails", "1girl", "solo"] {
             assert!(names.contains(want), "{names}");

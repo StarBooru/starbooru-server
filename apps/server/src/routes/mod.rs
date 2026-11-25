@@ -17,6 +17,7 @@ mod keys;
 mod library;
 mod modes;
 mod oidc;
+mod people;
 mod posts;
 mod profiles;
 mod remote;
@@ -31,6 +32,9 @@ mod uploads;
 pub use autotag::backfill_meta_tags;
 pub use imports::run_imports;
 pub use library::run_library_imports;
+#[cfg(test)]
+pub use people::fill_due as fill_franchises;
+pub use people::run_franchises;
 pub use posts::{
     backfill_colors, backfill_file_dates, backfill_hashes, backfill_media, backfill_samples,
     backfill_thumbs,
@@ -201,6 +205,8 @@ pub fn router(state: AppState) -> Router {
         .route("/searches", get(searches::list).post(searches::create))
         .route("/searches/{id}", axum::routing::delete(searches::delete))
         .route("/explore", get(explore::explore))
+        .route("/people", get(people::list))
+        .route("/franchises", get(people::franchises))
         .route("/duplicates", get(duplicates::list))
         .route("/duplicates/resolve", post(duplicates::resolve))
         .route("/duplicates/dismiss", post(duplicates::dismiss))

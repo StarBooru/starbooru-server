@@ -53,9 +53,10 @@ cargo clippy -p starbooru-core -p starbooru-client --target wasm32-unknown-unkno
 - 2% of the posts in the bin;
 - votes on 5%;
 - a random difference hash on each post, except 1% that share a blank one (hash 0);
-- 3 to 8 colour cells a post, drawn towards white, black and grey, with teal the rarest.
+- 3 to 8 colour cells a post, drawn towards white, black and grey, with teal the rarest;
+- a fifth of the tags characters and a fifth copyrights, and a figure on one post in 5 naming its first character, half of them with a kept face.
 
-It then times the API calls the clients make most, through the real router, and fails if any median is over 400 ms. Run it in release:
+It then works out every character's franchise (12 s for 1,000 characters and 200,000 figures, in the background on a real server) and times the API calls the clients make most, through the real router, and fails if any median is over 400 ms. The last three calls run after a switch to public, where Explore also works out trending posts, popular tags and popular characters. Run it in release:
 
 ```sh
 STARBOORU_BENCH_POSTS=1000000 cargo test --release -p starbooru-server search_at_scale -- --ignored --nocapture
@@ -83,8 +84,9 @@ Results at 1,000,000 posts (Ryzen 9 5900X, PostgreSQL 17 in Docker, default sett
 | `/posts?q=order:random` | 141 ms |
 | `/posts/{id}`, `/posts/{id}/neighbors`, tag search | under 1.2 ms |
 | `/posts/{id}/related` (a random hash, and a blank one shared by 10,000 posts) | 24–37 ms |
-| `/explore` | 72 ms |
-| `/explore?q=tag_1` | 116 ms |
+| `/explore`, `/explore?q=tag_1` on a private server | 22–31 ms |
+| `/explore`, `/explore?q=tag_1` on a public server (Trending is most of it) | 74–120 ms |
+| `/people` (every order and filter), `/franchises` | 2.1–4.5 ms |
 | `/admin/stats` | 112 ms |
 
 `order:random` sorts every match by `random()`, so it grows with the collection. The admin stats count the whole table.

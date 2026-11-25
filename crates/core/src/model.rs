@@ -625,6 +625,14 @@ pub struct Explore {
     /// Added on today's date (UTC) in earlier years, newest first.
     pub on_this_day: Vec<Post>,
     pub random: Vec<Post>,
+    /// The characters on the most posts. Empty from a server older than
+    /// people in Explore.
+    #[serde(default)]
+    pub people: Vec<crate::people::Person>,
+    /// Public instances: the characters on the posts with the most net
+    /// upvotes in the window.
+    #[serde(default)]
+    pub popular_characters: Vec<crate::people::Person>,
     /// Unknown tags the search corrected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub corrected: Vec<TagCorrection>,

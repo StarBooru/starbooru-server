@@ -1,6 +1,7 @@
 //! The people in a picture ("figures"). Each figure has a kind (girl, boy
-//! or other), maybe a character name and the character they cosplay, and
-//! tags sorted into slots: clothing by where it is worn, then body traits.
+//! or other), maybe a character name, the character they cosplay and the
+//! franchise they come from, where their face is, and tags sorted into
+//! slots: clothing by where it is worn, then body traits.
 //!
 //! A figure's tags are also the post's tags, so ordinary searches find
 //! them. The count tags (`1girl`, `2boys`, `solo`...) follow the figures:
@@ -21,6 +22,31 @@ pub const MAX_FIGURE_TAGS: usize = 64;
 /// Added to a post while any figure cosplays someone.
 pub const COSPLAY_TAG: &str = "cosplay";
 const COSPLAY_SUFFIX: &str = "_(cosplay)";
+/// A face box's edges are thousandths of the picture's width and height.
+pub const FACE_SCALE: u16 = 1000;
+/// The side of a kept face crop, in pixels: sharp at twice the 96 px circle
+/// the apps show it in.
+pub const FACE_SIZE: u32 = 192;
+
+/// Where a face is in the picture: from its top-left corner, in thousandths
+/// of the picture's width (`x`, `w`) and height (`y`, `h`), as the boxes of
+/// panel translations are.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FaceBox {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+impl FaceBox {
+    /// Inside the picture and not empty.
+    pub fn is_valid(self) -> bool {
+        let fits =
+            |at: u16, len: u16| len > 0 && at.checked_add(len).is_some_and(|end| end <= FACE_SCALE);
+        fits(self.x, self.w) && fits(self.y, self.h)
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -177,18 +203,33 @@ pub struct Figure {
     /// post gets the tag `name_(cosplay)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cosplay: Option<String>,
+    /// The franchise (series) the figure comes from, a tag the post gets,
+    /// made a copyright tag when it is new. For a cosplay, the franchise of
+    /// the character they dress as. Always written, `null` for none, so a
+    /// server can tell it from a field an older app leaves out ([`Sent`]).
+    #[serde(default)]
+    pub franchise: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<Slot, Vec<String>>,
+    /// Where the figure's face is. Always written, like `franchise`.
+    #[serde(default)]
+    pub face: Option<FaceBox>,
+    /// Signed, server-relative URL of the kept crop of the face, a square
+    /// JPEG of [`FACE_SIZE`] pixels. Only in answers, and only once the
+    /// server has made it; a request's is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face_url: Option<String>,
 }
 
 impl Figure {
     /// Every tag this figure puts on the post: the character, the cosplay
-    /// tag and the slot tags.
+    /// tag, the franchise and the slot tags.
     pub fn tag_names(&self) -> Vec<String> {
         self.character
             .iter()
             .cloned()
             .chain(self.cosplay.as_deref().map(cosplay_tag))
+            .chain(self.franchise.iter().cloned())
             .chain(self.tags.values().flatten().cloned())
             .collect()
     }
@@ -196,7 +237,16 @@ impl Figure {
     fn tag_count(&self) -> usize {
         usize::from(self.character.is_some())
             + usize::from(self.cosplay.is_some())
+            + usize::from(self.franchise.is_some())
             + self.tags.values().map(Vec::len).sum::<usize>()
+    }
+
+    /// The same person as `other`, as far as an app that doesn't know
+    /// franchises and faces can tell: the same kind, character and cosplay.
+    fn same_person(&self, other: &Figure) -> bool {
+        self.kind == other.kind
+            && self.character == other.character
+            && self.cosplay == other.cosplay
     }
 }
 
@@ -206,12 +256,83 @@ pub struct FiguresUpdate {
     pub figures: Vec<Figure>,
 }
 
+/// Which of the fields older apps don't know one figure of a `PUT
+/// /posts/{id}/figures` body has. [`Figure`] always writes them, so an app
+/// built on this crate sends both; one built before them sends neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sent {
+    pub franchise: bool,
+    pub face: bool,
+}
+
+impl Sent {
+    pub const BOTH: Sent = Sent {
+        franchise: true,
+        face: true,
+    };
+
+    /// What each figure of a [`FiguresUpdate`] body sent, in order. A key
+    /// with `null` counts as sent: it clears the field.
+    pub fn read(body: &serde_json::Value) -> Vec<Sent> {
+        body.get("figures")
+            .and_then(|f| f.as_array())
+            .map(|list| {
+                list.iter()
+                    .map(|figure| Sent {
+                        franchise: figure.get("franchise").is_some(),
+                        face: figure.get("face").is_some(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Gives each figure that left `franchise` or `face` out what the same
+/// person had before, so saving from an app that doesn't know them changes
+/// neither. The same person is an `old` figure of the same kind, character
+/// and cosplay: the one in the same place if it is that, else the first
+/// such one not taken yet. A figure with no such match keeps none.
+pub fn keep_unsent(figures: &mut [Figure], sent: &[Sent], old: &[Figure]) {
+    let mut taken = vec![false; old.len()];
+    for (at, figure) in figures.iter_mut().enumerate() {
+        let sent = sent.get(at).copied().unwrap_or(Sent::BOTH);
+        if sent == Sent::BOTH {
+            continue;
+        }
+        let free = |i: usize| taken.get(i).is_some_and(|t| !t);
+        let here = old
+            .get(at)
+            .filter(|o| free(at) && o.same_person(figure))
+            .map(|_| at);
+        let found = here.or_else(|| {
+            old.iter()
+                .enumerate()
+                .position(|(i, o)| free(i) && o.same_person(figure))
+        });
+        let Some((i, before)) = found.and_then(|i| Some((i, old.get(i)?))) else {
+            continue;
+        };
+        if let Some(t) = taken.get_mut(i) {
+            *t = true;
+        }
+        if !sent.franchise {
+            figure.franchise.clone_from(&before.franchise);
+        }
+        if !sent.face {
+            figure.face = before.face;
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum FigureError {
     #[error("too many people in one post (max {MAX_FIGURES})")]
     TooMany,
     #[error("too many tags on one person (max {MAX_FIGURE_TAGS})")]
     TooManyTags,
+    #[error("a face box has to be inside the picture (edges from 0 to 1000) and not empty")]
+    BadFace,
     #[error(transparent)]
     Tag(#[from] TagError),
 }
@@ -279,8 +400,9 @@ fn clean_name(raw: &str) -> Result<String, TagError> {
 }
 
 /// Normalises figures for saving: names cleaned, empty values dropped, a
-/// tag kept in its first slot only, count tags left out (they are made
-/// from the kinds) and the limits checked.
+/// tag kept in its first place only, count tags left out (they are made
+/// from the kinds), the URL of a face crop dropped (the server makes it)
+/// and the limits checked.
 pub fn clean_figures(figures: Vec<Figure>) -> Result<Vec<Figure>, FigureError> {
     if figures.len() > MAX_FIGURES {
         return Err(FigureError::TooMany);
@@ -293,6 +415,9 @@ pub fn clean_figures(figures: Vec<Figure>) -> Result<Vec<Figure>, FigureError> {
     };
     let mut out = Vec::with_capacity(figures.len());
     for figure in figures {
+        if figure.face.is_some_and(|b| !b.is_valid()) {
+            return Err(FigureError::BadFace);
+        }
         let character = optional(figure.character)?;
         let cosplay = optional(figure.cosplay)?.map(|c| cosplay_name(&c).to_owned());
         let mut seen: Vec<String> = character
@@ -300,6 +425,8 @@ pub fn clean_figures(figures: Vec<Figure>) -> Result<Vec<Figure>, FigureError> {
             .cloned()
             .chain(cosplay.as_deref().map(cosplay_tag))
             .collect();
+        let franchise = optional(figure.franchise)?.filter(|f| !seen.contains(f));
+        seen.extend(franchise.iter().cloned());
         let mut tags = BTreeMap::new();
         for (slot, names) in figure.tags {
             let mut kept = Vec::new();
@@ -319,7 +446,10 @@ pub fn clean_figures(figures: Vec<Figure>) -> Result<Vec<Figure>, FigureError> {
             kind: figure.kind,
             character,
             cosplay,
+            franchise,
             tags,
+            face: figure.face,
+            face_url: None,
         };
         if figure.tag_count() > MAX_FIGURE_TAGS {
             return Err(FigureError::TooManyTags);
@@ -387,16 +517,28 @@ mod tests {
 
     #[test]
     fn cleans_figures() {
+        let face = FaceBox {
+            x: 100,
+            y: 50,
+            w: 200,
+            h: 250,
+        };
         let figure = Figure {
             kind: FigureKind::Boy,
             character: Some("char:Link".into()),
             cosplay: Some("  ".into()),
+            franchise: Some("copyright:The Legend of Zelda".into()),
             tags: BTreeMap::from([
                 (Slot::Hair, vec!["Blonde Hair".into(), "link".into()]),
                 (Slot::Pose, vec!["standing".into(), "1boy".into()]),
-                (Slot::Other, vec!["blonde_hair".into()]),
+                (
+                    Slot::Other,
+                    vec!["blonde_hair".into(), "the_legend_of_zelda".into()],
+                ),
                 (Slot::Shoes, vec![]),
             ]),
+            face: Some(face),
+            face_url: Some("/media/face/x.jpg".into()),
         };
         let clean = clean_figures(vec![figure]).unwrap();
         assert_eq!(
@@ -405,13 +547,26 @@ mod tests {
                 kind: FigureKind::Boy,
                 character: Some("link".into()),
                 cosplay: None,
+                franchise: Some("the_legend_of_zelda".into()),
                 tags: BTreeMap::from([
                     (Slot::Hair, vec!["blonde_hair".into()]),
                     (Slot::Pose, vec!["standing".into()]),
                 ]),
+                face: Some(face),
+                face_url: None,
             }]
         );
-        assert_eq!(clean[0].tag_names(), ["link", "blonde_hair", "standing"]);
+        assert_eq!(
+            clean[0].tag_names(),
+            ["link", "the_legend_of_zelda", "blonde_hair", "standing"]
+        );
+        // A franchise named like the character says nothing more.
+        let same = Figure {
+            character: Some("pikachu".into()),
+            franchise: Some("Pikachu".into()),
+            ..Figure::default()
+        };
+        assert_eq!(clean_figures(vec![same]).unwrap()[0].franchise, None);
     }
 
     #[test]
@@ -431,6 +586,41 @@ mod tests {
             ..Figure::default()
         };
         assert!(matches!(clean_figures(vec![bad]), Err(FigureError::Tag(_))));
+        let bad = Figure {
+            franchise: Some("-x".into()),
+            ..Figure::default()
+        };
+        assert!(matches!(clean_figures(vec![bad]), Err(FigureError::Tag(_))));
+    }
+
+    #[test]
+    fn face_boxes_stay_inside_the_picture() {
+        let at = |x, y, w, h| FaceBox { x, y, w, h };
+        assert!(at(0, 0, 1000, 1000).is_valid());
+        assert!(at(999, 999, 1, 1).is_valid());
+        for bad in [
+            at(0, 0, 0, 10),
+            at(0, 0, 10, 0),
+            at(1, 0, 1000, 10),
+            at(0, 995, 10, 6),
+            at(u16::MAX, 0, 1, 1),
+            at(0, 0, u16::MAX, u16::MAX),
+        ] {
+            assert!(!bad.is_valid(), "{bad:?}");
+            let figure = Figure {
+                face: Some(bad),
+                ..Figure::default()
+            };
+            assert_eq!(clean_figures(vec![figure]), Err(FigureError::BadFace));
+        }
+        // Negative or fractional edges aren't a box at all.
+        for json in [
+            r#"{"kind":"girl","face":{"x":-1,"y":0,"w":5,"h":5}}"#,
+            r#"{"kind":"girl","face":{"x":1.5,"y":0,"w":5,"h":5}}"#,
+            r#"{"kind":"girl","face":{"x":1,"y":0,"w":5}}"#,
+        ] {
+            assert!(serde_json::from_str::<Figure>(json).is_err(), "{json}");
+        }
     }
 
     #[test]
@@ -448,6 +638,117 @@ mod tests {
             ..Figure::default()
         })
         .unwrap();
-        assert_eq!(json, r#"{"kind":"girl","tags":{"shoes":["boots"]}}"#);
+        // The fields older apps don't know are always there, null or not.
+        assert_eq!(
+            json,
+            r#"{"kind":"girl","franchise":null,"tags":{"shoes":["boots"]},"face":null}"#
+        );
+        // What an older server or app sends still reads.
+        let old: Figure = serde_json::from_str(
+            r#"{"kind":"boy","character":"link","tags":{"hair":["blonde_hair"]}}"#,
+        )
+        .unwrap();
+        assert_eq!((old.franchise, old.face, old.face_url), (None, None, None));
+    }
+
+    fn named(kind: FigureKind, character: &str) -> Figure {
+        Figure {
+            kind,
+            character: (!character.is_empty()).then(|| character.to_owned()),
+            ..Figure::default()
+        }
+    }
+
+    #[test]
+    fn reads_which_new_fields_were_sent() {
+        let body = serde_json::json!({"figures": [
+            {"kind": "girl"},
+            {"kind": "girl", "franchise": null, "face": null},
+            {"kind": "boy", "face": {"x": 1, "y": 1, "w": 2, "h": 2}},
+        ]});
+        assert_eq!(
+            Sent::read(&body),
+            [
+                Sent {
+                    franchise: false,
+                    face: false
+                },
+                Sent::BOTH,
+                Sent {
+                    franchise: false,
+                    face: true
+                },
+            ]
+        );
+        assert!(Sent::read(&serde_json::json!({"figures": 3})).is_empty());
+        assert!(Sent::read(&serde_json::json!([])).is_empty());
+    }
+
+    #[test]
+    fn an_older_app_keeps_what_it_did_not_send() {
+        let face = |x| {
+            Some(FaceBox {
+                x,
+                y: 0,
+                w: 10,
+                h: 10,
+            })
+        };
+        let with = |mut f: Figure, franchise: &str, x| {
+            f.franchise = Some(franchise.to_owned());
+            f.face = face(x);
+            f
+        };
+        let old = vec![
+            with(named(FigureKind::Girl, "saber"), "fate", 1),
+            with(named(FigureKind::Girl, "rin"), "fate", 2),
+            with(named(FigureKind::Girl, ""), "touhou", 3),
+            with(named(FigureKind::Girl, ""), "touhou", 4),
+        ];
+        let neither = Sent {
+            franchise: false,
+            face: false,
+        };
+
+        // Saber left out: Rin is found further down, and the unnamed girls in order.
+        let mut figures = vec![
+            named(FigureKind::Girl, "rin"),
+            named(FigureKind::Girl, ""),
+            named(FigureKind::Girl, ""),
+        ];
+        keep_unsent(&mut figures, &[neither; 3], &old);
+        assert_eq!(figures[0], old[1]);
+        assert_eq!(figures[1], old[2]);
+        assert_eq!(figures[2], old[3]);
+
+        // Another kind, character or cosplay is someone else: nothing kept.
+        let mut figures = vec![
+            named(FigureKind::Boy, "saber"),
+            named(FigureKind::Girl, "artoria"),
+        ];
+        keep_unsent(&mut figures, &[neither; 2], &old);
+        assert_eq!((figures[0].face, figures[1].face), (None, None));
+        assert_eq!(figures[1].franchise, None);
+
+        // What was sent stays as sent, a null included.
+        let mut figures = vec![named(FigureKind::Girl, "saber")];
+        figures[0].face = face(9);
+        let sent = Sent {
+            franchise: false,
+            face: true,
+        };
+        keep_unsent(&mut figures, &[sent], &old);
+        assert_eq!(figures[0].franchise.as_deref(), Some("fate"));
+        assert_eq!(figures[0].face, face(9));
+        let mut figures = vec![named(FigureKind::Girl, "saber")];
+        keep_unsent(&mut figures, &[Sent::BOTH], &old);
+        assert_eq!(
+            (figures[0].franchise.as_deref(), figures[0].face),
+            (None, None)
+        );
+        // A figure past the list of what was sent counts as sending both.
+        let mut figures = vec![named(FigureKind::Girl, "saber")];
+        keep_unsent(&mut figures, &[], &old);
+        assert_eq!(figures[0].face, None);
     }
 }

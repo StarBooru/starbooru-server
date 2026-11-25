@@ -115,12 +115,21 @@ pub async fn edit(
     .bind(id)
     .execute(&state.db)
     .await?;
-    let figures = super::figures::load(&state.db, id).await?;
+    let mut figures = super::figures::load(&state.db, id).await?;
     if !figures.is_empty() {
+        // Faces move with the picture; one cut off loses its box.
+        let side = |v: Option<i32>| v.and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
+        let (width, height) = (side(post.width), side(post.height));
+        for figure in &mut figures {
+            figure.face = figure
+                .face
+                .and_then(|face| req.move_face(width, height, face));
+        }
         let mut tx = state.db.begin().await?;
         posts::lock_live(&mut tx, copy.id).await?;
-        super::figures::replace(&mut tx, copy.id, figures).await?;
+        let saved = super::figures::replace(&mut tx, copy.id, figures, false).await?;
         tx.commit().await?;
+        saved.settle(&state).await;
     }
     if req.bin_original {
         posts::set_deleted(&state, &user, id, true).await?;

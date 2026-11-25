@@ -38,7 +38,7 @@ Admins download and delete backups on the same page and change the schedule ther
 
 A backup taken while a library import is waiting or running also holds the key to the other site, as it's kept until the import ends.
 
-A backup holds the database only. The media files are immutable and named by their hash, so copying the data folder (or the `media` volume) is all they need.
+A backup holds the database only. The media files are immutable and named by their hash, so copying the data folder (or the `media` volume) is all they need. That includes the crops of faces (`face/`); if they are missing after a restore, the server makes them again from the originals at its next start.
 
 The image ships the PostgreSQL 17 client. `pg_dump` must be at least as new as the database server, so update the image too if you move the `db` service to a newer PostgreSQL. Elsewhere, install the client or point `STARBOORU_PG_DUMP` at it.
 
