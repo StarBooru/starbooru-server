@@ -23,7 +23,8 @@
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
+use std::time::SystemTime;
 
 use axum::Router;
 use axum::body::Body;
@@ -65,23 +66,43 @@ const MIN_TRUNK_HASH: usize = 12;
 const MIN_COMPRESS_BYTES: u64 = 1024;
 
 struct WebApp {
+    dir: PathBuf,
     files: ServeDir,
-    /// `index.html` with the preloads added.
-    page: String,
+    page: RwLock<Page>,
+}
+
+/// `index.html` with the preloads added, and when the file was written.
+#[derive(Clone)]
+struct Page {
+    modified: Option<SystemTime>,
+    html: Arc<str>,
+}
+
+impl Page {
+    fn read(dir: &Path) -> Option<Page> {
+        let path = dir.join("index.html");
+        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let page =
+            read_capped(&path, MAX_PAGE_BYTES).and_then(|bytes| String::from_utf8(bytes).ok())?;
+        Some(Page {
+            modified,
+            html: with_preloads(&page, dir).into(),
+        })
+    }
 }
 
 /// The service that answers every path the API doesn't. `None` when the
 /// directory has no `index.html`.
 pub fn service(dir: &Path) -> Option<Router> {
-    let page = read_capped(&dir.join("index.html"), MAX_PAGE_BYTES)
-        .and_then(|bytes| String::from_utf8(bytes).ok())?;
+    let page = Page::read(dir)?;
     let app = Arc::new(WebApp {
+        dir: dir.to_path_buf(),
         // The page comes from `page`, so a directory is just not found.
         files: ServeDir::new(dir)
             .precompressed_br()
             .precompressed_gzip()
             .append_index_html_on_directories(false),
-        page: with_preloads(&page, dir),
+        page: RwLock::new(page),
     });
     Some(
         Router::new()
@@ -98,7 +119,7 @@ impl WebApp {
         let path = req.uri().path().to_owned();
         let reads = matches!(*req.method(), Method::GET | Method::HEAD);
         if reads && matches!(path.as_str(), "/" | "/index.html") {
-            return self.page();
+            return self.page().await;
         }
         let mut response = match self.files.clone().oneshot(req).await {
             Ok(found) => found.map(Body::new),
@@ -108,7 +129,7 @@ impl WebApp {
         // Single-page app: the router in the page knows the other paths. A
         // missing asset stays missing, as a page is no use to a script tag.
         if status == StatusCode::NOT_FOUND && reads && !is_asset(&path) {
-            return self.page();
+            return self.page().await;
         }
         if status.is_success() || status == StatusCode::NOT_MODIFIED {
             let keep = HeaderValue::from_static(cache_policy(&path));
@@ -123,8 +144,33 @@ impl WebApp {
         response
     }
 
-    fn page(&self) -> Response {
-        let mut response = Response::new(Body::from(self.page.clone()));
+    /// The page as it was prepared, again when `index.html` has changed: a
+    /// bundle unpacked over the old one needs no restart.
+    async fn current(&self) -> Arc<str> {
+        let kept = self
+            .page
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let modified = tokio::fs::metadata(self.dir.join("index.html"))
+            .await
+            .and_then(|m| m.modified())
+            .ok();
+        if modified.is_none() || modified == kept.modified {
+            return kept.html;
+        }
+        let dir = self.dir.clone();
+        // Half-written or gone: the page it had still works better than none.
+        let Ok(Some(fresh)) = tokio::task::spawn_blocking(move || Page::read(&dir)).await else {
+            return kept.html;
+        };
+        let html = fresh.html.clone();
+        *self.page.write().unwrap_or_else(PoisonError::into_inner) = fresh;
+        html
+    }
+
+    async fn page(&self) -> Response {
+        let mut response = Response::new(Body::from(self.current().await.to_string()));
         let headers = response.headers_mut();
         headers.insert(
             header::CONTENT_TYPE,
@@ -574,6 +620,46 @@ mod tests {
         // Regression: a stale page asking for last version's wasm got HTML back.
         let (response, _) = get(&app, "/assets/app_bg-dxh0123456789abcdef.wasm", None).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_new_bundle_needs_no_restart() {
+        let dir = bundle();
+        let app = service(dir.path()).unwrap();
+        let (_, body) = get(&app, "/", None).await;
+        assert!(
+            String::from_utf8(body)
+                .unwrap()
+                .contains("<title>StarBooru</title>")
+        );
+        // Regression: the page read at start kept naming the old wasm.
+        let index = dir.path().join("index.html");
+        std::fs::write(&index, "<html><head><title>Next</title></head></html>").unwrap();
+        let later = SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&index)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        for path in ["/", "/post/12"] {
+            let (_, body) = get(&app, path, None).await;
+            assert!(
+                String::from_utf8(body)
+                    .unwrap()
+                    .contains("<title>Next</title>"),
+                "{path}"
+            );
+        }
+        // Gone meanwhile: the last page stays.
+        std::fs::remove_file(&index).unwrap();
+        let (response, body) = get(&app, "/", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            String::from_utf8(body)
+                .unwrap()
+                .contains("<title>Next</title>")
+        );
     }
 
     #[tokio::test]
