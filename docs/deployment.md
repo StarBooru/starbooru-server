@@ -128,6 +128,7 @@ Admins can change the name, open registration, the recycle-bin days, the score k
 | `STARBOORU_AI_TAGGING` | see meaning | Where tag suggestions start: `off`, `local` or `api`. Unset: `api` when `STARBOORU_AI_URL` is set, else `local` when `STARBOORU_LOCAL_AI` is on, else `off`. |
 | `STARBOORU_AI_TRANSLATION` | see meaning | Where translations start, the same way |
 | `STARBOORU_AI_COMICS` | see meaning | Where comic translation starts, the same way |
+| `STARBOORU_AI_PEOPLE` | `off` | Where finding people starts: `off`, `local` or `api`. Off unless set, as it runs the tagger a few times for each picture. |
 | `STARBOORU_AI_WORKER` | next to the server | A specific AI worker binary, instead of `starbooru-ai-worker-gpu` then `starbooru-ai-worker` |
 | `STARBOORU_AI_TRANSLATE_TO` | unset | Translate new uploads in which OCR finds text into this language (`en`, `it`, `pt-BR`), drawn over the image (see *Comics and manga* below). Unset: only when someone asks in the viewer. |
 | `STARBOORU_TRUST_PROXY` | `false` (`true` in `docker-compose.yml`) | Take the client address from the last `X-Forwarded-For` entry, for the sign-in limits and the limit on visitors without an account. Turn it on only behind a reverse proxy that sets the header (Traefik does); otherwise clients could pick their own address. |
@@ -144,7 +145,7 @@ Admins can change the name, open registration, the recycle-bin days, the score k
 
 ## Local AI
 
-Tag suggestions, translation and comic translation can run inside StarBooru, on models made for each job. Nothing leaves the server and there is no per-image cost. In Administration › Server › AI each tool is **Off**, **Local** or **API**.
+Tag suggestions, translation, comic translation and finding people can run inside StarBooru, on models made for each job. Nothing leaves the server and there is no per-image cost. In Administration › Server › AI each tool is **Off**, **Local** or **API**.
 
 **Local** needs nothing else: choose a speed and the server downloads the model, resumes after a failure, checks every file's SHA-256, restarts the worker if it dies, downloads again any file that gets damaged, and frees the memory after 10 idle minutes. Models live in `STARBOORU_DATA_DIR/ai/models`, so they survive updates (and are in volume backups of `/data`; leave that folder out to save space).
 
@@ -179,10 +180,12 @@ Under *Models* you can install, uninstall or use any model that fits in memory; 
 | Comics | Detector L, Manga OCR, M2M-100 | see above | 4.9 s | | 2.7 GB | Apache-2.0, MIT |
 | Comics | Detector L, Manga OCR, MADLAD-400 | see above | 5.2 s | | 5.7 GB | Apache-2.0 |
 | Comics | Detector L, Manga OCR, TranslateGemma (high accuracy) | see above | 38 s | 6 s | 3.1 GB | Apache-2.0, Gemma Terms |
+| People | YuNet, anime face detector, WD SwinV2 v3 | 12 MB plus the tagger | 3.6 s | | 1.0 GB | MIT, Apache-2.0 |
+| People | YuNet, anime face detector, WD EVA02 Large v3 (high accuracy) | 12 MB plus the tagger | 15 s | | 2.2 GB | MIT, Apache-2.0 |
 
-Times are for one picture, one sentence or one page of eight balloons with the model already loaded, measured on two cores of a Ryzen 5900X and on the card through Vulkan. The first answer after loading also reads the model from disk, up to about 10 s more for the big ones. An empty card column means the processor is faster and stays in use. A slower server takes longer; a Raspberry Pi hasn't been measured. So on those two cores Accurate is greyed out for comics, and with that card all three speeds run the High accuracy models for tags.
+Times are for one picture, one sentence, one page of eight balloons or a picture of two people with the model already loaded, measured on two cores of a Ryzen 5900X and on the card through Vulkan. The first answer after loading also reads the model from disk, up to about 10 s more for the big ones. An empty card column means the processor is faster and stays in use. A slower server takes longer; a Raspberry Pi hasn't been measured. So on those two cores Accurate is greyed out for comics, and with that card all three speeds run the High accuracy models for tags.
 
-**API** sends the same work to any OpenAI-compatible address, hosted or on your network, such as Ollama (`http://host:11434/v1`), LM Studio or llama.cpp. Each tool has its own address, model and key. Tagging and comics need a model that reads images.
+**API** sends the same work to any OpenAI-compatible address, hosted or on your network, such as Ollama (`http://host:11434/v1`), LM Studio or llama.cpp. Each tool has its own address, model and key. Tagging, comics and people need a model that reads images. For people the server still finds the faces itself when it can (it downloads the two face detectors, 12 MB, and needs the AI runtime) and sends their boxes with the picture; otherwise the model finds them too.
 
 ### Graphics cards
 

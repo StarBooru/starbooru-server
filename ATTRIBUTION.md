@@ -19,6 +19,8 @@ Not bundled: downloaded from Hugging Face by each server when its admin installs
 | MADLAD-400 3B (ONNX) | Google, Kutalia | https://huggingface.co/Kutalia/madlad400-3b-mt-onnx | Apache-2.0 |
 | TranslateGemma 4B (ONNX) | Google, onnx-community | https://huggingface.co/onnx-community/translategemma-text-4b-it-ONNX | Gemma Terms of Use |
 | Comic text and bubble detector | ogkalu | https://huggingface.co/ogkalu/comic-text-and-bubble-detector | Apache-2.0 |
+| YuNet face detector (2023mar) | Shiqi Yu, OpenCV | https://huggingface.co/opencv/face_detection_yunet | MIT |
+| Anime face detection (YOLOv8n, v1.4) | deepghs | https://huggingface.co/deepghs/anime_face_detection | MIT |
 | Manga OCR (ONNX) | kha-white (Apache-2.0), l0wgear (conversion, repository states no license) | https://huggingface.co/l0wgear/manga-ocr-2025-onnx | See author column |
 
 Built into the image: ONNX Runtime (Microsoft, MIT). `AI_GPU=vulkan` adds Dawn (Google, BSD-3-Clause); `AI_GPU=nvidia` adds NVIDIA's CUDA libraries under the NVIDIA software license, on the machine that builds the image.

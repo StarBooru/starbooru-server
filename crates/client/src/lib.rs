@@ -33,7 +33,7 @@ use starbooru_core::{
     NewThread, Profile, ProfileUpdate, TagRemovalPage, TagVoteRequest, ThreadPage, ThreadUpdate,
     ThreadView,
 };
-use starbooru_core::{Blacklist, FranchisePage, Home, PeoplePage, PeopleQuery};
+use starbooru_core::{Blacklist, FoundPeople, FranchisePage, Home, PeoplePage, PeopleQuery};
 use starbooru_core::{Mode, ModePreview, ModeSwitch, ModeSwitched, ScoreKind, ScorePreview};
 use std::time::Duration;
 use thiserror::Error;
@@ -454,6 +454,13 @@ impl Client {
     /// Tags an AI model suggests for a post. The post is not changed.
     pub async fn suggest_tags(&self, id: i64) -> Result<TagSuggestions> {
         Self::send(self.request(Method::POST, &format!("/posts/{id}/suggest-tags"))?).await
+    }
+
+    /// The people an AI model finds in a post's picture, each with a face
+    /// box and a preview of its crop. The post is not changed: saving them
+    /// is [`Client::set_figures`].
+    pub async fn find_people(&self, id: i64) -> Result<FoundPeople> {
+        Self::send(self.request(Method::POST, &format!("/posts/{id}/find-people"))?).await
     }
 
     /// Translates the text in a post's image (OCR) into the language with

@@ -15,7 +15,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use starbooru_core::ai::{ParsedSuggestions, TAG_PROMPT};
 use starbooru_core::tag::normalize_tags;
-use starbooru_core::{AiMode, AiPreset, AiTool, TagCategory, parse_suggestions};
+use starbooru_core::{AiMode, AiPreset, AiTool, Figure, TagCategory, parse_suggestions};
 use tokio::sync::Semaphore;
 use tracing::warn;
 
@@ -301,33 +301,126 @@ pub async fn suggest(
 }
 
 /// Starts auto-tagging a new post in the background when it is wanted: by
-/// the uploader, or else by the server's setting. Failures are logged without
-/// content and never affect the upload.
+/// the uploader, or else by the server's setting, then finding its people
+/// when that tool is on. An uploader who turns auto-tagging off gets
+/// neither. Failures are logged without content and never affect the
+/// upload.
 pub fn autotag_later(state: &AppState, post_id: i64, wanted: Option<bool>) {
     if wanted == Some(false) {
         return;
     }
     let state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = autotag(&state, post_id, wanted).await {
-            warn!(post_id, "automatic tagging failed: {e}");
-        }
-    });
+    tokio::spawn(async move { after_upload(&state, post_id, wanted).await });
 }
 
-async fn autotag(state: &AppState, post_id: i64, wanted: Option<bool>) -> AppResult<()> {
+/// What [`autotag_later`] runs.
+pub(crate) async fn after_upload(state: &AppState, post_id: i64, wanted: Option<bool>) {
+    let people = crate::people_ai::is_on(state).await;
+    let held = match autotag(state, post_id, wanted, people).await {
+        Ok(held) => held,
+        Err(e) => {
+            warn!(post_id, "automatic tagging failed: {e}");
+            Vec::new()
+        }
+    };
+    if !people {
+        return;
+    }
+    // After the tags, which count towards the post's limit.
+    let found = match crate::people_ai::find_for_new_post(state, post_id).await {
+        Ok(saved) => saved,
+        Err(e) => {
+            warn!(post_id, "finding people failed: {e}");
+            false
+        }
+    };
+    // The tagging model's people, without faces, only when the people
+    // tool found none.
+    if !found && let Err(e) = add_figures(state, post_id, held).await {
+        warn!(post_id, "automatic tagging failed: {e}");
+    }
+}
+
+/// Tags a new post. With `hold_figures` the model's people aren't saved but
+/// returned, for the people tool to go first.
+async fn autotag(
+    state: &AppState,
+    post_id: i64,
+    wanted: Option<bool>,
+    hold_figures: bool,
+) -> AppResult<Vec<Figure>> {
     let setup = crate::settings::ai(state).await?;
     let tool = setup.tool(AiTool::Tagging);
     if !wanted.unwrap_or(setup.autotag) || tool.mode == AiMode::Off {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let route = route(state, &tool).await?;
     let _slot = AUTOTAG_SLOTS
         .acquire()
         .await
         .map_err(|_| AppError::Internal("auto-tagging is shutting down".into()))?;
-    let parsed = suggest(state, &route, post_id).await?;
-    add_tags(state, post_id, &parsed).await
+    let mut parsed = suggest(state, &route, post_id).await?;
+    let held = if hold_figures {
+        std::mem::take(&mut parsed.figures)
+    } else {
+        Vec::new()
+    };
+    add_tags(state, post_id, &parsed).await?;
+    Ok(held)
+}
+
+/// Saves suggested figures on a locked post when it has none yet and they
+/// fit under the tag limit with its `tags`.
+async fn save_new_figures(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    post_id: i64,
+    tags: usize,
+    figures: &[Figure],
+) -> AppResult<Option<crate::routes::Saved>> {
+    if figures.is_empty() {
+        return Ok(None);
+    }
+    let has_figures: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM figures WHERE post_id = $1)")
+            .bind(post_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    // An answer too long to fit on the post still gives its tags.
+    let figure_tags: usize = figures.iter().map(|f| f.tag_names().len()).sum();
+    let fits = tags + figure_tags + figures.len() < starbooru_core::tag::MAX_TAGS_PER_POST;
+    if has_figures || !fits {
+        return Ok(None);
+    }
+    Ok(Some(
+        crate::routes::replace_figures(tx, post_id, figures.to_vec(), true).await?,
+    ))
+}
+
+/// Saves found people on a post that has none yet, through the normal
+/// path: their tags join the post's and the crops follow. Whether they were
+/// saved.
+pub async fn add_figures(state: &AppState, post_id: i64, figures: Vec<Figure>) -> AppResult<bool> {
+    if figures.is_empty() {
+        return Ok(false);
+    }
+    let mut tx = state.db.begin().await?;
+    let tags: Option<i32> = sqlx::query_scalar(
+        "SELECT cardinality(tag_ids) FROM posts WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(post_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(tags) = tags else {
+        return Ok(false); // deleted meanwhile
+    };
+    let tags = usize::try_from(tags).unwrap_or(0);
+    let saved = save_new_figures(&mut tx, post_id, tags, &figures).await?;
+    tx.commit().await?;
+    let Some(saved) = saved else {
+        return Ok(false);
+    };
+    saved.settle(state).await;
+    Ok(true)
 }
 
 /// Adds suggested tags to a post through the normal tag path. New tags get
@@ -365,20 +458,7 @@ pub async fn add_tags(state: &AppState, post_id: i64, parsed: &ParsedSuggestions
     }
     let names = normalize_tags(names.iter().map(String::as_str))?;
     crate::routes::set_post_tags(&mut tx, post_id, &names).await?;
-    let has_figures: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM figures WHERE post_id = $1)")
-            .bind(post_id)
-            .fetch_one(&mut *tx)
-            .await?;
-    // An answer too long to fit on the post still gives its tags.
-    let figure_tags: usize = parsed.figures.iter().map(|f| f.tag_names().len()).sum();
-    let fits =
-        names.len() + figure_tags + parsed.figures.len() < starbooru_core::tag::MAX_TAGS_PER_POST;
-    let saved = if !has_figures && !parsed.figures.is_empty() && fits {
-        Some(crate::routes::replace_figures(&mut tx, post_id, parsed.figures.clone(), true).await?)
-    } else {
-        None
-    };
+    let saved = save_new_figures(&mut tx, post_id, names.len(), &parsed.figures).await?;
     tx.commit().await?;
     if let Some(saved) = saved {
         saved.settle(state).await;

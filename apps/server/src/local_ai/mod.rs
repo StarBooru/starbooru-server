@@ -20,9 +20,12 @@ use std::time::Duration;
 use base64::Engine as _;
 use starbooru_core::ai::ParsedSuggestions;
 use starbooru_core::ai_catalog::{
-    self, COMPONENTS, Calibration, CatalogModel, Component, Engine, MODELS, Machine, Measured,
+    self, COMPONENTS, Calibration, CatalogModel, Component, Engine, FACE_FINDERS, MODELS, Machine,
+    Measured,
 };
-use starbooru_core::ai_worker::{DAMAGED_MODEL, TextBox, WorkerReply, WorkerRequest};
+use starbooru_core::ai_worker::{
+    DAMAGED_MODEL, FoundFace, FoundPerson, TextBox, WorkerReply, WorkerRequest,
+};
 use starbooru_core::{
     AiAdminStatus, AiInstallProgress, AiMode, AiModelOption, AiPreset, AiPresetOption,
     AiRuntimeStatus, AiTool, AiToolSettings, AiToolState, AiToolStatus, TextBlock,
@@ -711,6 +714,15 @@ pub(crate) async fn sweep(state: &AppState, retry: bool) {
             ai.enqueue(target);
         }
     }
+    // An AI provider is told where the faces are, found here.
+    if setup.tool(AiTool::People).mode == AiMode::Api {
+        for part in face_finders().filter(|c| !install::is_installed(&ai.models, c)) {
+            let _turn = ai.download.lock().await;
+            if let Err(e) = install::install(&ai.models, part, |_| {}).await {
+                warn!(part = part.id, "downloading a face finder failed: {e}");
+            }
+        }
+    }
     loop {
         let next = {
             let mut shared = ai.shared();
@@ -759,6 +771,46 @@ pub async fn tag(state: &AppState, active: &Active, jpeg: &[u8]) -> AppResult<Pa
     match ask(&state.local_ai, active.model, &request, ANSWER_TIMEOUT).await? {
         WorkerReply::Tags { tags, rating } => Ok(ParsedSuggestions::from_found(tags, rating)),
         _ => Err(not_understood()),
+    }
+}
+
+fn face_finders() -> impl Iterator<Item = &'static Component> {
+    FACE_FINDERS
+        .iter()
+        .filter_map(|id| ai_catalog::component(id))
+}
+
+/// Finds the people in a picture with a people model.
+pub async fn people(state: &AppState, active: &Active, jpeg: &[u8]) -> AppResult<Vec<FoundPerson>> {
+    let request = WorkerRequest::People {
+        model: active.model.id.to_owned(),
+        gpu: active.gpu,
+        jpeg: encoded(jpeg),
+    };
+    match ask(&state.local_ai, active.model, &request, ANSWER_TIMEOUT).await? {
+        WorkerReply::People { people } => Ok(people),
+        _ => Err(not_understood()),
+    }
+}
+
+/// Only the faces in a picture, when the face finders are here: for an AI
+/// provider to describe. `None` when they can't run.
+pub async fn faces(state: &AppState, jpeg: &[u8]) -> Option<Vec<FoundFace>> {
+    let ai = &state.local_ai;
+    if !ai.runtime().ready || !face_finders().all(|c| install::is_installed(&ai.models, c)) {
+        return None;
+    }
+    let request = WorkerRequest::Faces {
+        gpu: false,
+        jpeg: encoded(jpeg),
+    };
+    match ai.worker.request(&request, ANSWER_TIMEOUT).await {
+        Ok(WorkerReply::Faces { faces }) => Some(faces),
+        Ok(_) => None,
+        Err(e) => {
+            warn!("finding faces failed: {e}");
+            None
+        }
     }
 }
 

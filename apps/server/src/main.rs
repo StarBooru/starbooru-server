@@ -18,6 +18,7 @@ mod modes;
 mod ocr;
 mod oidc;
 mod panels;
+mod people_ai;
 mod probe;
 mod remote;
 mod routes;

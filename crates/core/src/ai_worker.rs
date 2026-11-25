@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::figure::FaceBox;
 use crate::model::{Rating, TagCategory};
 
 /// The worker's error when a model's files on disk don't load. The server then
@@ -44,6 +45,15 @@ pub enum WorkerRequest {
         jpeg: String,
         boxes: Vec<TextBox>,
     },
+    /// Finds the faces in a picture and reads each person with the model's
+    /// tagger.
+    People {
+        model: String,
+        gpu: bool,
+        jpeg: String,
+    },
+    /// Only finds the faces, for an AI provider to describe.
+    Faces { gpu: bool, jpeg: String },
     /// Frees all models.
     Unload,
 }
@@ -64,6 +74,23 @@ pub struct FoundTag {
     #[serde(default)]
     pub category: Option<TagCategory>,
     pub score: f32,
+}
+
+/// A face a face finder found.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FoundFace {
+    pub face: FaceBox,
+    pub score: f32,
+}
+
+/// A person found by their face, with what the tagger read off a crop of
+/// the face and one of the body below it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FoundPerson {
+    pub face: FaceBox,
+    pub score: f32,
+    pub face_tags: Vec<FoundTag>,
+    pub body_tags: Vec<FoundTag>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -97,6 +124,12 @@ pub enum WorkerReply {
     },
     Texts {
         texts: Vec<String>,
+    },
+    People {
+        people: Vec<FoundPerson>,
+    },
+    Faces {
+        faces: Vec<FoundFace>,
     },
     Done,
     Error {

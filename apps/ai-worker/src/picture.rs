@@ -5,6 +5,7 @@ use std::io::Cursor;
 use base64::Engine;
 use image::imageops::FilterType;
 use image::{ImageReader, Limits, RgbImage};
+use starbooru_core::people_ai::{Letterbox, Rect};
 
 /// The server sends pictures of 1536 px at most.
 const MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
@@ -90,6 +91,43 @@ pub fn padded_bgr_hwc(image: &RgbImage, size: u32) -> (Vec<i64>, Vec<f32>) {
     (vec![1, side, side, 3], data)
 }
 
+/// The picture fit into `fit` pixels and put in the top-left corner of a
+/// `side`² square of `fill`: channels first in the order given, each value
+/// times `scale`. With the [`Letterbox`] that maps boxes back.
+pub fn letterboxed_chw(
+    image: &RgbImage,
+    fit: u32,
+    side: u32,
+    fill: u8,
+    order: [usize; 3],
+    scale: f32,
+) -> (Letterbox, Vec<i64>, Vec<f32>) {
+    let fit = fit.clamp(1, side.max(1));
+    let side = side.max(1);
+    let lb = Letterbox::new(image.width(), image.height(), fit);
+    let small = image::imageops::resize(image, lb.width, lb.height, FilterType::Triangle);
+    let mut canvas = RgbImage::from_pixel(side, side, image::Rgb([fill; 3]));
+    image::imageops::replace(&mut canvas, &small, 0, 0);
+    let pixels = canvas.as_raw();
+    let mut data = Vec::with_capacity(pixels.len());
+    for channel in order {
+        data.extend(
+            pixels
+                .iter()
+                .skip(channel)
+                .step_by(3)
+                .map(|&v| f32::from(v) * scale),
+        );
+    }
+    let s = i64::from(side);
+    (lb, vec![1, 3, s, s], data)
+}
+
+/// A part of the picture, as a picture of its own.
+pub fn crop(image: &RgbImage, rect: Rect) -> RgbImage {
+    image::imageops::crop_imm(image, rect.x, rect.y, rect.w.max(1), rect.h.max(1)).to_image()
+}
+
 /// A square grey crop for Manga OCR: channels first, -1 to 1.
 pub fn ocr_crop(
     image: &RgbImage,
@@ -169,6 +207,35 @@ mod tests {
         let (_, bgr) = padded_chw(&red, 2, [2, 1, 0], [0.0; 3], [1.0; 3]);
         assert_eq!(bgr.first(), Some(&0.0));
         assert_eq!(bgr.last(), Some(&1.0));
+    }
+
+    #[test]
+    fn letterboxes_go_in_the_corner() {
+        let wide = RgbImage::from_pixel(40, 20, image::Rgb([255, 0, 0]));
+        let (lb, shape, data) = letterboxed_chw(&wide, 8, 10, 0, [2, 1, 0], 1.0);
+        assert_eq!((lb.width, lb.height), (8, 4));
+        assert_eq!(shape, [1, 3, 10, 10]);
+        assert_eq!(data.len(), 3 * 10 * 10);
+        // Blue first: the picture's blue is 0, its red 255; the rest is fill.
+        let red = &data[200..300];
+        assert_eq!(red[0], 255.0);
+        assert_eq!(red[7], 255.0);
+        assert_eq!(red[8], 0.0);
+        assert_eq!(red[4 * 10], 0.0);
+        let (_, _, scaled) = letterboxed_chw(&wide, 64, 10, 114, [0, 1, 2], 0.5);
+        assert_eq!(scaled.len(), 300);
+        assert_eq!(scaled[0], 127.5);
+        assert_eq!(scaled[299], 57.0);
+        let cut = crop(
+            &wide,
+            Rect {
+                x: 39,
+                y: 19,
+                w: 10,
+                h: 10,
+            },
+        );
+        assert!(cut.width() >= 1 && cut.height() >= 1);
     }
 
     #[test]

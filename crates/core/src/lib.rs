@@ -27,6 +27,7 @@ pub mod oidc;
 pub mod panels;
 pub mod password;
 pub mod people;
+pub mod people_ai;
 pub mod profile;
 pub mod query;
 pub mod remote;
@@ -81,6 +82,7 @@ pub use oidc::{Identity, OidcBegin, OidcError, OidcFinish, OidcStart, SignInMeth
 pub use panels::{PanelTranslation, TextBlock, panel_prompt, parse_panel_blocks};
 pub use password::{password_is_weak, password_strength, strength_hue};
 pub use people::{Franchise, FranchisePage, PeopleOrder, PeoplePage, PeopleQuery, Person};
+pub use people_ai::FoundPeople;
 pub use profile::{
     AvatarCrop, Profile, ProfileError, ProfileUpdate, UserCard, avatar_square, clean_about,
     clean_display_name,

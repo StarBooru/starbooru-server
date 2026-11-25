@@ -67,17 +67,31 @@ pub enum AiTool {
     Tagging,
     Translation,
     Comics,
+    /// Finds the people in a picture and fills in who they are.
+    People,
 }
 
 impl AiTool {
-    pub const ALL: [AiTool; 3] = [AiTool::Tagging, AiTool::Translation, AiTool::Comics];
+    pub const ALL: [AiTool; 4] = [
+        AiTool::Tagging,
+        AiTool::Translation,
+        AiTool::Comics,
+        AiTool::People,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             AiTool::Tagging => "tagging",
             AiTool::Translation => "translation",
             AiTool::Comics => "comics",
+            AiTool::People => "people",
         }
+    }
+
+    /// Added after apps first listed the tools; apps from before it can't
+    /// read it.
+    pub fn is_newer(self) -> bool {
+        matches!(self, AiTool::People)
     }
 
     pub fn parse(s: &str) -> Option<Self> {
@@ -192,6 +206,11 @@ pub enum Engine {
         detector: &'static str,
         translator: &'static str,
     },
+    /// Finds faces with [`FACE_FINDERS`] and reads each person with a WD
+    /// tagger (`tagger` is its tagging model).
+    People {
+        tagger: &'static str,
+    },
 }
 
 /// A choice for one tool.
@@ -259,7 +278,13 @@ pub const COMPONENTS: &[Component] = &[
     part("opus-en-es", AiTool::Translation, files::OPUS_EN_ES),
     part("opus-en-ru", AiTool::Translation, files::OPUS_EN_RU),
     part("opus-en-zh", AiTool::Translation, files::OPUS_EN_ZH),
+    part("yunet", AiTool::People, files::YUNET),
+    part("anime-faces", AiTool::People, files::ANIME_FACES),
 ];
+
+/// The face detectors every model of the people tool uses: one for
+/// photographs, one for drawings.
+pub const FACE_FINDERS: &[&str] = &["yunet", "anime-faces"];
 
 /// Installed with the fast translator; other pairs follow when first needed.
 const OPUS_BASE: &[&str] = &["opus-ja-en", "opus-zh-en", "opus-ko-en"];
@@ -586,6 +611,38 @@ pub const MODELS: &[CatalogModel] = &[
         ram_mb: 3109,
         license: "Apache-2.0, Gemma Terms of Use",
     },
+    // Times are for a picture of two people: finding the faces, then the
+    // tagger on each face and on the body below it.
+    CatalogModel {
+        id: "people-swinv2",
+        name: "YuNet + anime face detector + WD SwinV2 v3",
+        tool: AiTool::People,
+        rank: 1,
+        high_accuracy: false,
+        engine: Engine::People {
+            tagger: "wd-swinv2",
+        },
+        components: &["yunet", "anime-faces", "wd-swinv2"],
+        kernel: Kernel::Float,
+        cpu_ms: 3550,
+        gpu_ms: 0,
+        ram_mb: 1000,
+        license: "MIT, Apache-2.0",
+    },
+    CatalogModel {
+        id: "people-eva02",
+        name: "YuNet + anime face detector + WD EVA02 Large v3",
+        tool: AiTool::People,
+        rank: 2,
+        high_accuracy: true,
+        engine: Engine::People { tagger: "wd-eva02" },
+        components: &["yunet", "anime-faces", "wd-eva02"],
+        kernel: Kernel::Float,
+        cpu_ms: 14720,
+        gpu_ms: 0,
+        ram_mb: 2170,
+        license: "MIT, Apache-2.0",
+    },
 ];
 
 pub fn model(id: &str) -> Option<&'static CatalogModel> {
@@ -823,6 +880,13 @@ mod tests {
                     assert!(m.components.contains(part), "{} needs {part}", m.id);
                 }
             }
+            if let Engine::People { tagger } = m.engine {
+                let tagger = model(tagger).unwrap();
+                assert!(matches!(tagger.engine, Engine::Wd { .. }), "{}", m.id);
+                for part in tagger.components.iter().chain(FACE_FINDERS) {
+                    assert!(m.components.contains(part), "{} needs {part}", m.id);
+                }
+            }
         }
     }
 
@@ -857,6 +921,13 @@ mod tests {
         assert_eq!(id(AiTool::Translation, AiPreset::Accurate), Some("gemma"));
         // A whole page can't be instant on two cores.
         assert_eq!(id(AiTool::Comics, AiPreset::Fast), None);
+        // Nor the tagger run on each person.
+        assert_eq!(id(AiTool::People, AiPreset::Fast), None);
+        assert_eq!(
+            id(AiTool::People, AiPreset::Balanced),
+            Some("people-swinv2")
+        );
+        assert_eq!(id(AiTool::People, AiPreset::Accurate), Some("people-eva02"));
     }
 
     #[test]

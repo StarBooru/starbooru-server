@@ -9,6 +9,7 @@
 mod calibrate;
 mod comics;
 mod onnx;
+mod people;
 mod picture;
 mod runtime;
 mod tag;
@@ -108,6 +109,18 @@ fn run(rt: &mut Runtime, request: WorkerRequest) -> Result<WorkerReply, String> 
             let image = picture::decode(&jpeg)?;
             Ok(WorkerReply::Texts {
                 texts: comics::read(rt, gpu, &image, &boxes)?,
+            })
+        }
+        WorkerRequest::People { model, gpu, jpeg } => {
+            let image = picture::decode(&jpeg)?;
+            Ok(WorkerReply::People {
+                people: people::people(rt, &model, gpu, &image)?,
+            })
+        }
+        WorkerRequest::Faces { gpu, jpeg } => {
+            let image = picture::decode(&jpeg)?;
+            Ok(WorkerReply::Faces {
+                faces: people::faces(rt, gpu, &image)?,
             })
         }
         WorkerRequest::Unload => {

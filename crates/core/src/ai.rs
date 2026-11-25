@@ -51,6 +51,9 @@ pub struct AiStatus {
     /// Translation of the text in comics, over the picture.
     #[serde(default)]
     pub comics: bool,
+    /// Finding the people in a picture (`POST /posts/{id}/find-people`).
+    #[serde(default)]
+    pub people: bool,
     /// Whether the AI tags a new upload whose uploader doesn't say. Always
     /// false while tagging is off.
     #[serde(default)]
@@ -227,12 +230,56 @@ pub struct AiRuntimeStatus {
 
 /// `GET /admin/ai`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "AdminStatusWire", into = "AdminStatusWire")]
 pub struct AiAdminStatus {
     pub hardware: Hardware,
     pub runtime: AiRuntimeStatus,
     pub autotag: bool,
     pub auto_translate: String,
     pub tools: Vec<AiToolStatus>,
+}
+
+/// How [`AiAdminStatus`] is sent. An app reading a tool it doesn't know
+/// would fail on the whole answer, so the tools added after apps first
+/// listed them ([`AiTool::is_newer`]) come in `more_tools`, which those
+/// apps skip. Read back, both are in `tools`.
+#[derive(Serialize, Deserialize)]
+struct AdminStatusWire {
+    hardware: Hardware,
+    runtime: AiRuntimeStatus,
+    autotag: bool,
+    auto_translate: String,
+    tools: Vec<AiToolStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    more_tools: Vec<AiToolStatus>,
+}
+
+impl From<AdminStatusWire> for AiAdminStatus {
+    fn from(wire: AdminStatusWire) -> Self {
+        let mut tools = wire.tools;
+        tools.extend(wire.more_tools);
+        Self {
+            hardware: wire.hardware,
+            runtime: wire.runtime,
+            autotag: wire.autotag,
+            auto_translate: wire.auto_translate,
+            tools,
+        }
+    }
+}
+
+impl From<AiAdminStatus> for AdminStatusWire {
+    fn from(status: AiAdminStatus) -> Self {
+        let (more_tools, tools) = status.tools.into_iter().partition(|t| t.tool.is_newer());
+        Self {
+            hardware: status.hardware,
+            runtime: status.runtime,
+            autotag: status.autotag,
+            auto_translate: status.auto_translate,
+            tools,
+            more_tools,
+        }
+    }
 }
 
 /// `POST /admin/ai/tools/{tool}/test`.
@@ -367,7 +414,7 @@ fn category(s: &str) -> Option<TagCategory> {
 }
 
 /// The JSON object in `text`: code fences and prose around it are ignored.
-fn json_object(text: &str) -> Option<serde_json::Value> {
+pub(crate) fn json_object(text: &str) -> Option<serde_json::Value> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
     let slice = text.get(start..=end)?;
@@ -386,50 +433,54 @@ fn model_tag(raw: &str) -> Option<String> {
     normalize_tag(raw).ok().filter(|n| !n.contains(':'))
 }
 
-/// The `figures` of an answer. Unusable names are skipped; a list under a
-/// key that isn't a slot (or `tags`) goes to [`Slot::Other`].
+/// One person of an answer. Unusable names are skipped; a list under a key
+/// that isn't a slot (or `tags`) goes to [`Slot::Other`].
+pub(crate) fn model_figure(item: &serde_json::Value) -> Option<Figure> {
+    let object = item.as_object()?;
+    let text = |key: &str| object.get(key).and_then(|v| v.as_str()).and_then(model_tag);
+    let mut figure = Figure {
+        kind: object
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .and_then(|k| FigureKind::parse(k.trim()))
+            .unwrap_or(FigureKind::Other),
+        character: text("character"),
+        cosplay: text("cosplay"),
+        franchise: text("franchise"),
+        ..Figure::default()
+    };
+    for (key, names) in object {
+        let Some(names) = names.as_array() else {
+            continue;
+        };
+        let slot = Slot::parse(key.trim()).unwrap_or(Slot::Other);
+        let names = names
+            .iter()
+            .filter_map(|n| n.as_str())
+            .filter_map(model_tag)
+            .take(crate::figure::MAX_FIGURE_TAGS);
+        figure.tags.entry(slot).or_default().extend(names);
+    }
+    // Over the tag limit: keep a fair share of each slot.
+    while figure.tags.values().map(Vec::len).sum::<usize>() > crate::figure::MAX_FIGURE_TAGS {
+        let Some(longest) = figure.tags.values_mut().max_by_key(|v| v.len()) else {
+            break;
+        };
+        longest.pop();
+    }
+    Some(figure)
+}
+
+/// The `figures` of an answer.
 fn model_figures(value: &serde_json::Value) -> Vec<Figure> {
     let Some(list) = value.get("figures").and_then(|f| f.as_array()) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for item in list.iter().take(MAX_FIGURES) {
-        let Some(object) = item.as_object() else {
-            continue;
-        };
-        let text = |key: &str| object.get(key).and_then(|v| v.as_str()).and_then(model_tag);
-        let mut figure = Figure {
-            kind: object
-                .get("kind")
-                .and_then(|k| k.as_str())
-                .and_then(|k| FigureKind::parse(k.trim()))
-                .unwrap_or(FigureKind::Other),
-            character: text("character"),
-            cosplay: text("cosplay"),
-            franchise: text("franchise"),
-            ..Figure::default()
-        };
-        for (key, names) in object {
-            let Some(names) = names.as_array() else {
-                continue;
-            };
-            let slot = Slot::parse(key.trim()).unwrap_or(Slot::Other);
-            let names = names
-                .iter()
-                .filter_map(|n| n.as_str())
-                .filter_map(model_tag)
-                .take(crate::figure::MAX_FIGURE_TAGS);
-            figure.tags.entry(slot).or_default().extend(names);
-        }
-        // Over the tag limit: keep a fair share of each slot.
-        while figure.tags.values().map(Vec::len).sum::<usize>() > crate::figure::MAX_FIGURE_TAGS {
-            let Some(longest) = figure.tags.values_mut().max_by_key(|v| v.len()) else {
-                break;
-            };
-            longest.pop();
-        }
-        out.push(figure);
-    }
+    let out = list
+        .iter()
+        .take(MAX_FIGURES)
+        .filter_map(model_figure)
+        .collect();
     // Every name is already valid, so this only drops duplicates and empties.
     clean_figures(out).unwrap_or_default()
 }
@@ -488,6 +539,47 @@ pub fn parse_suggestions(text: &str) -> ParsedSuggestions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newer_tools_stay_out_of_older_apps_way() {
+        let tool = |tool| AiToolStatus {
+            tool,
+            ..AiToolStatus::default()
+        };
+        let status = AiAdminStatus {
+            tools: AiTool::ALL.into_iter().map(tool).collect(),
+            ..AiAdminStatus::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        let names = |key: &str| -> Vec<String> {
+            json[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["tool"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(names("tools"), ["tagging", "translation", "comics"]);
+        assert_eq!(names("more_tools"), ["people"]);
+        let back: AiAdminStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back, status);
+        // An answer from before `more_tools` still reads.
+        let mut old = serde_json::to_value(&status).unwrap();
+        old.as_object_mut().unwrap().remove("more_tools");
+        let back: AiAdminStatus = serde_json::from_value(old).unwrap();
+        assert_eq!(back.tools.len(), 3);
+        // And nothing new, nothing extra.
+        let few = AiAdminStatus {
+            tools: vec![tool(AiTool::Tagging)],
+            ..AiAdminStatus::default()
+        };
+        assert!(
+            serde_json::to_value(&few)
+                .unwrap()
+                .get("more_tools")
+                .is_none()
+        );
+    }
 
     fn names(p: &ParsedSuggestions) -> Vec<&str> {
         p.tags.iter().map(|(n, _)| n.as_str()).collect()

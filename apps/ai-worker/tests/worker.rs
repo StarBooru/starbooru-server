@@ -237,3 +237,90 @@ fn real_models_answer() {
         assert!(error_of(&unknown).contains("no model"), "{unknown:?}");
     }
 }
+
+/// A public-domain picture from `STARBOORU_TEST_FACES`, as the server
+/// sends it.
+fn picture(dir: &Path, name: &str) -> String {
+    let image = image::open(dir.join(name)).unwrap().to_rgb8();
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut out)
+        .encode_image(&image)
+        .unwrap();
+    base64::engine::general_purpose::STANDARD.encode(out)
+}
+
+/// The face finders and a people model on real pictures. Needs the
+/// pictures listed in `docs/development.md` in `STARBOORU_TEST_FACES`.
+#[test]
+fn real_models_find_people() {
+    let Some(ort) = runtime() else { return };
+    let (Ok(models), Ok(faces)) = (
+        std::env::var("STARBOORU_AI_MODELS"),
+        std::env::var("STARBOORU_TEST_FACES"),
+    ) else {
+        eprintln!("skipped: STARBOORU_AI_MODELS or STARBOORU_TEST_FACES is not set");
+        return;
+    };
+    let faces = Path::new(&faces);
+    let Some(model) = MODELS
+        .iter()
+        .find(|m| m.tool == AiTool::People && installed(&models, m.components))
+    else {
+        eprintln!("skipped: no people model is installed");
+        return;
+    };
+    let mut worker = Worker::start(&ort, &models);
+    let found = |worker: &mut Worker, jpeg: String| match worker
+        .ask(&WorkerRequest::Faces { gpu: false, jpeg })
+    {
+        WorkerReply::Faces { faces } => faces,
+        other => panic!("{other:?}"),
+    };
+    // Nobody in noise; the three of Apollo 11; one drawn girl.
+    assert!(found(&mut worker, jpeg()).is_empty());
+    let crew = found(&mut worker, picture(faces, "p11.jpg"));
+    assert_eq!(crew.len(), 3, "{crew:?}");
+    assert!(crew.iter().all(|f| f.face.is_valid() && f.score >= 0.5));
+    let drawn = found(&mut worker, picture(faces, "d02.png"));
+    assert_eq!(drawn.len(), 1, "{drawn:?}");
+
+    let people = |worker: &mut Worker, jpeg: String| match worker.ask(&WorkerRequest::People {
+        model: model.id.into(),
+        gpu: false,
+        jpeg,
+    }) {
+        WorkerReply::People { people } => people,
+        other => panic!("{other:?}"),
+    };
+    let figures = |people: &[starbooru_core::ai_worker::FoundPerson]| {
+        starbooru_core::people_ai::figures_from(
+            people,
+            |_| false,
+            |n| starbooru_core::people_ai::slot_of::<&str>(n, &[]),
+        )
+    };
+    let crew = people(&mut worker, picture(faces, "p11.jpg"));
+    assert_eq!(crew.len(), 3);
+    for figure in figures(&crew) {
+        // The tagger can't tell on photographs, so it doesn't say.
+        assert_eq!(figure.kind, starbooru_core::FigureKind::Other, "{figure:?}");
+        assert_eq!(figure.character, None);
+    }
+    let girl = figures(&people(&mut worker, picture(faces, "d02.png")));
+    let [figure] = girl.as_slice() else {
+        panic!("{girl:?}")
+    };
+    assert_eq!(figure.kind, starbooru_core::FigureKind::Girl);
+    assert!(
+        figure.tags.contains_key(&starbooru_core::Slot::Hair),
+        "{figure:?}"
+    );
+    // A model of another tool is an error, not a crash.
+    let wrong = worker.ask(&WorkerRequest::People {
+        model: "opus".into(),
+        gpu: false,
+        jpeg: jpeg(),
+    });
+    assert!(!error_of(&wrong).is_empty());
+    assert!(worker.child.try_wait().unwrap().is_none());
+}

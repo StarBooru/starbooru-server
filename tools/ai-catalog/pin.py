@@ -25,6 +25,8 @@ MODELS = [
     ("DET_SMALL", "ogkalu/comic-text-and-bubble-detector", ["detector-v4-s_int8.onnx"]),
     ("DET_LARGE", "ogkalu/comic-text-and-bubble-detector", ["detector_int8.onnx"]),
     ("MANGA_OCR", "l0wgear/manga-ocr-2025-onnx", ["encoder_model.onnx", "decoder_model.onnx", "vocab.txt"]),
+    ("YUNET", "opencv/face_detection_yunet", ["face_detection_yunet_2023mar.onnx"]),
+    ("ANIME_FACES", "deepghs/anime_face_detection", ["face_detect_v1.4_n/model.onnx"]),
 ]
 for pair in OPUS:
     MODELS.append((f"OPUS_{pair.replace('-', '_').upper()}", f"Xenova/opus-mt-{pair}", Q))

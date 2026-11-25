@@ -347,6 +347,7 @@ pub async fn ai(state: &AppState) -> AppResult<AiSetup> {
                 AiTool::Tagging => env.tagging,
                 AiTool::Translation => env.translation,
                 AiTool::Comics => env.comics,
+                AiTool::People => Some(env.people.unwrap_or(AiMode::Off)),
             };
             let default_mode = env_mode.unwrap_or(if !env.url.is_empty() {
                 AiMode::Api

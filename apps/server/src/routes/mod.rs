@@ -59,9 +59,10 @@ use tower_http::cors::{Any as AnyOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{error, warn};
 
-pub(crate) use figures::replace as replace_figures;
+pub(crate) use figures::{Saved, replace as replace_figures};
 pub(crate) use forum::{seed as seed_forum, seed_once as seed_forum_once};
 pub(crate) use home::HomeCache;
+pub(crate) use people::franchises_by_name;
 pub(crate) use posts::set_tags as set_post_tags;
 
 use crate::error::{AppError, AppResult};
@@ -119,6 +120,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/ai", get(ai::status))
         .route("/posts/{id}/suggest-tags", post(ai::suggest_tags))
+        .route("/posts/{id}/find-people", post(ai::find_people))
         .route("/posts/{id}/translate", post(ai::translate))
         .route(
             "/posts/{id}/translations",

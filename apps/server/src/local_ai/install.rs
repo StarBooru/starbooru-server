@@ -23,15 +23,19 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const USER_AGENT: &str = concat!("StarBooru/", env!("CARGO_PKG_VERSION"));
 
-/// The ONNX Runtime release, the same as in the `Dockerfile`.
+/// The ONNX Runtime release, the same as in the `Dockerfile`: Microsoft's
+/// NuGet package, which holds the library for both processors.
 const RUNTIME_VERSION: &str = "1.31.1";
+const RUNTIME_PACKAGE: &str = "microsoft.ml.onnxruntime";
+const RUNTIME_PACKAGE_SHA256: &str =
+    "6871ccbc97f3d5bdb4095a1dcec33aa78d56f6ed8de5980ef5fa1d9f2e7c679a";
+const RUNTIME_PACKAGE_SIZE: u64 = 159_626_394;
 
 struct RuntimePin {
     os: &'static str,
     arch: &'static str,
-    package: &'static str,
-    archive_sha256: &'static str,
-    archive_size: u64,
+    /// The library's path in the package.
+    member: &'static str,
     library_sha256: &'static str,
 }
 
@@ -39,17 +43,13 @@ const RUNTIMES: &[RuntimePin] = &[
     RuntimePin {
         os: "linux",
         arch: "x86_64",
-        package: "onnxruntime-linux-x64-1.31.1",
-        archive_sha256: "c849e36a1ef3e22d4ff217b9d1ce4a3cf5b9467b975610913ae959ad5b16bdc9",
-        archive_size: 11_413_655,
+        member: "runtimes/linux-x64/native/libonnxruntime.so",
         library_sha256: "a96f132e5eb5ca04e23a7d2fc1078fb95aa591e8d71d0f237702ece3a1e0f4ea",
     },
     RuntimePin {
         os: "linux",
         arch: "aarch64",
-        package: "onnxruntime-linux-aarch64-1.31.1",
-        archive_sha256: "5317505e2da99be65f8e2775ba3c2afd6d2961fd78aba1bd8f56159f48820c78",
-        archive_size: 10_332_381,
+        member: "runtimes/linux-arm64/native/libonnxruntime.so",
         library_sha256: "7e17c55d675be73f67a218dbecb55522395f61dafb3da03ebc7ade56a4c2f813",
     },
 ];
@@ -75,66 +75,243 @@ pub async fn install_runtime(library: &Path) -> Result<(), String> {
     if current.is_ok_and(|hash| hash == pin.library_sha256) {
         return Ok(());
     }
-    fetch_runtime(library, pin).await.map_err(|e| {
-        warn!("downloading the AI runtime failed: {e}");
-        "the AI runtime can't be downloaded: check the server's internet access and free disk space"
-            .to_owned()
-    })
+    let package = Package {
+        url: format!(
+            "https://api.nuget.org/v3-flatcontainer/{RUNTIME_PACKAGE}/{RUNTIME_VERSION}/{RUNTIME_PACKAGE}.{RUNTIME_VERSION}.nupkg"
+        ),
+        sha256: RUNTIME_PACKAGE_SHA256.to_owned(),
+        size: RUNTIME_PACKAGE_SIZE,
+    };
+    fetch_runtime(&package, pin.member, pin.library_sha256, library)
+        .await
+        .map_err(|e| {
+            warn!("downloading the AI runtime failed: {e}");
+            "the AI runtime can't be downloaded: check the server's internet access and free disk space"
+                .to_owned()
+        })
 }
 
-async fn fetch_runtime(library: &Path, pin: &'static RuntimePin) -> AppResult<()> {
+/// A pinned ZIP to take the runtime from.
+struct Package {
+    url: String,
+    sha256: String,
+    size: u64,
+}
+
+/// Puts `member` of the package at `library`, checked against
+/// `library_sha256`. Only the library's bytes are fetched when the server
+/// sends ranges (12 MB of a 160 MB package); otherwise the whole package,
+/// checked against its own hash.
+async fn fetch_runtime(
+    package: &Package,
+    member: &str,
+    library_sha256: &str,
+    library: &Path,
+) -> AppResult<()> {
     let dir = library
         .parent()
         .ok_or_else(|| AppError::Internal("the AI runtime has no folder".into()))?;
     tokio::fs::create_dir_all(dir)
         .await
         .map_err(|e| write_error(&e))?;
-    let archive = dir.join(format!("{}.tgz", pin.package));
-    let part = dir.join(format!("{}.tgz.part", pin.package));
-    let url = format!(
-        "https://github.com/microsoft/onnxruntime/releases/download/v{RUNTIME_VERSION}/{}.tgz",
-        pin.package
-    );
-    download(
-        &url,
-        &archive,
-        &part,
-        pin.archive_sha256,
-        pin.archive_size,
-        |_| {},
-    )
-    .await?;
     let unpacked = dir.join("library.part");
-    let member = format!("{}/lib/libonnxruntime.so.{RUNTIME_VERSION}", pin.package);
-    let (from, to) = (archive.clone(), unpacked.clone());
-    let found = tokio::task::spawn_blocking(move || extract_file(&from, &member, &to))
-        .await
-        .map_err(AppError::internal)?
-        .map_err(|e| write_error(&e));
-    let _ = tokio::fs::remove_file(&archive).await;
-    if !found? || sha256_of(unpacked.clone()).await? != pin.library_sha256 {
-        let _ = tokio::fs::remove_file(&unpacked).await;
-        return Err(AppError::Upstream(
-            "the AI runtime is not the expected one".into(),
-        ));
+    let ranged = match fetch_member(package, member, &unpacked).await {
+        Ok(found) => found,
+        Err(e) => {
+            warn!("reading the AI runtime in parts failed, downloading all of it: {e}");
+            false
+        }
+    };
+    let ranged = ranged && sha256_of(unpacked.clone()).await? == library_sha256;
+    if !ranged {
+        let archive = dir.join("package.zip");
+        let part = dir.join("package.zip.part");
+        download(
+            &package.url,
+            &archive,
+            &part,
+            &package.sha256,
+            package.size,
+            |_| {},
+        )
+        .await?;
+        let (from, to, name) = (archive.clone(), unpacked.clone(), member.to_owned());
+        let found = tokio::task::spawn_blocking(move || unzip_file(&from, &name, &to))
+            .await
+            .map_err(AppError::internal)?
+            .map_err(|e| write_error(&e));
+        let _ = tokio::fs::remove_file(&archive).await;
+        if !found? || sha256_of(unpacked.clone()).await? != library_sha256 {
+            let _ = tokio::fs::remove_file(&unpacked).await;
+            return Err(AppError::Upstream(
+                "the AI runtime is not the expected one".into(),
+            ));
+        }
     }
     tokio::fs::rename(&unpacked, library)
         .await
         .map_err(|e| write_error(&e))
 }
 
-/// Copies one regular file out of a `.tgz` to `dest`. Whether it was there.
-fn extract_file(archive: &Path, member: &str, dest: &Path) -> std::io::Result<bool> {
-    let file = std::fs::File::open(archive)?;
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
-    for entry in tar.entries()? {
-        let mut entry = entry?;
-        if entry.header().entry_type().is_file() && entry.path()?.as_ref() == Path::new(member) {
-            std::io::copy(&mut entry, &mut std::fs::File::create(dest)?)?;
-            return Ok(true);
-        }
+/// The end of a ZIP file holds its directory's place, in the last 64 KiB.
+const ZIP_TAIL: u64 = 22 + 65_535;
+/// More directory than a package of a few dozen files has.
+const MAX_ZIP_DIRECTORY: u32 = 16 * 1024 * 1024;
+/// More than the runtime library takes packed.
+const MAX_PACKED: u64 = 256 * 1024 * 1024;
+const LOCAL_HEADER: u64 = 30;
+
+fn le16(b: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?))
+}
+
+fn le32(b: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// The offset and size of a ZIP's directory, from the end of the file.
+fn zip_directory(tail: &[u8]) -> Option<(u64, u32)> {
+    let end = tail
+        .windows(4)
+        .rposition(|w| w == [0x50, 0x4b, 0x05, 0x06])?;
+    let (size, offset) = (le32(tail, end + 12)?, le32(tail, end + 16)?);
+    (size <= MAX_ZIP_DIRECTORY).then_some((u64::from(offset), size))
+}
+
+/// Where a file's data starts, from its local header.
+fn data_start(header: u64, local: &[u8]) -> Option<u64> {
+    if le32(local, 0)? != 0x0403_4b50 {
+        return None;
     }
-    Ok(false)
+    let skip = u64::from(le16(local, 26)?) + u64::from(le16(local, 28)?);
+    header.checked_add(LOCAL_HEADER)?.checked_add(skip)
+}
+
+/// Where a file is in a ZIP: its compression, packed size and the offset of
+/// its local header.
+fn zip_entry(directory: &[u8], member: &str) -> Option<(u16, u64, u64)> {
+    let mut at = 0usize;
+    while le32(directory, at)? == 0x0201_4b50 {
+        let method = le16(directory, at + 10)?;
+        let packed = le32(directory, at + 20)?;
+        let name_len = usize::from(le16(directory, at + 28)?);
+        let extra_len = usize::from(le16(directory, at + 30)?);
+        let comment_len = usize::from(le16(directory, at + 32)?);
+        let offset = le32(directory, at + 42)?;
+        let name = directory.get(at + 46..at + 46 + name_len)?;
+        if name == member.as_bytes() {
+            // Over 4 GiB is ZIP64, which a runtime package isn't.
+            if packed == u32::MAX || offset == u32::MAX || u64::from(packed) > MAX_PACKED {
+                return None;
+            }
+            return Some((method, u64::from(packed), u64::from(offset)));
+        }
+        at = at.checked_add(46 + name_len + extra_len + comment_len)?;
+    }
+    None
+}
+
+/// Writes a ZIP member's packed bytes out, stored or deflated. Whether it
+/// knew the compression.
+fn unpack(method: u16, data: impl Read, dest: &Path) -> std::io::Result<bool> {
+    let mut out = std::fs::File::create(dest)?;
+    match method {
+        0 => std::io::copy(&mut { data }, &mut out)?,
+        8 => std::io::copy(&mut flate2::read::DeflateDecoder::new(data), &mut out)?,
+        _ => return Ok(false),
+    };
+    Ok(true)
+}
+
+/// Bytes `from..to` of `url`, when the server sends just those.
+async fn range(url: &str, from: u64, to: u64) -> AppResult<Option<Vec<u8>>> {
+    let Some(last) = to.checked_sub(1).filter(|&last| last >= from) else {
+        return Ok(Some(Vec::new()));
+    };
+    let mut resp = client()?
+        .get(url)
+        .header(reqwest::header::RANGE, format!("bytes={from}-{last}"))
+        .send()
+        .await
+        .map_err(network_error)?;
+    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Ok(None);
+    }
+    let want = usize::try_from(to - from).map_err(AppError::internal)?;
+    let mut out = Vec::with_capacity(want);
+    while let Some(chunk) = resp.chunk().await.map_err(network_error)? {
+        if out.len() + chunk.len() > want {
+            return Ok(None);
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok((out.len() == want).then_some(out))
+}
+
+/// Copies one file out of a ZIP on a server that sends ranges to `dest`,
+/// fetching only its directory and that file. Whether it could.
+async fn fetch_member(package: &Package, member: &str, dest: &Path) -> AppResult<bool> {
+    let url = package.url.as_str();
+    let tail_start = package.size.saturating_sub(ZIP_TAIL);
+    let Some(tail) = range(url, tail_start, package.size).await? else {
+        return Ok(false);
+    };
+    let Some((offset, size)) = zip_directory(&tail) else {
+        return Ok(false);
+    };
+    let end = offset.saturating_add(u64::from(size));
+    let directory = match offset.checked_sub(tail_start) {
+        Some(at) => usize::try_from(at)
+            .ok()
+            .and_then(|at| tail.get(at..at.checked_add(usize::try_from(size).ok()?)?))
+            .map(<[u8]>::to_vec),
+        None => range(url, offset, end).await?,
+    };
+    let Some((method, packed, header)) = directory.and_then(|d| zip_entry(&d, member)) else {
+        return Ok(false);
+    };
+    let local = range(url, header, header.saturating_add(LOCAL_HEADER)).await?;
+    let Some(start) = local.and_then(|l| data_start(header, &l)) else {
+        return Ok(false);
+    };
+    let Some(data) = range(url, start, start.saturating_add(packed)).await? else {
+        return Ok(false);
+    };
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || unpack(method, data.as_slice(), &dest))
+        .await
+        .map_err(AppError::internal)?
+        .map_err(|e| write_error(&e))
+}
+
+/// Copies one file out of a ZIP (a NuGet package) to `dest`, stored or
+/// deflated. Whether it was there.
+fn unzip_file(archive: &Path, member: &str, dest: &Path) -> std::io::Result<bool> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(archive)?;
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(ZIP_TAIL)))?;
+    let mut tail = Vec::new();
+    file.by_ref().take(ZIP_TAIL).read_to_end(&mut tail)?;
+    let Some((offset, size)) = zip_directory(&tail) else {
+        return Ok(false);
+    };
+    file.seek(SeekFrom::Start(offset))?;
+    let mut directory = Vec::new();
+    file.by_ref()
+        .take(u64::from(size))
+        .read_to_end(&mut directory)?;
+    let Some((method, packed, header)) = zip_entry(&directory, member) else {
+        return Ok(false);
+    };
+    file.seek(SeekFrom::Start(header))?;
+    let mut local = [0u8; LOCAL_HEADER as usize];
+    file.read_exact(&mut local)?;
+    let Some(start) = data_start(header, &local) else {
+        return Ok(false);
+    };
+    file.seek(SeekFrom::Start(start))?;
+    unpack(method, file.take(packed), dest)
 }
 
 pub fn component_dir(models: &Path, component: &Component) -> PathBuf {
@@ -509,5 +686,191 @@ mod tests {
         let (dest, part) = (dir.path().join("f"), dir.path().join("f.part"));
         let err = download("http://127.0.0.1:9/f", &dest, &part, "00", 4, |_| {}).await;
         assert!(err.is_err());
+    }
+
+    /// A ZIP of `(name, method, contents)`, the way a NuGet package is laid out.
+    fn zip(files: &[(&str, u16, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let (mut out, mut directory) = (Vec::new(), Vec::new());
+        for (name, method, contents) in files {
+            let packed = if *method == 8 {
+                let mut z = flate2::write::DeflateEncoder::new(Vec::new(), Default::default());
+                z.write_all(contents).unwrap();
+                z.finish().unwrap()
+            } else {
+                contents.to_vec()
+            };
+            let offset = out.len() as u32;
+            let sizes = [packed.len() as u32, contents.len() as u32];
+            out.extend(0x0403_4b50u32.to_le_bytes());
+            out.extend([20, 0, 0, 0]);
+            out.extend(method.to_le_bytes());
+            out.extend([0; 8]); // time, date, crc
+            out.extend(sizes.iter().flat_map(|s| s.to_le_bytes()));
+            out.extend((name.len() as u16).to_le_bytes());
+            out.extend(3u16.to_le_bytes());
+            out.extend(name.as_bytes());
+            out.extend(b"xyz");
+            out.extend(&packed);
+            directory.extend(0x0201_4b50u32.to_le_bytes());
+            directory.extend([20, 0, 20, 0, 0, 0]);
+            directory.extend(method.to_le_bytes());
+            directory.extend([0; 8]);
+            directory.extend(sizes.iter().flat_map(|s| s.to_le_bytes()));
+            directory.extend((name.len() as u16).to_le_bytes());
+            directory.extend([0; 12]);
+            directory.extend(offset.to_le_bytes());
+            directory.extend(name.as_bytes());
+        }
+        let at = out.len() as u32;
+        let count = (files.len() as u16).to_le_bytes();
+        out.extend(&directory);
+        out.extend(0x0605_4b50u32.to_le_bytes());
+        out.extend([0; 4]);
+        out.extend(count);
+        out.extend(count);
+        out.extend((directory.len() as u32).to_le_bytes());
+        out.extend(at.to_le_bytes());
+        out.extend([0; 2]);
+        out
+    }
+
+    #[test]
+    fn takes_one_file_out_of_a_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let (archive, dest) = (dir.path().join("p.nupkg"), dir.path().join("lib"));
+        let library = BODY.repeat(50);
+        std::fs::write(
+            &archive,
+            zip(&[
+                ("runtimes/win-x64/native/onnxruntime.dll", 8, b"other"),
+                ("runtimes/linux-x64/native/libonnxruntime.so", 8, &library),
+                ("stored.txt", 0, b"as is"),
+            ]),
+        )
+        .unwrap();
+        let member = "runtimes/linux-x64/native/libonnxruntime.so";
+        assert!(unzip_file(&archive, member, &dest).unwrap());
+        assert_eq!(std::fs::read(&dest).unwrap(), library);
+        assert!(unzip_file(&archive, "stored.txt", &dest).unwrap());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"as is");
+        assert!(!unzip_file(&archive, "missing", &dest).unwrap());
+    }
+
+    /// Serves `body` at `/p`, answering ranges when `ranges` is set, and
+    /// counts the bytes it sent.
+    async fn package_server(body: Vec<u8>, ranges: bool) -> (String, Arc<AtomicUsize>) {
+        let sent = Arc::new(AtomicUsize::new(0));
+        let counter = sent.clone();
+        let body = Arc::new(body);
+        let app = Router::new().route(
+            "/p",
+            get(move |headers: HeaderMap| {
+                let (counter, body) = (counter.clone(), body.clone());
+                async move {
+                    let asked = headers
+                        .get("range")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("bytes="))
+                        .and_then(|v| v.split_once('-'))
+                        .and_then(|(a, b)| {
+                            Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+                        });
+                    let (status, out) = match asked.filter(|_| ranges) {
+                        Some((a, b)) => (
+                            StatusCode::PARTIAL_CONTENT,
+                            body.get(a..=b.min(body.len() - 1))
+                                .unwrap_or_default()
+                                .to_vec(),
+                        ),
+                        None => (StatusCode::OK, body.to_vec()),
+                    };
+                    counter.fetch_add(out.len(), Ordering::SeqCst);
+                    (status, out)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (format!("http://{addr}/p"), sent)
+    }
+
+    #[tokio::test]
+    async fn fetches_only_the_library_when_it_can() {
+        let library = BODY.repeat(500);
+        // Most of a package is other platforms' libraries.
+        let other: Vec<u8> = (0..400_000u32).map(|i| (i * 7919 % 251) as u8).collect();
+        let member = "runtimes/linux-x64/native/libonnxruntime.so";
+        let package = zip(&[
+            ("runtimes/win-x64/native/onnxruntime.dll", 0, &other),
+            (member, 8, &library),
+        ]);
+        for ranges in [true, false] {
+            let (url, sent) = package_server(package.clone(), ranges).await;
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("runtime").join("lib.so");
+            let pinned = Package {
+                url,
+                sha256: digest(&package),
+                size: package.len() as u64,
+            };
+            fetch_runtime(&pinned, member, &digest(&library), &dest)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), library);
+            let sent = sent.load(Ordering::SeqCst);
+            if ranges {
+                assert!(sent < 100_000, "{sent} of {}", package.len());
+            } else {
+                assert!(sent >= package.len(), "{sent}");
+            }
+            // Nothing is left behind.
+            let left: Vec<_> = std::fs::read_dir(dir.path().join("runtime"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(left, ["lib.so"]);
+            // A library that isn't the pinned one is refused, either way.
+            let wrong = fetch_runtime(&pinned, member, &digest(b"other"), &dest).await;
+            assert!(wrong.is_err());
+        }
+    }
+
+    #[test]
+    fn a_damaged_package_is_no_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let (archive, dest) = (dir.path().join("p.nupkg"), dir.path().join("lib"));
+        let good = zip(&[("a", 8, b"contents")]);
+        for cut in [0, 10, good.len() / 2, good.len() - 30, good.len() - 1] {
+            let mut bad = good.clone();
+            bad.truncate(cut);
+            std::fs::write(&archive, &bad).unwrap();
+            let _ = unzip_file(&archive, "a", &dest);
+        }
+        // Offsets pointing anywhere.
+        for flip in 0..good.len() {
+            let mut bad = good.clone();
+            bad[flip] ^= 0xff;
+            std::fs::write(&archive, &bad).unwrap();
+            let _ = unzip_file(&archive, "a", &dest);
+        }
+    }
+
+    /// The pinned runtime, from NuGet. Skipped unless `STARBOORU_TEST_NUGET`
+    /// is set, as it goes online.
+    #[tokio::test]
+    async fn the_pinned_runtime_comes_from_nuget() {
+        if std::env::var_os("STARBOORU_TEST_NUGET").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("runtime").join("libonnxruntime.so");
+        install_runtime(&library).await.unwrap();
+        let pin = RUNTIMES
+            .iter()
+            .find(|r| r.arch == std::env::consts::ARCH)
+            .unwrap();
+        assert_eq!(sha256_of(library).await.unwrap(), pin.library_sha256);
     }
 }

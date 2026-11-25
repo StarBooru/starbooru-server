@@ -6,11 +6,13 @@ use std::time::{Duration, Instant};
 use ort::session::Session;
 use starbooru_core::ai_catalog::{self, AiTool, Engine};
 use starbooru_core::ai_worker::{TextBox, WorkerReply};
+use starbooru_core::figure::FaceBox;
+use starbooru_core::people_ai;
 
 use crate::onnx::{self, Message};
 use crate::picture;
 use crate::runtime::{self, Runtime};
-use crate::{comics, tag, translate};
+use crate::{comics, people, tag, translate};
 
 const SIDE: usize = 256;
 const LAYERS: usize = 32;
@@ -24,6 +26,21 @@ const LONG_RUN_MS: u128 = 120_000;
 const SENTENCE: &str = "今日はとても天気がいいので、友達と一緒に公園へ散歩に行きました。";
 /// What the catalog's comic times count.
 const PAGE_BLOCKS: u32 = 8;
+/// What the catalog's people times count: a picture of two people.
+const PEOPLE: [FaceBox; 2] = [
+    FaceBox {
+        x: 200,
+        y: 150,
+        w: 120,
+        h: 160,
+    },
+    FaceBox {
+        x: 600,
+        y: 120,
+        w: 130,
+        h: 170,
+    },
+];
 /// What a speech bubble says, more or less.
 const BUBBLE: &str = "今日はいい天気ですね。";
 
@@ -235,6 +252,26 @@ fn run_once(rt: &mut Runtime, id: &str, gpu: bool) -> Result<Vec<String>, String
                 translate::translate(rt, translator, gpu, from, to, &texts)?;
             }
             out.push(found.len().to_string());
+            Ok(out)
+        }
+        (AiTool::People, Engine::People { tagger }) => {
+            let image = picture::generated(1024, 768);
+            let found = people::faces(rt, gpu, &image)?;
+            let (w, h) = image.dimensions();
+            let mut out = vec![found.len().to_string()];
+            // The tagger reads each face and the body below it.
+            for face in PEOPLE {
+                let crops = [
+                    people_ai::face_crop(face, w, h),
+                    people_ai::body_crop(face, &PEOPLE, w, h),
+                ];
+                for rect in crops.into_iter().flatten() {
+                    let (tags, _) = tag::tag(rt, tagger, gpu, &picture::crop(&image, rect))?;
+                    let mut names: Vec<String> = tags.into_iter().take(3).map(|t| t.name).collect();
+                    names.sort();
+                    out.extend(names);
+                }
+            }
             Ok(out)
         }
         _ => Err("unknown model".into()),

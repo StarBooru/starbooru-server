@@ -5,8 +5,9 @@ use axum::Json;
 use axum::extract::{Path, State};
 use starbooru_core::{
     AiAdminStatus, AiGeneralUpdate, AiMode, AiStatus, AiTestResult, AiTool, AiToolUpdate,
-    PanelTranslation, TagCategory, TagSuggestion, TagSuggestions, TranslateRequest, Translation,
-    clean_general_update, clean_language, clean_tool_update, clean_translation, translate_prompt,
+    FoundPeople, PanelTranslation, TagCategory, TagSuggestion, TagSuggestions, TranslateRequest,
+    Translation, clean_general_update, clean_language, clean_tool_update, clean_translation,
+    translate_prompt,
 };
 
 use super::admin::require_admin_session;
@@ -32,6 +33,7 @@ pub async fn status(State(state): State<AppState>, _user: AuthUser) -> AppResult
     let tagging = offered(&state, &tool);
     let translation = offered(&state, &setup.tool(AiTool::Translation));
     let comics = offered(&state, &setup.tool(AiTool::Comics));
+    let people = offered(&state, &setup.tool(AiTool::People));
     let model = tagging.then(|| match tool.mode {
         AiMode::Local => local_ai::active(&state, &tool)
             .map(|a| a.model.name.to_owned())
@@ -39,11 +41,12 @@ pub async fn status(State(state): State<AppState>, _user: AuthUser) -> AppResult
         _ => tool.api.model.clone(),
     });
     Ok(Json(AiStatus {
-        enabled: tagging || translation || comics,
+        enabled: tagging || translation || comics || people,
         tagging,
         model,
         translation,
         comics,
+        people,
         autotag: tagging && setup.autotag,
     }))
 }
@@ -94,6 +97,19 @@ pub async fn suggest_tags(
         rating: parsed.rating,
         figures: parsed.figures,
     }))
+}
+
+/// `POST /posts/{id}/find-people`: the people the people tool finds in the
+/// post's picture, with their face boxes and previews of the crops. The post
+/// is not changed.
+pub async fn find_people(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    Path(id): Path<i64>,
+) -> AppResult<Json<FoundPeople>> {
+    let setup = settings::ai(&state).await?;
+    let route = ai::route(&state, &setup.tool(AiTool::People)).await?;
+    Ok(Json(crate::people_ai::suggest(&state, &route, id).await?))
 }
 
 /// `POST /posts/{id}/translate`: translates the text OCR read in the post's
@@ -250,6 +266,7 @@ mod tests {
     use axum::http::{HeaderMap, Method, StatusCode};
     use axum::routing::post;
     use serde_json::{Value, json};
+    use starbooru_core::AiMode;
 
     use crate::testing;
 
@@ -326,10 +343,12 @@ mod tests {
 
     /// The panel's entry for a tool.
     fn tool_of<'a>(status: &'a Value, tool: &str) -> &'a Value {
+        let more = status["more_tools"].as_array().into_iter().flatten();
         status["tools"]
             .as_array()
             .unwrap()
             .iter()
+            .chain(more)
             .find(|t| t["tool"] == tool)
             .unwrap()
     }
@@ -376,7 +395,7 @@ mod tests {
         assert_eq!(
             status,
             json!({ "enabled": true, "model": "llava", "tagging": true, "translation": true,
-                "comics": true, "autotag": false })
+                "comics": true, "people": false, "autotag": false })
         );
 
         let path = format!("/api/v1/posts/{id}/suggest-tags");
@@ -541,15 +560,27 @@ mod tests {
         assert_eq!(
             status,
             json!({ "enabled": false, "model": null, "tagging": false, "translation": false,
-                "comics": false, "autotag": false })
+                "comics": false, "people": false, "autotag": false })
         );
         let path = format!("/api/v1/posts/{id}/suggest-tags");
+        let r = app.call(Method::POST, &path, Some(&admin), None).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        let path = format!("/api/v1/posts/{id}/find-people");
         let r = app.call(Method::POST, &path, Some(&admin), None).await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST);
         let r = app.get("/api/v1/admin/ai", &admin).await.json();
         assert_eq!(r["autotag"], false);
         assert_eq!(r["auto_translate"], "");
-        for tool in ["tagging", "translation", "comics"] {
+        // Apps from before the people tool read `tools` and skip the rest.
+        let listed: Vec<&Value> = r["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| &t["tool"])
+            .collect();
+        assert_eq!(listed, ["tagging", "translation", "comics"]);
+        assert_eq!(r["more_tools"][0]["tool"], "people");
+        for tool in ["tagging", "translation", "comics", "people"] {
             let tool = tool_of(&r, tool);
             assert_eq!(tool["settings"]["mode"], "off");
             assert_eq!(tool["state"], "off");
@@ -737,15 +768,24 @@ while IFS= read -r line; do
     *'"op":"translate"'*) echo '{"reply":"translated","texts":["CIAO"]}' ;;
     *'"op":"detect"'*) echo '{"reply":"boxes","boxes":[{"x":0,"y":0,"w":1,"h":1}]}' ;;
     *'"op":"read"'*) echo '{"reply":"texts","texts":["こんにちは"]}' ;;
+    *'"op":"faces"'*) echo '{"reply":"faces","faces":[{"face":{"x":600,"y":100,"w":200,"h":300},"score":0.9},{"face":{"x":100,"y":100,"w":200,"h":300},"score":0.8}]}' ;;
+    *'"op":"people"'*) echo "{\"reply\":\"people\",\"people\":[$PERSON,$PERSON2]}" ;;
     *) echo '{"reply":"error","message":"unknown request"}' ;;
   esac
 done
 "#;
 
+    /// The two people the fake worker finds: a girl on the right whom the
+    /// tagger knows, and someone it can't tell on the left.
+    const PEOPLE: &str = r#"PERSON='{"face":{"x":600,"y":100,"w":200,"h":300},"score":0.9,"face_tags":[{"name":"1girl","category":"general","score":0.97},{"name":"blonde_hair","category":"general","score":0.9},{"name":"portrait","category":"general","score":0.9},{"name":"red_eyes","category":"general","score":0.3},{"name":"saber_(fate)","category":"character","score":0.96}],"body_tags":[{"name":"1girl","category":"general","score":0.9},{"name":"white_shirt","category":"general","score":0.8},{"name":"pleated_skirt","category":"general","score":0.7},{"name":"outdoors","category":"general","score":0.9}]}'
+PERSON2='{"face":{"x":100,"y":100,"w":200,"h":300},"score":0.8,"face_tags":[{"name":"solo","category":"general","score":0.9},{"name":"smile","category":"general","score":0.8}],"body_tags":[]}'
+"#;
+
     fn fake_worker(dir: &std::path::Path) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-worker");
-        std::fs::write(&path, FAKE_WORKER).unwrap();
+        let script = FAKE_WORKER.replacen("\n", &format!("\n{PEOPLE}"), 1);
+        std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -1151,6 +1191,213 @@ done
             .await
             .unwrap();
         assert_eq!(left, 1);
+        app.finish().await;
+    }
+
+    /// Waits for a post to have people, and returns it.
+    async fn wait_for_people(app: &testing::TestApp, token: &str, id: i64) -> Value {
+        for _ in 0..100 {
+            let post = app.get(&format!("/api/v1/posts/{id}"), token).await.json();
+            if post["figures"].as_array().is_some_and(|f| !f.is_empty()) {
+                return post;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("post {id} has no people");
+    }
+
+    #[tokio::test]
+    async fn finds_people_on_the_built_in_models() {
+        let worker_dir = tempfile::tempdir().unwrap();
+        let worker = fake_worker(worker_dir.path());
+        let Some(app) = testing::app_with(|c| c.ai.worker = Some(worker)).await else {
+            return;
+        };
+        crate::routes::seed_vocab(app.db()).await.unwrap();
+        let ai = &app.state.local_ai;
+        std::fs::create_dir_all(app.state.config.data_dir.join("ai/models")).unwrap();
+        let admin = app.register("admin").await;
+        // Left alone on upload, so finding its people is up to the request.
+        let r = app
+            .upload(&admin, &testing::png(30, 20, 30), &[("autotag", "false")])
+            .await;
+        let id = r.json()["id"].as_i64().unwrap();
+        crate::local_ai::sweep(&app.state, false).await;
+        crate::local_ai::mark_all_installed(
+            ai,
+            starbooru_core::ai_catalog::model("people-swinv2").unwrap(),
+        );
+        // The collection's own tree wins over the words; the series is
+        // known by another name.
+        let tags = [("tags", "white_shirt fate_(series)"), ("autotag", "false")];
+        app.upload(&admin, &testing::png(29, 20, 29), &tags).await;
+        for (path, body) in [
+            ("/api/v1/tags/white_shirt", json!({ "parent": "headwear" })),
+            (
+                "/api/v1/tags/fate_(series)",
+                json!({ "category": "copyright" }),
+            ),
+        ] {
+            let r = app
+                .call(Method::PATCH, path, Some(&admin), Some(body))
+                .await;
+            assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        }
+        let r = app
+            .call(
+                Method::PUT,
+                "/api/v1/admin/ai/tools/people",
+                Some(&admin),
+                Some(json!({ "mode": "local", "preset": "balanced", "model": "" })),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        assert_eq!(tool_of(&r.json(), "people")["active"], "people-swinv2");
+        assert_eq!(app.get("/api/v1/ai", &admin).await.json()["people"], true);
+
+        let before = app.get(&format!("/api/v1/posts/{id}"), &admin).await.json();
+        let path = format!("/api/v1/posts/{id}/find-people");
+        let r = app.call(Method::POST, &path, Some(&admin), None).await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        let mut found = r.json();
+        assert_eq!(found["model"], "YuNet + anime face detector + WD SwinV2 v3");
+        // A preview of each crop, as nothing is stored yet.
+        for figure in found["figures"].as_array_mut().unwrap() {
+            let url = figure["face_url"].take();
+            assert!(url.as_str().unwrap().starts_with("data:image/jpeg;base64,"));
+        }
+        assert_eq!(
+            found["figures"],
+            json!([
+                { "kind": "other", "franchise": null, "tags": { "other": ["smile"] },
+                  "face": { "x": 100, "y": 100, "w": 200, "h": 300 }, "face_url": null },
+                { "kind": "girl", "character": "saber_(fate)", "franchise": "fate_(series)",
+                  "tags": { "head": ["white_shirt"], "bottom": ["pleated_skirt"],
+                            "hair": ["blonde_hair"] },
+                  "face": { "x": 600, "y": 100, "w": 200, "h": 300 }, "face_url": null },
+            ])
+        );
+        let after = app.get(&format!("/api/v1/posts/{id}"), &admin).await.json();
+        assert_eq!(before, after);
+
+        // New uploads get their people after the tags, with their crops.
+        let id = app.upload_png(&admin, 31, "mine").await;
+        let post = wait_for_people(&app, &admin, id).await;
+        assert_eq!(post["figures"][1]["character"], "saber_(fate)");
+        let names = post["tag_details"].to_string();
+        for want in [
+            "mine",
+            "saber_(fate)",
+            "fate_(series)",
+            "blonde_hair",
+            "1girl",
+            "1other",
+        ] {
+            assert!(names.contains(want), "{names}");
+        }
+        assert_eq!(crate::faces::make_due(&app.state).await.unwrap(), 2);
+        let post = app.get(&format!("/api/v1/posts/{id}"), &admin).await.json();
+        assert!(
+            post["figures"][1]["face_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("/media/face/")
+        );
+        // An uploader who says no to automatic tagging gets no people either.
+        let r = app
+            .upload(&admin, &testing::png(9, 8, 32), &[("autotag", "false")])
+            .await;
+        let skipped = r.json()["id"].as_i64().unwrap();
+        let id = app.upload_png(&admin, 33, "").await;
+        wait_for_people(&app, &admin, id).await;
+        let post = app
+            .get(&format!("/api/v1/posts/{skipped}"), &admin)
+            .await
+            .json();
+        assert_eq!(post["figures"], Value::Null);
+        app.finish().await;
+    }
+
+    /// A provider for the people tool. Given boxes, it describes the second
+    /// and a box that isn't there; without, it gives a face of its own.
+    async fn people_provider() -> String {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|body: axum::Json<Value>| async move {
+                let prompt = body["messages"][0]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default();
+                let answer = if prompt.contains("2: [100, 100, 200, 300]") {
+                    r#"{"figures": [{"box": 2, "kind": "boy", "character": "shirou_(fate)",
+                        "hair": ["red_hair"], "body": ["jacket"]}, {"box": 7, "kind": "girl"}]}"#
+                } else if prompt.contains("Find each person's face") {
+                    r#"{"figures": [{"face": [10, 20, 300, 400], "kind": "girl",
+                        "cosplay": "hatsune_miku", "franchise": "vocaloid"}]}"#
+                } else {
+                    r#"{"tags": [{"name": "brand_new"}], "figures": [{"kind": "girl"}]}"#
+                };
+                json!({ "choices": [{ "message": { "content": answer } }] }).to_string()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        format!("http://{addr}/v1")
+    }
+
+    #[tokio::test]
+    async fn finds_people_with_a_provider() {
+        let url = people_provider().await;
+        let worker_dir = tempfile::tempdir().unwrap();
+        let worker = fake_worker(worker_dir.path());
+        let Some(app) = testing::app_with(|c| {
+            c.ai.url = url;
+            c.ai.model = "llava".into();
+            c.ai.autotag = true;
+            c.ai.people = Some(AiMode::Api);
+            c.ai.worker = Some(worker);
+        })
+        .await
+        else {
+            return;
+        };
+        let admin = app.register("admin").await;
+        let id = app.upload_png(&admin, 40, "").await;
+        // Without the face finders the provider finds the faces too, and
+        // its people win over the tagging model's.
+        let post = wait_for_people(&app, &admin, id).await;
+        assert_eq!(
+            post["figures"],
+            json!([{ "kind": "girl", "cosplay": "hatsune_miku", "franchise": "vocaloid",
+                     "face": { "x": 10, "y": 20, "w": 300, "h": 400 } }])
+        );
+        assert!(tag_names(&post).contains("brand_new"));
+
+        // With the face finders here, the provider is told where the faces are.
+        std::fs::create_dir_all(app.state.config.data_dir.join("ai/models")).unwrap();
+        crate::local_ai::sweep(&app.state, false).await;
+        assert!(app.get("/api/v1/admin/ai", &admin).await.json()["runtime"]["ready"] == true);
+        crate::local_ai::mark_all_installed(
+            &app.state.local_ai,
+            starbooru_core::ai_catalog::model("people-swinv2").unwrap(),
+        );
+        let path = format!("/api/v1/posts/{id}/find-people");
+        let r = app.call(Method::POST, &path, Some(&admin), None).await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.json());
+        let found = r.json();
+        assert_eq!(found["model"], "llava");
+        let figures = found["figures"].as_array().unwrap();
+        assert_eq!(figures.len(), 1, "{found}");
+        assert_eq!(figures[0]["character"], "shirou_(fate)");
+        assert_eq!(figures[0]["franchise"], "fate");
+        assert_eq!(
+            figures[0]["tags"],
+            json!({ "body": ["jacket"], "hair": ["red_hair"] })
+        );
+        assert_eq!(
+            figures[0]["face"],
+            json!({ "x": 100, "y": 100, "w": 200, "h": 300 })
+        );
         app.finish().await;
     }
 }

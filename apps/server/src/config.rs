@@ -119,6 +119,8 @@ pub struct AiConfig {
     pub tagging: Option<AiMode>,
     pub translation: Option<AiMode>,
     pub comics: Option<AiMode>,
+    /// Off unless set: finding people runs the tagger a few times a picture.
+    pub people: Option<AiMode>,
     /// Language (BCP 47) new images with text are translated into; empty
     /// is off.
     pub translate_to: String,
@@ -137,6 +139,7 @@ impl std::fmt::Debug for AiConfig {
             .field("tagging", &self.tagging)
             .field("translation", &self.translation)
             .field("comics", &self.comics)
+            .field("people", &self.people)
             .field("translate_to", &self.translate_to)
             .field("worker", &self.worker)
             .finish_non_exhaustive()
@@ -336,6 +339,7 @@ impl Config {
                 tagging: ai_mode(&get, "STARBOORU_AI_TAGGING")?,
                 translation: ai_mode(&get, "STARBOORU_AI_TRANSLATION")?,
                 comics: ai_mode(&get, "STARBOORU_AI_COMICS")?,
+                people: ai_mode(&get, "STARBOORU_AI_PEOPLE")?,
                 worker: get("STARBOORU_AI_WORKER")
                     .map(|v| v.trim().to_owned())
                     .filter(|v| !v.is_empty())

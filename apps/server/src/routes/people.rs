@@ -169,7 +169,7 @@ async fn resolve(conn: &mut PgConnection, ids: &[i64]) -> AppResult<HashMap<i64,
 
 /// The franchise of each character named in `names` (aliases followed),
 /// worked out now, by the name as given.
-pub(super) async fn franchises_by_name(
+pub(crate) async fn franchises_by_name(
     tx: &mut Transaction<'_, Postgres>,
     names: &[String],
 ) -> AppResult<HashMap<String, String>> {

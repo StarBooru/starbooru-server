@@ -24,7 +24,7 @@ Migrations run at startup. The first account you register becomes admin.
 
 To serve a web app's bundle from the server, set `STARBOORU_WEB_DIR` to its folder. `cargo run -p starbooru-server -- precompress <dir>` writes `.br` and `.gz` copies beside its files. It's optional: without them the server compresses each file as it sends it.
 
-Local AI needs the worker: `cargo build -p starbooru-ai-worker` (`target/debug/` is next to the server). The server downloads the pinned ONNX Runtime into `<data>/ai/runtime/` by itself on Linux x86-64 and ARM64. Elsewhere, point `STARBOORU_ORT_LIB` at a `libonnxruntime` 1.31.
+Local AI needs the worker: `cargo build -p starbooru-ai-worker` (`target/debug/` is next to the server). The server downloads the pinned ONNX Runtime into `<data>/ai/runtime/` by itself on Linux x86-64 and ARM64. It comes from Microsoft's NuGet package, as in the `Dockerfile`: the server reads just the library out of it with range requests (about 12 MB) and checks the library's SHA-256, or downloads the whole package (160 MB) and checks that when ranges don't work. Elsewhere, point `STARBOORU_ORT_LIB` at a `libonnxruntime` 1.31.
 
 ## Tests and lints
 
@@ -36,7 +36,7 @@ Server integration tests run the real router against PostgreSQL. Each test creat
 export STARBOORU_TEST_DATABASE_URL=postgres://starbooru:devpass@127.0.0.1:55432/starbooru
 ```
 
-The AI worker's tests in `apps/ai-worker/tests/worker.rs` also run models when `STARBOORU_ORT_LIB` and `STARBOORU_AI_MODELS` are set.
+The AI worker's tests in `apps/ai-worker/tests/worker.rs` also run models when `STARBOORU_ORT_LIB` and `STARBOORU_AI_MODELS` are set. The people test also needs `STARBOORU_TEST_FACES`, a folder with two public-domain pictures from Wikimedia Commons: `p11.jpg` ([Apollo 11 Crew](https://commons.wikimedia.org/wiki/File:Apollo_11_Crew.jpg)) and `d02.png` ([Moe anime girl in sailor fuku](https://commons.wikimedia.org/wiki/File:Moe_anime_girl_in_sailor_fuku.png), CC0). `STARBOORU_TEST_NUGET=1` fetches the runtime from NuGet to check the pin.
 
 The harness is `apps/server/src/testing.rs`. Tests for video, AVIF and JPEG XL thumbnails need `ffmpeg` on `PATH` and are skipped without it.
 

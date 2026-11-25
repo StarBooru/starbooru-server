@@ -288,6 +288,22 @@ pub const MANGA_OCR: &[ModelFile] = &[
     },
 ];
 
+pub const YUNET: &[ModelFile] = &[ModelFile {
+    repo: "opencv/face_detection_yunet",
+    rev: "3cc26e7f1014a5ee5d74a42acee58bafc9d0a310",
+    path: "face_detection_yunet_2023mar.onnx",
+    sha256: "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+    size: 232589,
+}];
+
+pub const ANIME_FACES: &[ModelFile] = &[ModelFile {
+    repo: "deepghs/anime_face_detection",
+    rev: "784dc4c0bb692351ddcdbe6131a050b17d3025d5",
+    path: "face_detect_v1.4_n/model.onnx",
+    sha256: "fd860b650a4377046842c3cd80d01b0b408bdfbdb4acee5759630f82c6ef04a9",
+    size: 12102558,
+}];
+
 pub const OPUS_JA_EN: &[ModelFile] = &[
     ModelFile {
         repo: "Xenova/opus-mt-ja-en",
