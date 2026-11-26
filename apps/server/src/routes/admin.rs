@@ -153,6 +153,9 @@ pub async fn put_settings(
     if let Some(home) = &clean.home {
         settings::save_home(&mut *tx, home).await?;
     }
+    if let Some(on) = clean.link_previews {
+        settings::save_link_previews(&mut *tx, on).await?;
+    }
     let mut changes = Vec::new();
     if wanted != kind {
         settings::save_score_kind(&mut *tx, wanted).await?;
@@ -417,7 +420,8 @@ mod tests {
                 "score_kind": "likes",
                 "default_blacklist": [],
                 "home": { "enabled": false, "title": null, "subtitle": null, "query": "",
-                          "posts": 36 }
+                          "posts": 36 },
+                "link_previews": false
             })
         );
         let put = |token: &str, body: serde_json::Value| {
@@ -444,12 +448,15 @@ mod tests {
         .await;
         assert_eq!(r.status, 200, "{:?}", r.json());
         assert_eq!(r.json()["name"], "Home booru");
+        // Left out, link previews stay off.
+        assert_eq!(r.json()["link_previews"], false);
         let info = app
             .call(Method::GET, "/api/v1/info", None, None)
             .await
             .json();
         assert_eq!(info["name"], "Home booru");
         assert_eq!(info["registration_open"], true);
+        assert_eq!(info["link_previews"], false);
         let bad = put(
             &admin,
             json!({ "name": "", "allow_registration": true, "trash_days": 0 }),

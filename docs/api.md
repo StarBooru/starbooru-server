@@ -26,15 +26,15 @@ All endpoints are under `/api/v1`. Bodies are JSON unless noted. The Rust types 
 
 | Method | Path | |
 |---|---|---|
-| GET | `/info` | `ServerInfo`: `name`, `version`, `has_users`, `registration_open`, `max_upload_bytes`, `url_import` (whether `POST /posts/import` is on), `oidc` (the identity provider's name for a "Sign in with …" button, `null` when OpenID Connect sign-in is off), `video_editing` (whether `POST /posts/{id}/edit` can trim videos: the server has ffmpeg), `mode` (`private` or `public`, see [Modes](#modes)), `score_kind` (`likes` or `stars`, see [Scores](#scores)), `guests` (people without an account may browse), `home` (the [home page](#home-page) is on) |
+| GET | `/info` | `ServerInfo`: `name`, `version`, `has_users`, `registration_open`, `max_upload_bytes`, `url_import` (whether `POST /posts/import` is on), `oidc` (the identity provider's name for a "Sign in with …" button, `null` when OpenID Connect sign-in is off), `video_editing` (whether `POST /posts/{id}/edit` can trim videos: the server has ffmpeg), `mode` (`private` or `public`, see [Modes](#modes)), `score_kind` (`likes` or `stars`, see [Scores](#scores)), `guests` (people without an account may browse), `home` (the [home page](#home-page) is on), `link_previews` (the admin's switch for [link previews](#link-previews)) |
 | GET | `/healthz` (not under `/api/v1`) | `ok` when the database answers |
 
-`name` and `registration_open` follow the admin settings (see [Administration](#administration)). A server older than modes leaves out `mode`, `score_kind` and `guests`; read them as `private`, `likes` and `false`. One older than the home page leaves out `home`: read it as `false`.
+`name` and `registration_open` follow the admin settings (see [Administration](#administration)). A server older than modes leaves out `mode`, `score_kind` and `guests`; read them as `private`, `likes` and `false`. One older than the home page leaves out `home`, and one older than link previews leaves out `link_previews`: read both as `false`.
 
 ```json
 { "name": "StarBooru", "version": "0.2.0", "has_users": true, "registration_open": false,
   "max_upload_bytes": 536870912, "url_import": true, "oidc": null, "video_editing": true,
-  "mode": "public", "score_kind": "likes", "guests": true, "home": true }
+  "mode": "public", "score_kind": "likes", "guests": true, "home": true, "link_previews": false }
 ```
 
 ## Accounts
@@ -56,6 +56,8 @@ All endpoints are under `/api/v1`. Bodies are JSON unless noted. The Rust types 
 | DELETE | `/auth/avatar` | | `Profile` without a picture |
 | GET | `/auth/blacklist` | | `Blacklist {entries}` (see [Blacklist](#blacklist)) |
 | PUT | `/auth/blacklist` | `Blacklist {entries}` | `Blacklist`, as kept |
+| GET | `/auth/sharing` | | `SharingSettings {previews}`: whether the account's share links show a [link preview](#link-previews) when they don't choose for themselves. `false` until changed. |
+| PUT | `/auth/sharing` | `SharingSettings {previews}` | `SharingSettings`, as kept |
 
 Account rules:
 - Usernames are 2 to 32 characters of `A–Z a–z 0–9 _ . -` and are unique regardless of case.
@@ -110,8 +112,8 @@ Admins only; others get 403. API keys may read these but not change anything.
 | Method | Path | Body | Returns |
 |---|---|---|---|
 | GET | `/admin/stats` | | `ServerStats`: `version`, `started_at`, `users`, `disabled_users`, live `images`/`animations`/`videos`, `bin_posts`, `tags`, `media_bytes` (originals, bin included), `bin_bytes`, `database_bytes`, `uploads_by_day` (`[{day, posts}]`, the last 30 UTC days oldest first), `max_upload_bytes`, `video_thumbnails`, `url_import` |
-| GET | `/admin/settings` | | `ServerSettings {name, allow_registration, trash_days, auto_meta_tags, mode, score_kind, tag_vote_threshold?, default_blacklist, home}`, the values in force. `tag_vote_threshold` is there on a public server only (see [Tag votes](#tag-votes)). `default_blacklist` is what new accounts start with and guests get (see [Blacklist](#blacklist)); `home` is the [home page](#home-page). |
-| PUT | `/admin/settings` | `ServerSettings` | The saved settings. They apply at once. Each starts from its environment variable (`STARBOORU_NAME`, `STARBOORU_ALLOW_REGISTRATION`, `STARBOORU_TRASH_DAYS`, `STARBOORU_AUTO_TAGS`), and a value equal to the variable's keeps following it. The mode and the score kind are stored as they are and don't follow the environment. `name` is 1–64 characters with whitespace collapsed; `trash_days` is 0–3650. `auto_meta_tags` (automatic meta tags such as `highres` and `video` on new posts) may be left out by older clients and then means `true`. `mode` changes only through `POST /admin/mode`: the mode in force is accepted, another one is 409 `use_mode_switch`, and leaving it out is fine. `score_kind` left out stays as it is; a new one converts the votes (see [Scores](#scores)) and the answer lists what it did in `changes`, as `GET /admin/scores/preview` would have. `stars` on a public server is 409 `public_counts_likes`. `tag_vote_threshold` is 0 to 100; left out, it stays as it is. `default_blacklist` is cleaned like an account's list, at most 100 entries; `home` is checked as [Home page](#home-page) says. Either left out stays as it is. |
+| GET | `/admin/settings` | | `ServerSettings {name, allow_registration, trash_days, auto_meta_tags, mode, score_kind, tag_vote_threshold?, default_blacklist, home, link_previews}`, the values in force. `tag_vote_threshold` is there on a public server only (see [Tag votes](#tag-votes)). `default_blacklist` is what new accounts start with and guests get (see [Blacklist](#blacklist)); `home` is the [home page](#home-page). `link_previews` turns [link previews](#link-previews) on; it is `false` until an admin changes it. |
+| PUT | `/admin/settings` | `ServerSettings` | The saved settings. They apply at once. Each starts from its environment variable (`STARBOORU_NAME`, `STARBOORU_ALLOW_REGISTRATION`, `STARBOORU_TRASH_DAYS`, `STARBOORU_AUTO_TAGS`), and a value equal to the variable's keeps following it. The mode and the score kind are stored as they are and don't follow the environment. `name` is 1–64 characters with whitespace collapsed; `trash_days` is 0–3650. `auto_meta_tags` (automatic meta tags such as `highres` and `video` on new posts) may be left out by older clients and then means `true`. `mode` changes only through `POST /admin/mode`: the mode in force is accepted, another one is 409 `use_mode_switch`, and leaving it out is fine. `score_kind` left out stays as it is; a new one converts the votes (see [Scores](#scores)) and the answer lists what it did in `changes`, as `GET /admin/scores/preview` would have. `stars` on a public server is 409 `public_counts_likes`. `tag_vote_threshold` is 0 to 100; left out, it stays as it is. `default_blacklist` is cleaned like an account's list, at most 100 entries; `home` is checked as [Home page](#home-page) says. Either left out stays as it is, and so does `link_previews`. |
 | GET | `/admin/users` | | `AdminUser[] {id, username, role, created_at, disabled, posts, bytes, quota_bytes, last_active, display_name?, about?, avatar_url?}`, oldest first. `posts` and `bytes` count uploads, recycle bin included. `last_active` is the latest use of any session or key. The profile fields are left out when not set; `avatar_url` is the signed 64 px picture. |
 | PATCH | `/admin/users/{id}` | `UserUpdate {role?, disabled?, quota_bytes?, clear_avatar?, clear_about?, clear_display_name?}` | The updated `AdminUser`. Missing fields stay as they are; `"quota_bytes": null` removes the limit. Disabling signs the account out everywhere. The `clear_*` flags (`true`) remove that part of the profile, for moderation. 400 for a role, disabled or limit on your own account (so an admin always remains); clearing your own profile is fine. 404 for an unknown id. |
 | POST | `/admin/users/{id}/password` | `PasswordReset {new}` | 204. Signs the account out everywhere; its API keys keep working. 400 for your own account (use `PUT /auth/password`). |
@@ -284,7 +286,7 @@ On a public server a request without a token may read what a browser needs, and 
 | GET | `/forum`, `/forum/threads`, `/forum/threads/{id}` |
 | GET | `/auth/blacklist` (the admin's default), `/home` |
 
-`/info`, sign-up and sign-in, and the signed `/media` URLs are open in both modes, and so is `/home`, which on a private server shows no posts without a token. Everything else answers 401 to a guest, as it does on a private server, where none of these opens without a token. A guest has no vote of their own (`my_vote` is 0) and doesn't see the recycle bin: `status:deleted` is 401 and a binned post 404. A token that is sent but wrong is still 401.
+`/info`, sign-up and sign-in, the signed `/media` URLs and the pictures of [link previews](#link-previews) are open in both modes, and so is `/home`, which on a private server shows no posts without a token. Everything else answers 401 to a guest, as it does on a private server, where none of these opens without a token. A guest has no vote of their own (`my_vote` is 0) and doesn't see the recycle bin: `status:deleted` is 401 and a binned post 404. A token that is sent but wrong is still 401.
 
 Each client address (IPv6 by its /64, the last `X-Forwarded-For` entry with `STARBOORU_TRUST_PROXY`) may ask for 300 a minute without an account; `/explore` counts as 5 and `/people` as 2. Past that the answer is 429 `rate_limited` with `Retry-After`. Signed-in requests don't count. Page sizes are the same as for accounts.
 
@@ -732,16 +734,56 @@ Each user's own list; other users never see it.
 
 A share link shows chosen posts to anyone who has it, without an account. It shows only the media: no tags, votes, ids or account details. Any signed-in user can share any post they can see.
 
-Share links are for private servers. On a public one a post is shared by its own address, as guests can open it: `POST /shares` answers 409 `share_by_address`, `GET /shares` an empty list and `GET /shared/{token}` 404. Switching to public deletes the links.
+Share links are for private servers. On a public one a post is shared by its own address, as guests can open it: `POST /shares` answers 409 `share_by_address`, `GET /shares` an empty list, and `PATCH /shares/{id}` and `GET /shared/{token}` 404. Switching to public deletes the links.
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| GET | `/shares` | | `Share[] {id, token, title, posts, cover_url, created_at, expires_at, views, last_viewed_at}`, the caller's links, newest first. `posts` counts the posts the link was made with. `cover_url` is the signed thumbnail of the first post still shown, or `null`. `views` counts opens of the public view. Expired links stay listed until removed. |
-| POST | `/shares` | `NewShare {post_ids, title?, days?}` | `Share`. `post_ids` keeps its order, repeats are dropped, 1–500 posts. The title is trimmed, at most 100 characters, and empty means none. `days` is 1–365, or omitted to keep the link until it is removed. 400 if a post doesn't exist or is in the recycle bin, and past 500 links. |
+| GET | `/shares` | | `Share[] {id, token, title, posts, cover_url, created_at, expires_at, views, last_viewed_at, preview, preview_on}`, the caller's links, newest first. `posts` counts the posts the link was made with. `cover_url` is the signed thumbnail of the first post still shown, or `null`. `views` counts opens of the public view. `preview` is the link's own choice of [link preview](#link-previews), `null` when it follows the account's (`GET /auth/sharing`); `preview_on` says whether it shows one now, after the admin's switch. Expired links stay listed until removed. |
+| POST | `/shares` | `NewShare {post_ids, title?, days?, preview?}` | `Share`. `post_ids` keeps its order, repeats are dropped, 1–500 posts. The title is trimmed, at most 100 characters, and empty means none. `days` is 1–365, or omitted to keep the link until it is removed. `preview` is `true`, `false`, or left out to follow the account. 400 if a post doesn't exist or is in the recycle bin, and past 500 links. |
+| PATCH | `/shares/{id}` | `ShareUpdate {preview?}` | The `Share` as kept. `"preview": null` makes the link follow the account again; left out, it stays as it is. 404 if it isn't the caller's. |
 | DELETE | `/shares/{id}` | | 204; the link stops working at once. 404 if it isn't the caller's. Media URLs already handed out stay valid until their signature expires (up to 12 hours). |
 | GET | `/shared/{token}` | | **No auth.** `SharedView {title, server, expires_at, posts}`, where `posts` are `SharedPost {kind, mime, width, height, duration_ms, file_url, thumb_url, sample_url}` in the link's order. Posts moved to the recycle bin since are left out. 404 for a malformed, unknown, expired or removed link, or one whose owner is disabled. Answers with `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. |
 
-The page to give out is `/s/{token}` on the server, which the web app serves (`starbooru_core::share::share_path`).
+The page to give out is `/s/{token}` on the server, which the web app serves (`starbooru_core::share::share_path`). Its page always carries `<meta name="robots" content="noindex, nofollow">` and the header `X-Robots-Tag: noindex, nofollow`, so search engines leave it alone.
+
+## Link previews
+
+Chat apps and sites (WhatsApp, Telegram, Discord, Facebook, Slack, iMessage, Google Chat and others) show a pasted link with a title, a line of text and a picture, read from Open Graph tags in the page. Their bots don't run the app, so the server writes the tags into the page itself when it serves the web app (`STARBOORU_WEB_DIR`). Every client gets the same page, whatever its User-Agent.
+
+What has a preview:
+
+- On a public server, a post's own address, `/post/{id}`, when the admin's `link_previews` is on and the post is out of the recycle bin. Every rating.
+- On a private server, a share link, `/s/{token}`, when `link_previews` is on, the link is live (not expired, removed, or of a disabled account) and it says yes: its own `preview`, or the account's `previews` when it leaves that to the account (`starbooru_core::preview_on`).
+- Nothing else. With `link_previews` off, no page has one.
+
+Opening the page or its pictures doesn't count as a view of the link.
+
+The tags come right after `<head>`, as WhatsApp reads only the first 300 KB:
+
+| Tag | Content |
+|---|---|
+| `og:type` | `website` |
+| `og:site_name` | The server's name |
+| `og:title` | A link's title, or the server's name. A post's first three characters, else its copyrights, else its artists (underscores read as spaces), else `#<id>` |
+| `og:description` | What a link holds, such as "3 pictures and 1 video" or "3 immagini e 1 video". A post's general tags up to about 200 characters, or the server's name. Never empty, as WhatsApp shows nothing without it |
+| `og:url` | The page's absolute address |
+| `og:image`, with `og:image:width`, `og:image:height`, `og:image:type` (`image/jpeg`) and `og:image:alt` | The picture. A link names up to four, one for each of its first posts that has one, in its order: Discord shows them together, the others take the first |
+| `twitter:card` | `summary_large_image` with a picture (Telegram shows a large one only then), `summary` without |
+
+The texts are in Italian when `Accept-Language` prefers Italian to English, and in English otherwise; the page says `Vary: Accept-Language`. Absolute addresses start from `STARBOORU_PUBLIC_URL`. Without it they take the request's host: `X-Forwarded-Host` and `X-Forwarded-Proto` first with `STARBOORU_TRUST_PROXY`, then `Host`, with `http` for a local name or a private address and `https` for the rest. A host that isn't a plain name or address, with an optional port, gets no tags.
+
+The pictures are outside `/api/v1`, need no token and don't count against a guest's limit:
+
+| Method | Path | Returns |
+|---|---|---|
+| GET, HEAD | `/preview/s/{token}/{n}.jpg` | The picture of the link's `n`th post (0 to 3) among those that have one |
+| GET, HEAD | `/preview/p/{id}.jpg` | A post's picture |
+
+Each answers 404 unless its page has a preview at that moment, so removing or expiring a link, binning a post or turning the switch off stops them at once. The tags add `?v=` and the first 8 hex digits of the post's SHA-256 to each address, so an edited picture, which is another post, gets another address; the server ignores it. The answer has `Content-Type: image/jpeg`, `Cache-Control: public, max-age=3600` and `X-Content-Type-Options: nosniff`, and a link's picture `X-Robots-Tag: noindex` as well.
+
+A picture is a JPEG that fits in 1200 × 1200 and is never enlarged, transparency on white. It comes from a big image's sample, else the original for a picture or a GIF's first frame (AVIF and JPEG XL through ffmpeg), else the thumbnail (videos, and AVIF or JPEG XL without ffmpeg); a post without any of these, or without a stored size, has none. It is saved at quality 82, or 75, 68 or 60 when that keeps it under 550 KB, as WhatsApp drops pictures over 600 KB; the size stays the one the tags name. The server makes it the first time it is asked for and keeps it with the post's other files.
+
+Chat apps keep their own copy of a preview, so a message sent before a link was removed may go on showing its picture and title in that app. Only new messages see the change.
 
 ## Media
 
@@ -751,3 +793,5 @@ GET /media/{avatar|avatar64|face}/{sha256}.jpg?exp=<unix>&sig=<hex>
 ```
 
 Media URLs come from the API, so never build one by hand. Invalid or expired signatures get a 403. Range requests are supported. Responses are cacheable (`private, max-age=21600, immutable`).
+
+Link previews' pictures have routes of their own (see [Link previews](#link-previews)), never a `/media` URL.

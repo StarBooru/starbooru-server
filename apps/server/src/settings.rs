@@ -33,6 +33,7 @@ struct SettingsRow {
     home_subtitle: Option<String>,
     home_query: Option<String>,
     home_posts: Option<i32>,
+    link_previews: Option<bool>,
 }
 
 /// The settings in force.
@@ -40,7 +41,7 @@ pub async fn current(state: &AppState) -> AppResult<ServerSettings> {
     let row: Option<SettingsRow> = sqlx::query_as(
         "SELECT name, allow_registration, trash_days, auto_meta_tags, mode, score_kind, \
          tag_vote_threshold, default_blacklist, home_enabled, home_title, home_subtitle, \
-         home_query, home_posts FROM server_settings",
+         home_query, home_posts, link_previews FROM server_settings",
     )
     .fetch_optional(&state.db)
     .await?;
@@ -71,8 +72,30 @@ pub async fn current(state: &AppState) -> AppResult<ServerSettings> {
                 .and_then(|n| u32::try_from(n).ok())
                 .unwrap_or(DEFAULT_HOME_POSTS),
         }),
+        link_previews: Some(row.link_previews.unwrap_or(false)),
         changes: Vec::new(),
     })
+}
+
+/// Whether the admin has turned link previews on.
+pub async fn link_previews(db: impl PgExecutor<'_>) -> AppResult<bool> {
+    let stored: Option<Option<bool>> =
+        sqlx::query_scalar("SELECT link_previews FROM server_settings")
+            .fetch_optional(db)
+            .await?;
+    Ok(stored.flatten().unwrap_or(false))
+}
+
+/// Saves the admin's link previews switch; off is stored as NULL.
+pub async fn save_link_previews(db: impl PgExecutor<'_>, on: bool) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO server_settings (id, link_previews) VALUES (true, $1) \
+         ON CONFLICT (id) DO UPDATE SET link_previews = $1, updated_at = now()",
+    )
+    .bind(on.then_some(true))
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 /// The blacklist new accounts start with and guests get.

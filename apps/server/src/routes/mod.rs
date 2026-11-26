@@ -19,6 +19,7 @@ mod modes;
 mod oidc;
 mod people;
 mod posts;
+mod previews;
 mod profiles;
 mod remote;
 mod searches;
@@ -64,6 +65,7 @@ pub(crate) use forum::{seed as seed_forum, seed_once as seed_forum_once};
 pub(crate) use home::HomeCache;
 pub(crate) use people::franchises_by_name;
 pub(crate) use posts::set_tags as set_post_tags;
+pub(crate) use previews::link_head;
 
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
@@ -88,6 +90,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/users/{name}", get(profiles::get))
         .route("/auth/blacklist", get(blacklist::get).put(blacklist::put))
+        .route(
+            "/auth/sharing",
+            get(shares::sharing).put(shares::set_sharing),
+        )
         .route("/home", get(home::home))
         .route("/auth/password", put(auth::change_password))
         .route("/auth/oidc/begin", post(oidc::begin))
@@ -202,7 +208,10 @@ pub fn router(state: AppState) -> Router {
         .route("/posts/{id}/figures", put(figures::put))
         .route("/posts/{id}/edit", post(edit::edit))
         .route("/shares", get(shares::list).post(shares::create))
-        .route("/shares/{id}", axum::routing::delete(shares::delete))
+        .route(
+            "/shares/{id}",
+            axum::routing::patch(shares::update).delete(shares::delete),
+        )
         .route("/shared/{token}", get(shares::view))
         .route("/searches", get(searches::list).post(searches::create))
         .route("/searches/{id}", axum::routing::delete(searches::delete))
@@ -251,10 +260,14 @@ pub fn router(state: AppState) -> Router {
         .nest(starbooru_core::API_PREFIX, api)
         .route("/media/{variant}/{file}", get(crate::media::serve))
         .route("/backups/{name}", get(backups::download))
+        // Link previews' pictures: for chat apps, without a token or a
+        // guest's limit.
+        .route("/preview/s/{token}/{file}", get(previews::share_image))
+        .route("/preview/p/{file}", get(previews::post_image))
         .route("/healthz", get(health));
 
     if let Some(dir) = &state.config.web_dir {
-        match crate::web::service(dir) {
+        match crate::web::service(dir, Some(state.clone())) {
             Some(web) => app = app.fallback_service(web),
             None => warn!(
                 "STARBOORU_WEB_DIR={} has no index.html; web app disabled",
@@ -360,6 +373,7 @@ async fn info(State(state): State<AppState>) -> AppResult<Json<ServerInfo>> {
         score_kind: settings.score_kind,
         guests: settings.mode.guests(),
         home: settings.home.is_some_and(|h| h.enabled),
+        link_previews: settings.link_previews.unwrap_or(false),
     }))
 }
 

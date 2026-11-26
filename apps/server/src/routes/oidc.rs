@@ -188,7 +188,7 @@ fn no_store(headers: &mut HeaderMap) {
 /// (expired, used, or never started here), since there is nowhere to send
 /// the browser.
 fn expired_page(oidc: &Oidc) -> Response {
-    let home = escape_html(oidc.public_url().as_str());
+    let home = crate::web::escape_html(oidc.public_url().as_str());
     let body = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width\">\
@@ -210,13 +210,6 @@ fn expired_page(oidc: &Oidc) -> Response {
     );
     no_store(headers);
     resp
-}
-
-fn escape_html(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 /// A finished sign-in, taken out of the table so it can't be used twice.

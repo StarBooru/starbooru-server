@@ -74,6 +74,9 @@ pub struct Inner {
     /// The people tool's turn: one picture at a time, on upload and on
     /// request.
     pub people: tokio::sync::Semaphore,
+    /// Link previews being made: two at a time, as a burst of chat apps
+    /// asking for new links shouldn't take every core.
+    pub previews: tokio::sync::Semaphore,
     pub started_at: DateTime<Utc>,
 }
 
@@ -128,6 +131,7 @@ impl AppState {
             faces: tokio::sync::Notify::new(),
             franchises: tokio::sync::Notify::new(),
             people: tokio::sync::Semaphore::new(1),
+            previews: tokio::sync::Semaphore::new(2),
             started_at: Utc::now(),
         }))
     }

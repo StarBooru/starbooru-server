@@ -28,6 +28,10 @@ pub struct NewShare {
     /// Days until the link stops working; `None` keeps it until removed.
     #[serde(default)]
     pub days: Option<u32>,
+    /// Whether chats and sites show the link with its first picture:
+    /// `None` follows the account's [`SharingSettings::previews`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<bool>,
 }
 
 /// One of the caller's links.
@@ -45,6 +49,41 @@ pub struct Share {
     /// Times the link was opened.
     pub views: i64,
     pub last_viewed_at: Option<DateTime<Utc>>,
+    /// The link's own choice of preview; `None` follows the account's.
+    #[serde(default)]
+    pub preview: Option<bool>,
+    /// Whether the link shows a preview now, after the server's and the
+    /// account's settings ([`preview_on`]).
+    #[serde(default)]
+    pub preview_on: bool,
+}
+
+/// `PATCH /shares/{id}`: fields left out stay as they are.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareUpdate {
+    /// `Some(None)` (JSON `null`) makes the link follow the account's
+    /// setting again.
+    #[serde(
+        default,
+        deserialize_with = "crate::admin::present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub preview: Option<Option<bool>>,
+}
+
+/// `GET` and `PUT /auth/sharing`: the account's defaults for its links.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharingSettings {
+    /// New links, and those that don't choose, show a preview in chats.
+    #[serde(default)]
+    pub previews: bool,
+}
+
+/// Whether a share link shows its picture to chats and sites: the server
+/// allows it (`link_previews` in the admin settings), and the link says yes
+/// or leaves it to the account, which says yes.
+pub fn preview_on(server: bool, account: bool, link: Option<bool>) -> bool {
+    server && link.unwrap_or(account)
 }
 
 /// A post as a link shows it.
@@ -123,6 +162,7 @@ impl NewShare {
             post_ids,
             title,
             days: self.days,
+            preview: self.preview,
         })
     }
 }
@@ -149,7 +189,42 @@ mod tests {
             post_ids: ids,
             title: title.map(str::to_owned),
             days,
+            preview: None,
         }
+    }
+
+    #[test]
+    fn previews_need_the_server_and_follow_the_account_unless_the_link_says() {
+        assert!(!preview_on(false, true, Some(true)));
+        assert!(preview_on(true, true, None));
+        assert!(!preview_on(true, false, None));
+        assert!(preview_on(true, false, Some(true)));
+        assert!(!preview_on(true, true, Some(false)));
+    }
+
+    #[test]
+    fn a_patch_tells_null_from_missing() {
+        let missing: ShareUpdate = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.preview, None);
+        let follow: ShareUpdate = serde_json::from_str(r#"{"preview":null}"#).unwrap();
+        assert_eq!(follow.preview, Some(None));
+        let off: ShareUpdate = serde_json::from_str(r#"{"preview":false}"#).unwrap();
+        assert_eq!(off.preview, Some(Some(false)));
+        assert_eq!(
+            serde_json::to_string(&ShareUpdate {
+                preview: Some(None)
+            })
+            .unwrap(),
+            r#"{"preview":null}"#
+        );
+        // An older server's link reads as following the account, without one.
+        let old: Share = serde_json::from_str(
+            r#"{"id":1,"token":"t","title":null,"posts":1,"cover_url":null,
+                "created_at":"2026-11-26T00:00:00Z","expires_at":null,"views":0,
+                "last_viewed_at":null}"#,
+        )
+        .unwrap();
+        assert_eq!((old.preview, old.preview_on), (None, false));
     }
 
     #[test]

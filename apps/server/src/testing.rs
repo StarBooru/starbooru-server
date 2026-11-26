@@ -341,6 +341,41 @@ pub fn noise_png(w: u32, h: u32, seed: u32) -> Vec<u8> {
     out.into_inner()
 }
 
+/// A gradient with a little noise: a PNG this size is big enough for a
+/// sample, and its JPEG copies stay small, like a photo's.
+pub fn textured_png(w: u32, h: u32, seed: u32) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(2_654_435_761) | 1;
+    let img = image::RgbImage::from_fn(w, h, |x, y| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let grain = (state & 7) as u8;
+        let r = (x * 255 / w.max(1)) as u8;
+        let g = (y * 255 / h.max(1)) as u8;
+        image::Rgb([
+            r.saturating_add(grain),
+            g.saturating_add(grain),
+            128 + grain,
+        ])
+    });
+    let mut out = Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+/// A two-frame GIF.
+pub fn gif(w: u32, h: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut out);
+        for shade in [40u8, 200] {
+            let frame = image::RgbaImage::from_pixel(w, h, image::Rgba([shade, 80, 160, 255]));
+            encoder.encode_frame(image::Frame::new(frame)).unwrap();
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::with_database;

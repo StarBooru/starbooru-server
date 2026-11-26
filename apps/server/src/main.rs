@@ -19,6 +19,7 @@ mod ocr;
 mod oidc;
 mod panels;
 mod people_ai;
+mod previews;
 mod probe;
 mod remote;
 mod routes;

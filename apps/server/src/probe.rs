@@ -162,7 +162,7 @@ impl Tools {
 }
 
 /// The longest side of the frame to grab, for a picture of this size if known.
-fn frame_size(width: Option<i32>, height: Option<i32>) -> u32 {
+pub(crate) fn frame_size(width: Option<i32>, height: Option<i32>) -> u32 {
     match (width.map(u32::try_from), height.map(u32::try_from)) {
         (Some(Ok(w)), Some(Ok(h))) => FRAME_SIZE.max(thumb_side(w, h)),
         _ => FRAME_SIZE,

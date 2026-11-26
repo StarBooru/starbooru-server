@@ -43,6 +43,7 @@ The owner's answers (2026-11-23): in public mode, people without an account can 
 - [x] Public mode: the other-booru endpoints (`/remote/*`) are off and can't be turned on
 - [x] Public mode: browsing without an account, read-only, and Explore's Trending and Popular tags
 - [x] Share links set up to suit each mode: share links in private mode, a post's own address in public mode
+- [x] Link previews in chat apps (Open Graph tags and a picture), behind an admin switch: posts' addresses in public mode; share links in private mode, by account default and per link
 - [ ] The guests' rate limit shared between replicas (it's per process, in memory, like the sign-in limits)
 - [x] A tag blacklist for each account
 - [x] A home page setting: on or off, and how it's customised. Its background shows the most popular posts rated safe
@@ -75,4 +76,5 @@ The image serves starbooru-web, a release pinned in the `Dockerfile`.
 - **AI key in the database.** An API key entered in Administration › AI is stored as plain text in `ai_tools`, so it is also in database backups. Setting it with `STARBOORU_AI_KEY` keeps it out of both.
 - **OCR coverage.** GIFs and videos are not read, and a scan that failed or timed out counts as done until `POST /posts/{id}/ocr` redoes it. The Docker image has English and Japanese; other languages need their `tesseract-ocr-*` package.
 - **Panel translation.** Small local models miss text and place boxes loosely, and may translate sound effects literally. Long webtoon strips are shrunk to 1536 px, so their text may be too small to read; there is no splitting yet.
+- **Link previews.** A video's preview is its thumbnail, 512 px on the long side, so Facebook shows it as a small card. Chat apps keep their own copy of a preview after the link is removed.
 - **Sideways photos from before EXIF orientation.** Posts uploaded earlier keep the thumbnail and the size they got without it, so a crop can be refused as "outside the image". Rebuilding them needs a backfill.

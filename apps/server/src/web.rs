@@ -29,12 +29,16 @@ use std::time::SystemTime;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
+use tracing::warn;
+
+use crate::previews;
+use crate::state::AppState;
 
 /// For files named after their content.
 const KEEP: &str = "public, max-age=31536000, immutable";
@@ -73,6 +77,24 @@ struct WebApp {
     /// Held while a request prepares a new page, so the others answer with
     /// the old one meanwhile instead of each preparing it too.
     preparing: tokio::sync::Mutex<()>,
+    /// For the link previews in the page; `None` leaves them out.
+    state: Option<AppState>,
+}
+
+/// `text` safe inside an HTML attribute or element.
+pub fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// What `index.html` was when its page was prepared. Its content counts:
@@ -122,9 +144,12 @@ impl Page {
 }
 
 /// The service that answers every path the API doesn't. `None` when the
-/// directory has no `index.html`.
-pub fn service(dir: &Path) -> Option<Router> {
-    let app = Arc::new(WebApp::open(dir)?);
+/// directory has no `index.html`. With `state`, a link's page carries its
+/// preview (`previews.rs`).
+pub fn service(dir: &Path, state: Option<AppState>) -> Option<Router> {
+    let mut app = WebApp::open(dir)?;
+    app.state = state;
+    let app = Arc::new(app);
     Some(
         Router::new()
             .fallback(move |req: Request| {
@@ -146,6 +171,7 @@ impl WebApp {
                 .append_index_html_on_directories(false),
             page: RwLock::new(Page::read(dir)?),
             preparing: tokio::sync::Mutex::new(()),
+            state: None,
         })
     }
 
@@ -153,8 +179,16 @@ impl WebApp {
         let path = req.uri().path().to_owned();
         let reads = matches!(*req.method(), Method::GET | Method::HEAD);
         if reads && matches!(path.as_str(), "/" | "/index.html") {
-            return self.page().await;
+            return self.page(None).await;
         }
+        // What a link's page needs of the request, which the files take.
+        let link = previews::link_of(&path)
+            .filter(|_| reads)
+            .map(|link| Asked {
+                link,
+                headers: req.headers().clone(),
+                authority: req.uri().authority().map(|a| a.as_str().to_owned()),
+            });
         let mut response = match self.files.clone().oneshot(req).await {
             Ok(found) => found.map(Body::new),
             Err(never) => match never {},
@@ -163,7 +197,7 @@ impl WebApp {
         // Single-page app: the router in the page knows the other paths. A
         // missing asset stays missing, as a page is no use to a script tag.
         if status == StatusCode::NOT_FOUND && reads && !is_asset(&path) {
-            return self.page().await;
+            return self.page(link).await;
         }
         if status.is_success() || status == StatusCode::NOT_MODIFIED {
             let keep = HeaderValue::from_static(cache_policy(&path));
@@ -217,16 +251,64 @@ impl WebApp {
         html
     }
 
-    async fn page(&self) -> Response {
-        let mut response = Response::new(Body::from(self.current().await.to_string()));
+    /// The page, with what `asked` links to in its head.
+    async fn page(&self, asked: Option<Asked>) -> Response {
+        let html = self.current().await;
+        let shared = matches!(
+            asked.as_ref().map(|a| &a.link),
+            Some(previews::Link::Share(_))
+        );
+        let mut head = String::new();
+        if shared {
+            head.push_str(previews::ROBOTS);
+            head.push('\n');
+        }
+        if let (Some(state), Some(asked)) = (&self.state, &asked) {
+            // A preview that can't be made leaves the page as it is.
+            match crate::routes::link_head(
+                state,
+                &asked.link,
+                &asked.headers,
+                asked.authority.as_deref(),
+            )
+            .await
+            {
+                Ok(tags) => head.push_str(&tags),
+                Err(e) => warn!("link preview left out: {e}"),
+            }
+        }
+        let body = if head.is_empty() {
+            html.to_string()
+        } else {
+            previews::with_head(&html, &head)
+        };
+        let mut response = Response::new(Body::from(body));
         let headers = response.headers_mut();
         headers.insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/html; charset=utf-8"),
         );
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(CHECK));
+        if asked.is_some() {
+            // The texts are in the reader's language.
+            headers.insert(header::VARY, HeaderValue::from_static("accept-language"));
+        }
+        if shared {
+            headers.insert(
+                HeaderName::from_static("x-robots-tag"),
+                HeaderValue::from_static("noindex, nofollow"),
+            );
+        }
         response
     }
+}
+
+/// A request for a link's page.
+struct Asked {
+    link: previews::Link,
+    headers: HeaderMap,
+    /// The address's host, for HTTP/2, which has no `Host`.
+    authority: Option<String>,
 }
 
 /// How long a browser may keep the file at `path`.
@@ -641,7 +723,7 @@ mod tests {
     #[tokio::test]
     async fn every_page_of_the_app_is_the_prepared_page() {
         let dir = bundle();
-        let app = service(dir.path()).unwrap();
+        let app = service(dir.path(), None).unwrap();
         for path in ["/", "/index.html", "/post/12", "/settings", "/assets"] {
             let (response, body) = get(&app, path, None).await;
             assert_eq!(response.status(), StatusCode::OK, "{path}");
@@ -660,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn assets_are_kept_and_a_missing_one_is_not_a_page() {
         let dir = bundle();
-        let app = service(dir.path()).unwrap();
+        let app = service(dir.path(), None).unwrap();
         let (response, body) = get(&app, &format!("/assets/{STYLE}"), None).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(cache(&response), KEEP);
@@ -673,7 +755,7 @@ mod tests {
     #[tokio::test]
     async fn a_new_bundle_needs_no_restart() {
         let dir = bundle();
-        let app = service(dir.path()).unwrap();
+        let app = service(dir.path(), None).unwrap();
         let (_, body) = get(&app, "/", None).await;
         assert!(
             String::from_utf8(body)
@@ -715,7 +797,7 @@ mod tests {
     #[tokio::test]
     async fn a_new_page_with_the_old_time_and_size_is_seen() {
         let dir = bundle();
-        let app = service(dir.path()).unwrap();
+        let app = service(dir.path(), None).unwrap();
         let index = dir.path().join("index.html");
         let old = std::fs::read_to_string(&index).unwrap();
         let written = std::fs::metadata(&index).unwrap().modified().unwrap();
@@ -760,7 +842,7 @@ mod tests {
     #[tokio::test]
     async fn no_index_no_web_app() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(service(dir.path()).is_none());
+        assert!(service(dir.path(), None).is_none());
     }
 
     #[tokio::test]
@@ -788,7 +870,7 @@ mod tests {
         .unwrap();
         assert_eq!(unpacked, original);
 
-        let app = service(dir.path()).unwrap();
+        let app = service(dir.path(), None).unwrap();
         let path = format!("/assets/{STYLE}");
         let (response, body) = get(&app, &path, Some("gzip, br")).await;
         assert_eq!(response.headers()[header::CONTENT_ENCODING], "br");
@@ -878,7 +960,7 @@ mod tests {
     async fn serves_a_trunk_bundle() {
         let dir = trunk_bundle();
         let page = std::fs::read(dir.path().join("index.html")).unwrap();
-        let app = service(dir.path()).unwrap();
+        let app = service(dir.path(), None).unwrap();
         // The page as Trunk wrote it: its preloads are there already.
         for path in ["/", "/index.html", "/post/12", "/settings"] {
             let (response, body) = get(&app, path, None).await;
@@ -919,6 +1001,43 @@ mod tests {
             let (response, _) = get(&app, page, None).await;
             assert_eq!(response.status(), StatusCode::OK, "{page}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_share_links_page_is_never_indexed() {
+        let dir = trunk_bundle();
+        let page = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        let app = service(dir.path(), None).unwrap();
+        let (response, body) = get(&app, "/s/0123456789abcdef0123456789abcdef", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-robots-tag"], "noindex, nofollow");
+        assert_eq!(cache(&response), CHECK);
+        let shown = String::from_utf8(body).unwrap();
+        assert_eq!(
+            shown,
+            page.replacen(
+                "<head>",
+                "<head>\n<meta name=\"robots\" content=\"noindex, nofollow\">\n",
+                1
+            )
+        );
+        // The other pages are the page as it is.
+        for path in ["/s/nope", "/post/12", "/", "/settings"] {
+            let (response, body) = get(&app, path, None).await;
+            assert!(response.headers().get("x-robots-tag").is_none(), "{path}");
+            assert_eq!(String::from_utf8(body).unwrap(), page, "{path}");
+        }
+        let (response, _) = get(&app, "/post/12", None).await;
+        assert_eq!(response.headers()[header::VARY], "accept-language");
+    }
+
+    #[test]
+    fn escapes_attribute_values() {
+        assert_eq!(
+            escape_html("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&#39;f"
+        );
+        assert_eq!(escape_html("plain é"), "plain é");
     }
 
     #[test]

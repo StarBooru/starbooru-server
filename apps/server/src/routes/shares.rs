@@ -8,7 +8,10 @@ use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use sqlx::FromRow;
 use starbooru_core::share::{MAX_SHARES, SHARE_TOKEN_CHARS, is_share_token};
-use starbooru_core::{MediaKind, Mode, NewShare, Share, SharedPost, SharedView};
+use starbooru_core::{
+    MediaKind, Mode, NewShare, Share, ShareUpdate, SharedPost, SharedView, SharingSettings,
+    preview_on,
+};
 
 use super::posts::{media_urls, sample_url};
 use crate::auth::AuthUser;
@@ -29,14 +32,17 @@ struct ShareRow {
     cover_sha: Option<Vec<u8>>,
     cover_ext: Option<String>,
     cover_thumb: Option<bool>,
+    preview: Option<bool>,
+    share_previews: bool,
 }
 
 /// The caller's links (or the one with id `$2`, when not NULL) with their
 /// cover: the first of their posts not in the bin.
 const SELECT_SHARES: &str = "SELECT s.id, s.token, s.title, cardinality(s.post_ids) AS posts, \
      s.created_at, s.expires_at, s.views, s.last_viewed_at, \
-     c.sha256 AS cover_sha, c.ext AS cover_ext, c.has_thumb AS cover_thumb \
-     FROM shares s LEFT JOIN LATERAL ( \
+     c.sha256 AS cover_sha, c.ext AS cover_ext, c.has_thumb AS cover_thumb, \
+     s.preview, o.share_previews \
+     FROM shares s JOIN users o ON o.id = s.user_id LEFT JOIN LATERAL ( \
          SELECT p.sha256, p.ext, p.has_thumb \
          FROM unnest(s.post_ids) WITH ORDINALITY AS u(id, n) \
          JOIN posts p ON p.id = u.id \
@@ -44,7 +50,8 @@ const SELECT_SHARES: &str = "SELECT s.id, s.token, s.title, cardinality(s.post_i
      WHERE s.user_id = $1 AND ($2::bigint IS NULL OR s.id = $2) \
      ORDER BY s.created_at DESC, s.id DESC";
 
-fn to_share(state: &AppState, row: ShareRow) -> Share {
+/// `server` is the admin's link previews switch.
+fn to_share(state: &AppState, row: ShareRow, server: bool) -> Share {
     let cover_url = match (row.cover_sha, row.cover_ext, row.cover_thumb) {
         (Some(sha), Some(ext), Some(true)) => media_urls(state, &hex::encode(sha), &ext, true).1,
         _ => None,
@@ -59,7 +66,21 @@ fn to_share(state: &AppState, row: ShareRow) -> Share {
         expires_at: row.expires_at,
         views: row.views,
         last_viewed_at: row.last_viewed_at,
+        preview: row.preview,
+        preview_on: preview_on(server, row.share_previews, row.preview),
     }
+}
+
+/// One of `user`'s links as the API shows it, or 404.
+async fn load(state: &AppState, user: i64, id: i64) -> AppResult<Share> {
+    let row: ShareRow = sqlx::query_as(SELECT_SHARES)
+        .bind(user)
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let server = settings::link_previews(&state.db).await?;
+    Ok(to_share(state, row, server))
 }
 
 /// A public instance shares a post by its own address, so it has no links.
@@ -77,8 +98,11 @@ pub async fn list(State(state): State<AppState>, user: AuthUser) -> AppResult<Js
         .bind(None::<i64>)
         .fetch_all(&state.db)
         .await?;
+    let server = settings::link_previews(&state.db).await?;
     Ok(Json(
-        rows.into_iter().map(|r| to_share(&state, r)).collect(),
+        rows.into_iter()
+            .map(|r| to_share(&state, r, server))
+            .collect(),
     ))
 }
 
@@ -124,23 +148,75 @@ pub async fn create(
     }
     let token = new_token();
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO shares (user_id, token, title, post_ids, expires_at) \
-         VALUES ($1, $2, $3, $4, now() + make_interval(days => $5)) RETURNING id",
+        "INSERT INTO shares (user_id, token, title, post_ids, expires_at, preview) \
+         VALUES ($1, $2, $3, $4, now() + make_interval(days => $5), $6) RETURNING id",
     )
     .bind(user.id)
     .bind(&token)
     .bind(&req.title)
     .bind(&req.post_ids)
     .bind(req.days.and_then(|d| i32::try_from(d).ok()))
+    .bind(req.preview)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
-    let row: ShareRow = sqlx::query_as(SELECT_SHARES)
+    Ok(Json(load(&state, user.id, id).await?))
+}
+
+/// `PATCH /shares/{id}`: changes what the request names. A public server
+/// has no links, so it is a 404 there, as for any link that isn't the
+/// caller's.
+pub async fn update(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(req): Json<ShareUpdate>,
+) -> AppResult<Json<Share>> {
+    if public(&state).await? {
+        return Err(AppError::NotFound);
+    }
+    let done = sqlx::query(
+        "UPDATE shares SET preview = CASE WHEN $3 THEN $4 ELSE preview END \
+         WHERE id = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(user.id)
+    .bind(req.preview.is_some())
+    .bind(req.preview.flatten())
+    .execute(&state.db)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(load(&state, user.id, id).await?))
+}
+
+/// `GET /auth/sharing`: the account's defaults for its links.
+pub async fn sharing(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> AppResult<Json<SharingSettings>> {
+    let previews: bool = sqlx::query_scalar("SELECT share_previews FROM users WHERE id = $1")
         .bind(user.id)
-        .bind(id)
         .fetch_one(&state.db)
         .await?;
-    Ok(Json(to_share(&state, row)))
+    Ok(Json(SharingSettings { previews }))
+}
+
+/// `PUT /auth/sharing`.
+pub async fn set_sharing(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(req): Json<SharingSettings>,
+) -> AppResult<Json<SharingSettings>> {
+    let previews: bool = sqlx::query_scalar(
+        "UPDATE users SET share_previews = $2 WHERE id = $1 RETURNING share_previews",
+    )
+    .bind(user.id)
+    .bind(req.previews)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(Json(SharingSettings { previews }))
 }
 
 /// 128 random bits as lowercase hex.

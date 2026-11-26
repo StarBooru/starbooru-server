@@ -55,6 +55,13 @@ pub struct ServerSettings {
     /// it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<HomeSettings>,
+    /// Link previews: chats and sites show a shared address with its
+    /// picture. On a public server this turns them on for posts' addresses;
+    /// on a private one it lets accounts turn them on for their share links.
+    /// Off until an admin turns it on. Always in a `GET`; left out of a
+    /// `PUT`, it stays as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_previews: Option<bool>,
     /// Only in the answer to a `PUT` that changed `score_kind`: the votes
     /// it converted and dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -132,6 +139,7 @@ pub fn clean_settings(settings: &ServerSettings) -> Result<ServerSettings, Setti
         tag_vote_threshold: settings.tag_vote_threshold,
         default_blacklist,
         home,
+        link_previews: settings.link_previews,
         changes: Vec::new(),
     })
 }
@@ -333,6 +341,7 @@ mod tests {
             tag_vote_threshold: None,
             default_blacklist: None,
             home: None,
+            link_previews: None,
             changes: Vec::new(),
         }
     }
@@ -348,12 +357,19 @@ mod tests {
         assert_eq!(old.score_kind, ScoreKind::Likes);
         assert_eq!(old.tag_vote_threshold, None);
         assert_eq!((old.default_blacklist, old.home), (None, None));
+        assert_eq!(old.link_previews, None);
         assert!(old.auto_meta_tags);
         let out = serde_json::to_value(settings("x", 0)).unwrap();
         assert_eq!(out["mode"], "private");
         assert!(out.get("changes").is_none());
         assert!(out.get("tag_vote_threshold").is_none());
         assert!(out.get("default_blacklist").is_none() && out.get("home").is_none());
+        assert!(out.get("link_previews").is_none());
+        let on = ServerSettings {
+            link_previews: Some(true),
+            ..settings("x", 0)
+        };
+        assert_eq!(clean_settings(&on).unwrap().link_previews, Some(true));
     }
 
     #[test]

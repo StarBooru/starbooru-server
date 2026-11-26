@@ -55,6 +55,10 @@ pub struct Config {
     pub backup_days: u32,
     /// Automatic backups kept.
     pub backup_keep: u32,
+    /// The address people open the server at (`STARBOORU_PUBLIC_URL`), with
+    /// a trailing `/`. Link previews put it in front of their addresses;
+    /// without it they take the request's own host.
+    pub public_url: Option<Url>,
     /// Sign-in through an OpenID Connect provider. `None` turns it off.
     pub oidc: Option<OidcConfig>,
     /// OpenAI-compatible AI provider (`STARBOORU_AI_*`); admins can override it.
@@ -283,7 +287,17 @@ impl Config {
         ))
         .then(|| PathBuf::from(pg_dump.trim()));
 
-        let oidc = oidc_config(&get)?;
+        let public_url = match get("STARBOORU_PUBLIC_URL")
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+        {
+            None => None,
+            Some(raw) => Some(web_url(&raw).map_err(|reason| ConfigError::Invalid {
+                name: "STARBOORU_PUBLIC_URL",
+                reason,
+            })?),
+        };
+        let oidc = oidc_config(&get, public_url.as_ref())?;
         let updates = update_config(&get)?;
         let mode = named(&get, "STARBOORU_MODE", Mode::parse, "private or public")?;
         let score_kind = named(&get, "STARBOORU_SCORES", ScoreKind::parse, "likes or stars")?;
@@ -319,6 +333,7 @@ impl Config {
             pg_dump,
             backup_days,
             backup_keep,
+            public_url,
             oidc,
             ai: AiConfig {
                 url: get("STARBOORU_AI_URL")
@@ -386,6 +401,7 @@ impl Config {
             pg_dump: None,
             backup_days: 0,
             backup_keep: 7,
+            public_url: None,
             oidc: None,
             ai: AiConfig::default(),
             updates: UpdateConfig::for_tests(),
@@ -469,8 +485,12 @@ fn update_config(get: &impl Fn(&str) -> Option<String>) -> Result<UpdateConfig, 
     })
 }
 
-/// `STARBOORU_OIDC_*`: all of issuer, client id and secret, or none.
-fn oidc_config(get: &impl Fn(&str) -> Option<String>) -> Result<Option<OidcConfig>, ConfigError> {
+/// `STARBOORU_OIDC_*`: all of issuer, client id and secret, or none. They
+/// need `STARBOORU_PUBLIC_URL` too.
+fn oidc_config(
+    get: &impl Fn(&str) -> Option<String>,
+    public_url: Option<&Url>,
+) -> Result<Option<OidcConfig>, ConfigError> {
     let value = |name: &str| {
         get(name)
             .map(|v| v.trim().to_owned())
@@ -496,13 +516,9 @@ fn oidc_config(get: &impl Fn(&str) -> Option<String>) -> Result<Option<OidcConfi
         name: "STARBOORU_OIDC_ISSUER",
         reason,
     })?;
-    let public = value("STARBOORU_PUBLIC_URL").ok_or(ConfigError::Missing(
+    let public_url = public_url.cloned().ok_or(ConfigError::Missing(
         "STARBOORU_PUBLIC_URL (needed for OpenID Connect sign-in)",
     ))?;
-    let public_url = web_url(&public).map_err(|reason| ConfigError::Invalid {
-        name: "STARBOORU_PUBLIC_URL",
-        reason,
-    })?;
     let redirect_uri = public_url
         .join(&format!(
             "{}/auth/oidc/callback",
@@ -764,6 +780,46 @@ mod tests {
         let mut query = full;
         query[3].1 = "https://booru.example.com/?x=1";
         assert!(with(&query).is_err());
+    }
+
+    #[test]
+    fn public_url_stands_alone() {
+        let with = |v: &str| {
+            cfg(&[
+                ("DATABASE_URL", "x"),
+                ("STARBOORU_SECRET", SECRET),
+                ("STARBOORU_PUBLIC_URL", v),
+            ])
+            .map(|c| c.public_url.map(|u| u.to_string()))
+        };
+        assert_eq!(with("").unwrap(), None);
+        assert_eq!(
+            with(" https://booru.example.com ").unwrap().as_deref(),
+            Some("https://booru.example.com/")
+        );
+        assert_eq!(
+            with("https://example.com/booru").unwrap().as_deref(),
+            Some("https://example.com/booru/")
+        );
+        assert_eq!(
+            with("http://127.0.0.1:8120").unwrap().as_deref(),
+            Some("http://127.0.0.1:8120/")
+        );
+        for bad in [
+            "http://booru.example.com",
+            "https://booru.example.com/?x=1",
+            "https://user@booru.example.com",
+            "not an address",
+        ] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
+        // Without OpenID Connect it is no longer needed.
+        assert!(
+            cfg(&[("DATABASE_URL", "x"), ("STARBOORU_SECRET", SECRET)])
+                .unwrap()
+                .public_url
+                .is_none()
+        );
     }
 
     #[test]

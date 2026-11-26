@@ -101,7 +101,9 @@ pub use remote::{
     SavedRemoteSearch, TagGroups, counted_tags, for_site, guarded_by, post_link, remote_tags,
 };
 pub use saved::clean_saved_search;
-pub use share::{NewShare, Share, ShareError, SharedPost, SharedView};
+pub use share::{
+    NewShare, Share, ShareError, ShareUpdate, SharedPost, SharedView, SharingSettings, preview_on,
+};
 pub use tag::{normalize_tag, parse_tag_list};
 pub use tag_vote::{TagRemoval, TagRemovalPage, TagVote, TagVoteRequest, voted_off};
 pub use transfer::{Meter, Transfer};

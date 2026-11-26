@@ -7,6 +7,7 @@
 //! <data>/avatar/ab/cd/<sha256>.jpg     (profile pictures, 256 px)
 //! <data>/avatar64/ab/cd/<sha256>.jpg   (the same at 64 px)
 //! <data>/face/ab/cd/<sha256>.jpg       (crops of the faces of figures)
+//! <data>/preview/ab/cd/<sha256>.jpg    (link previews, made when first asked for)
 //! ```
 
 use std::io::{Cursor, Read, Seek};
@@ -24,6 +25,7 @@ use starbooru_core::color::Palette;
 use starbooru_core::{FORMATS, MediaKind, SAMPLE_SIZE, SNIFF_BYTES, detect_mime};
 
 use crate::error::{AppError, AppResult};
+use crate::previews::{PREVIEW_SIZE, Source};
 use crate::probe::Tools;
 use crate::similar::{self, Fingerprint};
 
@@ -48,6 +50,12 @@ const SAMPLE_MAX_PERCENT: usize = 75;
 const MAX_DECODE_BYTES: u64 = 1 << 30;
 const AVATAR_EXT: &str = "jpg";
 const FACE_EXT: &str = "jpg";
+const PREVIEW_EXT: &str = "jpg";
+/// A link preview is saved at the first of these that keeps it within
+/// [`PREVIEW_MAX_BYTES`], or the last; its size stays the one its tags name.
+const PREVIEW_QUALITIES: [u8; 4] = [82, 75, 68, 60];
+/// WhatsApp drops a preview over 600 KB.
+const PREVIEW_MAX_BYTES: usize = 550_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Variant {
@@ -61,16 +69,20 @@ pub enum Variant {
     AvatarSmall,
     /// A crop of a figure's face, `FACE_SIZE` square.
     Face,
+    /// A link preview (`previews.rs`), served by its own routes and never
+    /// through a signed media URL.
+    Preview,
 }
 
 impl Variant {
-    pub const ALL: [Variant; 6] = [
+    pub const ALL: [Variant; 7] = [
         Variant::Original,
         Variant::Thumb,
         Variant::Sample,
         Variant::Avatar,
         Variant::AvatarSmall,
         Variant::Face,
+        Variant::Preview,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -81,11 +93,16 @@ impl Variant {
             Variant::Avatar => "avatar",
             Variant::AvatarSmall => "avatar64",
             Variant::Face => "face",
+            Variant::Preview => "preview",
         }
     }
 
+    /// A variant `/media` serves, by its name there.
     pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|v| v.as_str() == s)
+        Self::ALL
+            .into_iter()
+            .filter(|v| *v != Variant::Preview)
+            .find(|v| v.as_str() == s)
     }
 }
 
@@ -219,6 +236,7 @@ impl Storage {
             Variant::Sample => format!("{sha_hex}.{SAMPLE_EXT}"),
             Variant::Avatar | Variant::AvatarSmall => format!("{sha_hex}.{AVATAR_EXT}"),
             Variant::Face => format!("{sha_hex}.{FACE_EXT}"),
+            Variant::Preview => format!("{sha_hex}.{PREVIEW_EXT}"),
         }
     }
 
@@ -683,10 +701,75 @@ impl Storage {
         }
     }
 
-    /// Deletes a post's original, thumbnail and sample. Missing files are
-    /// not an error.
+    /// A post's link preview as stored, if it has the size its tags name.
+    /// Call from a blocking thread.
+    pub fn read_preview(&self, sha_hex: &str, size: (u32, u32)) -> Option<Vec<u8>> {
+        let path = self.path_for_file(
+            Variant::Preview,
+            &Self::file_name(Variant::Preview, sha_hex, ""),
+        )?;
+        let bytes = std::fs::read(path).ok()?;
+        let found = ImageReader::new(Cursor::new(&bytes))
+            .with_guessed_format()
+            .ok()?
+            .into_dimensions()
+            .ok()?;
+        (found == size).then_some(bytes)
+    }
+
+    /// A post's link preview, made from `source` at `size` and stored when
+    /// it isn't already. `None` when the source is gone or can't be read;
+    /// only disk errors fail. Two at once write the same bytes, each to a
+    /// file of its own renamed into place. Call from a blocking thread.
+    pub fn preview(
+        &self,
+        sha_hex: &str,
+        ext: &str,
+        kind: MediaKind,
+        source: Source,
+        size: (u32, u32),
+    ) -> AppResult<Option<Vec<u8>>> {
+        if let Some(bytes) = self.read_preview(sha_hex, size) {
+            return Ok(Some(bytes));
+        }
+        let picture = match source {
+            Source::Sample => self.sample(sha_hex),
+            Source::Original | Source::Frame => self.still(sha_hex, ext, kind)?,
+            Source::Thumb => self.thumb(sha_hex, ext),
+        };
+        let Some(picture) = picture else {
+            return Ok(None);
+        };
+        let (jpeg, _) = preview_jpeg(&picture, size)?;
+        let path = self
+            .path_for_file(
+                Variant::Preview,
+                &Self::file_name(Variant::Preview, sha_hex, ""),
+            )
+            .ok_or_else(|| AppError::internal("bad storage path"))?;
+        // Replaced, as one made for an older size can be there.
+        self.replace_atomic(&path, &jpeg)?;
+        Ok(Some(jpeg))
+    }
+
+    /// A post's thumbnail, decoded. Call from a blocking thread.
+    fn thumb(&self, sha_hex: &str, ext: &str) -> Option<DynamicImage> {
+        let path = self.path_for_file(
+            Variant::Thumb,
+            &Self::file_name(Variant::Thumb, sha_hex, ext),
+        )?;
+        decode(&std::fs::read(path).ok()?).ok()
+    }
+
+    /// Deletes a post's original, thumbnail, sample and link preview.
+    /// Missing files are not an error.
     pub fn remove(&self, sha_hex: &str, ext: &str) -> std::io::Result<()> {
-        for variant in [Variant::Original, Variant::Thumb, Variant::Sample] {
+        for variant in [
+            Variant::Original,
+            Variant::Thumb,
+            Variant::Sample,
+            Variant::Preview,
+        ] {
             let Some(path) = self.path_for_file(variant, &Self::file_name(variant, sha_hex, ext))
             else {
                 continue;
@@ -884,17 +967,59 @@ pub fn square_jpeg(img: &DynamicImage, side: u32) -> AppResult<Vec<u8>> {
 }
 
 fn flat_jpeg(small: &image::RgbaImage) -> AppResult<Vec<u8>> {
-    let rgb = RgbImage::from_fn(small.width(), small.height(), |x, y| {
+    jpeg_at(&flatten(small), THUMB_QUALITY)
+}
+
+/// Transparency flattened onto white.
+fn flatten(small: &image::RgbaImage) -> RgbImage {
+    RgbImage::from_fn(small.width(), small.height(), |x, y| {
         let [r, g, b, a] = small.get_pixel(x, y).0;
         let a = u16::from(a);
         let blend = |c: u8| ((u16::from(c) * a + 255 * (255 - a)) / 255) as u8;
         Rgb([blend(r), blend(g), blend(b)])
-    });
+    })
+}
+
+fn jpeg_at(rgb: &RgbImage, quality: u8) -> AppResult<Vec<u8>> {
     let mut out = Vec::new();
-    JpegEncoder::new_with_quality(&mut out, THUMB_QUALITY)
-        .encode_image(&rgb)
+    JpegEncoder::new_with_quality(&mut out, quality)
+        .encode_image(rgb)
         .map_err(AppError::internal)?;
     Ok(out)
+}
+
+/// A link preview of `img` at exactly `size`, its tags' size, as a JPEG,
+/// with the quality it was saved at. A picture a pixel off that size (an
+/// ffmpeg frame rounds its own way) is stretched to it; one of another
+/// shape fits in [`PREVIEW_SIZE`]² instead.
+pub fn preview_jpeg(img: &DynamicImage, size: (u32, u32)) -> AppResult<(Vec<u8>, u8)> {
+    let (width, height) = (img.width(), img.height());
+    let scaled = if (width, height) == size {
+        img.to_rgba8()
+    } else if same_shape((width, height), size) {
+        img.resize_exact(size.0, size.1, FilterType::CatmullRom)
+            .to_rgba8()
+    } else {
+        let (w, h) = crate::previews::fit(width, height, PREVIEW_SIZE);
+        img.resize_exact(w, h, FilterType::CatmullRom).to_rgba8()
+    };
+    let rgb = flatten(&scaled);
+    let mut last = None;
+    for quality in PREVIEW_QUALITIES {
+        let jpeg = jpeg_at(&rgb, quality)?;
+        if jpeg.len() <= PREVIEW_MAX_BYTES {
+            return Ok((jpeg, quality));
+        }
+        last = Some((jpeg, quality));
+    }
+    last.ok_or_else(|| AppError::internal("no preview quality"))
+}
+
+/// Whether two sizes have the same proportions, within 2%.
+fn same_shape(a: (u32, u32), b: (u32, u32)) -> bool {
+    let cross = u64::from(a.0) * u64::from(b.1);
+    let other = u64::from(a.1) * u64::from(b.0);
+    cross.abs_diff(other).saturating_mul(50) <= cross
 }
 
 #[cfg(test)]
@@ -1339,6 +1464,161 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn previews_keep_the_size_their_tags_name_and_stay_small() {
+        let size_of = |jpeg: &[u8]| {
+            let img = decode(jpeg).unwrap();
+            (img.width(), img.height())
+        };
+        // Transparency goes onto white.
+        let clear = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            300,
+            200,
+            image::Rgba([0, 0, 0, 0]),
+        ));
+        let (jpeg, quality) = preview_jpeg(&clear, (300, 200)).unwrap();
+        assert_eq!(quality, 82);
+        let flat = decode(&jpeg).unwrap().to_rgb8();
+        assert_eq!(flat.dimensions(), (300, 200));
+        assert!(flat.pixels().all(|p| p.0.iter().all(|c| *c >= 250)));
+        // Scaled down to the size named, a pixel off (as ffmpeg rounds) included.
+        let big = DynamicImage::new_rgb8(2560, 1706);
+        assert_eq!(
+            size_of(&preview_jpeg(&big, (1200, 800)).unwrap().0),
+            (1200, 800)
+        );
+        let frame = DynamicImage::new_rgb8(1024, 578);
+        assert_eq!(
+            size_of(&preview_jpeg(&frame, (1024, 577)).unwrap().0),
+            (1024, 577)
+        );
+        // Another shape altogether fits in the square instead.
+        let odd = DynamicImage::new_rgb8(2000, 500);
+        assert_eq!(
+            size_of(&preview_jpeg(&odd, (800, 800)).unwrap().0),
+            (1200, 300)
+        );
+        assert!(!same_shape((2000, 500), (800, 800)));
+        assert!(same_shape((1024, 578), (1024, 577)));
+        // Noise needs a lower quality to stay under the limit, at the same size.
+        let noise = decode(&crate::testing::noise_png(1200, 1200, 9)).unwrap();
+        assert!(jpeg_at(&noise.to_rgb8(), 82).unwrap().len() > PREVIEW_MAX_BYTES);
+        let (jpeg, quality) = preview_jpeg(&noise, (1200, 1200)).unwrap();
+        assert!(quality < 82, "{quality}");
+        assert!(jpeg.len() <= PREVIEW_MAX_BYTES || quality == 60);
+        assert_eq!(size_of(&jpeg), (1200, 1200));
+    }
+
+    #[tokio::test]
+    async fn previews_are_kept_and_go_with_the_post() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).await.unwrap();
+        let png = png_bytes(300, 200);
+        let sha = hex::encode(storage.ingest(&png).unwrap().sha256);
+        let path = storage
+            .path_for_file(
+                Variant::Preview,
+                &Storage::file_name(Variant::Preview, &sha, "png"),
+            )
+            .unwrap();
+        assert!(path.ends_with(format!("preview/{}/{}/{sha}.jpg", &sha[..2], &sha[2..4])));
+        assert_eq!(storage.read_preview(&sha, (300, 200)), None);
+        let made = storage
+            .preview(&sha, "png", MediaKind::Image, Source::Original, (300, 200))
+            .unwrap()
+            .unwrap();
+        assert_eq!(storage.read_preview(&sha, (300, 200)), Some(made.clone()));
+        let again = storage
+            .preview(&sha, "png", MediaKind::Image, Source::Original, (300, 200))
+            .unwrap();
+        assert_eq!(again, Some(made));
+        // Asked at another size, as after a sample is made: made again in place.
+        assert_eq!(storage.read_preview(&sha, (150, 100)), None);
+        storage
+            .preview(&sha, "png", MediaKind::Image, Source::Original, (150, 100))
+            .unwrap()
+            .unwrap();
+        assert!(storage.read_preview(&sha, (150, 100)).is_some());
+        // A source that isn't there makes none.
+        let none = storage.preview(&sha, "png", MediaKind::Image, Source::Sample, (300, 200));
+        assert_eq!(none.unwrap(), None);
+        let gone = "0".repeat(64);
+        let none = storage.preview(&gone, "png", MediaKind::Image, Source::Original, (3, 2));
+        assert_eq!(none.unwrap(), None);
+        storage.remove(&sha, "png").unwrap();
+        assert!(!path.exists());
+        // Never a signed media file.
+        assert_eq!(Variant::parse("preview"), None);
+        assert_eq!(Variant::parse("face"), Some(Variant::Face));
+        assert!(dir.path().join("preview").is_dir());
+    }
+
+    #[tokio::test]
+    async fn previews_of_videos_and_avif_with_ffmpeg() {
+        let Some(tools) = crate::probe::tests::tools() else {
+            return;
+        };
+        let src = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path())
+            .await
+            .unwrap()
+            .with_tools(Some(tools));
+        type Case<'a> = (&'a str, &'a str, &'a [&'a str], Source, (u32, u32));
+        let cases: [Case; 2] = [
+            (
+                "clip.webm",
+                "testsrc=duration=1:size=1280x720:rate=2",
+                &["-c:v", "libvpx-vp9", "-b:v", "200k"],
+                Source::Thumb,
+                (512, 288),
+            ),
+            (
+                "still.avif",
+                "testsrc=size=1100x620",
+                &[
+                    "-frames:v",
+                    "1",
+                    "-c:v",
+                    "libaom-av1",
+                    "-still-picture",
+                    "1",
+                ],
+                Source::Frame,
+                (1024, 577),
+            ),
+        ];
+        let mut ran = 0;
+        for (name, input, args, expected, size) in cases {
+            let Some(bytes) = crate::probe::tests::generate(src.path(), name, input, args) else {
+                continue;
+            };
+            let info = storage.ingest(&bytes).unwrap();
+            let source =
+                crate::previews::source(info.kind, info.ext, info.has_sample, info.has_thumb, true);
+            assert_eq!(source, Some(expected), "{name}");
+            assert_eq!(
+                crate::previews::size(info.width, info.height, expected),
+                Some(size),
+                "{name}"
+            );
+            let jpeg = storage
+                .preview(
+                    &hex::encode(info.sha256),
+                    info.ext,
+                    info.kind,
+                    expected,
+                    size,
+                )
+                .unwrap()
+                .unwrap();
+            let made = decode(&jpeg).unwrap();
+            assert_eq!((made.width(), made.height()), size, "{name}");
+            ran += 1;
+        }
+        assert!(ran > 0, "ffmpeg made neither file");
     }
 
     #[tokio::test]

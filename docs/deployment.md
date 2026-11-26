@@ -92,7 +92,7 @@ Administration › Server also sets the blacklist new accounts start with, which
 
 ## Configuration
 
-Admins can change the name, open registration, the recycle-bin days, the score kind, the tag-vote threshold and the backup schedule in the app (Settings › Administration). Those changes apply at once and override the variables below.
+Admins can change the name, open registration, the recycle-bin days, the score kind, the tag-vote threshold, link previews (off until turned on) and the backup schedule in the app (Settings › Administration). Those changes apply at once and override the variables below.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -106,7 +106,7 @@ Admins can change the name, open registration, the recycle-bin days, the score k
 | `STARBOORU_SAMPLES` | `true` | Make smaller JPEG copies of big images for viewing (see `architecture.md` › *Media storage*). Turned on later, copies are made for older posts at the next start. |
 | `STARBOORU_AUTO_TAGS` | `true` | Tag posts with what the file shows, in the `meta` category: `lowres`, `highres`, `absurdres`, `wide_image`, `tall_image`, `animated`, `video`, `sound`, `long_video` (see `architecture.md` › *Automatic meta tags*). Each post is tagged once; turned on later, older posts are tagged at the next start. Admins can override it in Administration › Server. |
 | `STARBOORU_TRASH_DAYS` | `0` | Purge recycle-bin posts (and their files) after this many days; `0` keeps them until emptied by hand |
-| `STARBOORU_PUBLIC_URL` | unset | The address people open StarBooru at, e.g. `https://booru.example.com`. Needed for provider sign-in. |
+| `STARBOORU_PUBLIC_URL` | unset | The address people open StarBooru at, e.g. `https://booru.example.com` (a path below it works too). Needed for provider sign-in. Link previews put it in front of the addresses chat apps fetch; unset, they take the address from the request (see `api.md` › *Link previews*). |
 | `STARBOORU_OIDC_ISSUER` | unset | OpenID Connect issuer URL (https). With the client id and secret, turns provider sign-in on. |
 | `STARBOORU_OIDC_CLIENT_ID` | unset | Client id from the provider |
 | `STARBOORU_OIDC_CLIENT_SECRET` | unset | Client secret from the provider |

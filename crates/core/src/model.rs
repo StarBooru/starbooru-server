@@ -190,6 +190,11 @@ pub struct ServerInfo {
     /// The home page is on (`GET /home`).
     #[serde(default)]
     pub home: bool,
+    /// The admin's `link_previews`: on a public server, posts' addresses
+    /// show their picture in chats; on a private one, accounts may turn
+    /// that on for their share links.
+    #[serde(default)]
+    pub link_previews: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

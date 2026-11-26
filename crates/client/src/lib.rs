@@ -19,8 +19,9 @@ use starbooru_core::{
     MediaEdit, Neighbors, NewApiKey, NewShare, OidcBegin, OidcFinish, OidcStart, PasswordChange,
     PasswordReset, Post, PostPage, PostUpdate, PurgeResult, Rating, RelatedPosts, RemotePage,
     RemoteSearch, ResolveDuplicates, RevokeResult, SaveSearchRequest, SavedSearch, ServerInfo,
-    ServerSettings, ServerStats, SessionInfo, Share, SharedView, SignInMethods, Tag, TagCorrection,
-    TagDetail, TagOrder, TagUpdate, Usage, User, UserUpdate, VoteRequest,
+    ServerSettings, ServerStats, SessionInfo, Share, ShareUpdate, SharedView, SharingSettings,
+    SignInMethods, Tag, TagCorrection, TagDetail, TagOrder, TagUpdate, Usage, User, UserUpdate,
+    VoteRequest,
 };
 use starbooru_core::{
     AiAdminStatus, AiGeneralUpdate, AiStatus, AiTestResult, AiTool, AiToolUpdate, BooruAccount,
@@ -413,6 +414,21 @@ impl Client {
 
     pub async fn create_share(&self, share: &NewShare) -> Result<Share> {
         self.json(Method::POST, "/shares", share).await
+    }
+
+    /// Changes one of the caller's links; the answer is the link as kept.
+    pub async fn update_share(&self, id: i64, update: &ShareUpdate) -> Result<Share> {
+        self.json(Method::PATCH, &format!("/shares/{id}"), update)
+            .await
+    }
+
+    /// The account's defaults for its share links.
+    pub async fn sharing(&self) -> Result<SharingSettings> {
+        Self::send(self.request(Method::GET, "/auth/sharing")?).await
+    }
+
+    pub async fn set_sharing(&self, settings: &SharingSettings) -> Result<SharingSettings> {
+        self.json(Method::PUT, "/auth/sharing", settings).await
     }
 
     /// Stops the link working at once.
@@ -1500,6 +1516,7 @@ mod tests {
             score_kind: ScoreKind::Likes,
             guests: true,
             home: false,
+            link_previews: false,
         })
         .unwrap();
         format!(
