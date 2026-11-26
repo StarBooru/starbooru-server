@@ -4,7 +4,7 @@ members = ["crates/*", "apps/*"]
 default-members = ["crates/core", "crates/client", "apps/server"]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.88"
 license = "AGPL-3.0-or-later"
